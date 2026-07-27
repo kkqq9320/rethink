@@ -4,9 +4,11 @@ on:
     push:
         branches:
             - master
+            - local
     release:
         types:
             - published
+    workflow_dispatch:
 
 permissions:
     contents: read
@@ -48,6 +50,8 @@ jobs:
                   images: ghcr.io/${{ github.repository }}
                   tags: |
                       type=raw,value=dev,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+                      type=raw,value=local,enable=${{ github.ref == 'refs/heads/local' }}
+                      type=raw,value=local-{{date 'YYYYMMDD-HHmmss'}},enable=${{ github.ref == 'refs/heads/local' }}
                       type=raw,value=${{ github.event.release.tag_name }},enable=${{ github.event_name == 'release' }}
                       type=raw,value=latest,enable=${{ github.event_name == 'release' && github.event.release.prerelease == false }}
 
@@ -56,7 +60,9 @@ jobs:
               with:
                   context: .
                   file: ./Dockerfile
-                  platforms: linux/amd64,linux/arm64,linux/arm/v7
+                  # The local branch only ever runs on one box, so skip the QEMU-emulated
+                  # arm builds - they dominate the build time and nothing pulls them.
+                  platforms: ${{ github.ref == 'refs/heads/local' && 'linux/amd64' || 'linux/amd64,linux/arm64,linux/arm/v7' }}
                   push: true
                   tags: ${{ steps.meta.outputs.tags }}
                   labels: ${{ steps.meta.outputs.labels }}
