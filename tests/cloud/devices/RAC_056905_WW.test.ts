@@ -136,9 +136,10 @@ describe(MODEL_ID, () => {
         assert.equal(ha.getProperty(DEVICE_ID, 'stoptimer', 'state'), 0) // 0x21B=0
         assert.equal(ha.getProperty(DEVICE_ID, 'jet', 'state'), 'OFF')
 
-        // energysave is mode-dependent (cool only). With mode=heat its read_callback returns false,
-        // so it must NOT have been published.
-        assert.ok(!ha.getProperty(DEVICE_ID, 'energysave', 'state'), 'energysave suppressed in heat mode')
+        // energysave only applies in cooling, and the appliance reports 0 for it in every other
+        // mode. Publish that rather than withholding it: a switch that says nothing is worse than
+        // one that says what the appliance is doing. (local change - upstream suppresses this.)
+        assert.equal(ha.getProperty(DEVICE_ID, 'energysave', 'state'), 'OFF')
 
         dev.drop()
     })

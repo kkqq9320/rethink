@@ -815,7 +815,6 @@ export default class Device extends TLVDevice {
             name: descFull,
             icon: icon,
             entity_category: 'config',
-            optimistic: true,
         }
         config['components'][name] = comp
 
@@ -838,13 +837,9 @@ export default class Device extends TLVDevice {
                 return 'OFF'
             },
             read_callback: (val) => {
-                // Ignore read value if not running
-                const powerTLV = this.getPowerTLV()
-                if (powerTLV === 0 || powerTLV == null) return false
-
-                // Ignore read value if not in the right mode
-                if (!((jetCool && this.getModeTLV() === 0) || (jetHeat && this.getModeTLV() === 4))) return false
-
+                // The appliance reports 0 whenever it is off or in a mode that has no jet, and it
+                // forgets the setting across power cycles anyway. Publish what it reports, so the
+                // switch says what the appliance is actually doing rather than what was once asked.
                 this.jetMode = val === 'ON'
                 return true
             },
@@ -856,23 +851,16 @@ export default class Device extends TLVDevice {
                  * Be consistent and only allow enabling Jet mode
                  * when running in the right mode.
                  */
-                return (
+                const writable =
                     this.getPowerTLV() !== 0 &&
                     ((jetCool && this.getModeTLV() === 0) || (jetHeat && this.getModeTLV() === 4))
-                )
-            },
-        })
 
-        /*
-         * This value needs to be written at each power up in heat/cool mode,
-         * but in a separate message.
-         */
-        this.powerChangeHooks.push(() => {
-            if (this.getPowerTLV() === 0) return
-            this.setProperty(name + '-', this.jetMode ? 'ON' : 'OFF')
-        })
-        this.modeChangeHooks.push(() => {
-            this.setProperty(name + '-', this.jetMode ? 'ON' : 'OFF')
+                // Nothing reaches the appliance, so put the switch back where it was instead of
+                // leaving it showing a change that never happened.
+                if (!writable) this.HA.publishProperty(this.id, name + '-', this.jetMode ? 'ON' : 'OFF')
+
+                return writable
+            },
         })
     }
 
@@ -974,7 +962,6 @@ export default class Device extends TLVDevice {
             name: desc,
             icon: icon,
             entity_category: 'config',
-            optimistic: true,
         }
         config['components'][name] = comp
 
@@ -985,37 +972,23 @@ export default class Device extends TLVDevice {
             write_xform: (val) => (val === 'ON' ? 1 : 0),
             read_xform: (raw) => (raw ? 'ON' : 'OFF'),
             read_callback: (val) => {
-                // Ignore read value if not running
-                const powerTLV = this.getPowerTLV()
-                if (powerTLV === 0 || powerTLV == null) return false
-
-                // Ignore read value if not in the right mode
-                if (!!check_mode && !check_mode(this.getModeTLV())) return false
-
+                // The appliance reports 0 whenever it is off or in a mode this setting does not
+                // apply to, and it forgets the setting across power cycles anyway. Publish what it
+                // reports, so the switch says what the appliance is actually doing.
                 this[field_name] = val === 'ON'
                 return true
             },
             write_callback: (val) => {
-                this[field_name] = val === 1
-
                 // No need to write the value if not running in the right mode
-                return this.getPowerTLV() !== 0 && (!check_mode || check_mode(this.getModeTLV()))
+                const writable = this.getPowerTLV() !== 0 && (!check_mode || check_mode(this.getModeTLV()))
+
+                // Nothing reaches the appliance, so put the switch back where it was instead of
+                // leaving it showing a change that never happened.
+                if (!writable) this.HA.publishProperty(this.id, name + '-', this[field_name] ? 'ON' : 'OFF')
+                else this[field_name] = val === 1
+
+                return writable
             },
         })
-
-        this.powerChangeHooks.push(() => {
-            if (this.getPowerTLV() === 0) return
-            /*
-             * This value needs to be written at each power up,
-             * but in a separate message.
-             */
-            this.setProperty(name + '-', this[field_name] ? 'ON' : 'OFF')
-        })
-
-        if (!!check_mode) {
-            this.modeChangeHooks.push(() => {
-                this.setProperty(name + '-', this[field_name] ? 'ON' : 'OFF')
-            })
-        }
     }
 }
