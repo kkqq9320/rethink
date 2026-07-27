@@ -645,6 +645,23 @@ export default class Device extends TLVDevice {
         // 0x21f - "display light" value is inverted in some devices,
         // but in some devices it is not - not shown in ThinQ app either
 
+        const displayComp = {
+            platform: 'switch',
+            unique_id: '$deviceid-display',
+            name: 'Display light',
+            icon: 'mdi:led-on',
+            entity_category: 'config',
+        }
+        config['components']['display'] = displayComp
+
+        this.addField(config, {
+            id: 0x21f,
+            name: '',
+            comp: 'display',
+            write_xform: (val) => (val === 'ON' ? 0 : 1),
+            read_xform: (raw) => (raw ? 'OFF' : 'ON'),
+        })
+
         if (this.filterLifeTime) {
             const filterUsed = {
                 platform: 'sensor',
