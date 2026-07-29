@@ -1,6 +1,6 @@
 import TLVDevice, { FieldDefinition } from './tlv_device'
 import { Device as Thinq2Device } from '../thinq2/device'
-import { ClimateComponent, DeviceDiscovery, type Connection } from '../homeassistant'
+import { ClimateComponent, ComponentInfo, DeviceDiscovery, type Connection } from '../homeassistant'
 import { type Metadata } from '../thinq'
 import { allowExtendedType } from '@/util/casting'
 import * as TLV from '@/util/tlv'
@@ -41,25 +41,25 @@ type SwitchOptions = {
     offValue?: number
     /* raw TLV value that reads back as 'ON', when it differs from onValue */
     readOnValue?: number
+    /* HA entity_category; 'config' unless the control is really a maintenance function */
+    entityCategory?: string
 }
 
 export default class Device extends TLVDevice {
     readonly deviceConfig: StandDiscovery
-    filterUsedTime: number = 0
-    filterLifeTime: number = 0
-    filterChangedDate: number = 0
-    filterConfigured: boolean = false
-    filterInitialQueryTimeout: ReturnType<typeof setTimeout> | undefined
-    filterQueryTimer: ReturnType<typeof setInterval> | undefined
 
     constructor(HA: Connection, thinq: Thinq2Device, meta: Metadata) {
         super(HA, thinq)
 
         /*
          * Unlike RAC_056905_WW this profile builds its configuration up front instead of
-         * waiting for a capability response. Nothing here is gated on capability bits -
-         * this appliance was never observed answering a capability query at all (see
-         * isCapsResponse below) - so deferring would risk publishing no entities ever.
+         * waiting for a capability response. Nothing here is gated on capability bits, so
+         * every entity exists from the first connect.
+         *
+         * This appliance does answer a capability query - a live probe got a 174-byte,
+         * 54-TLV reply, see isCapsResponse() below. It is simply not needed to publish these
+         * components, and its contents were never recorded in full, which is why processTLV()
+         * below keeps it away from the filter counters.
          */
         const config: StandDiscovery = allowExtendedType({
             ...HADevice.config(meta, { name: 'LG Stand Air Conditioner' }),
@@ -78,7 +78,8 @@ export default class Device extends TLVDevice {
                     modes: ['off', 'cool', 'dry', 'fan_only'],
                     /* raw 2 .. 6 are the appliance's 1단 .. 5단; named as in RAC_056905_WW */
                     fan_modes: ['very low', 'low', 'medium', 'high', 'very high', 'auto'],
-                    swing_modes: ['concentrated', 'wide', 'left', 'right', 'split'],
+                    /* sideways airflow aim, not oscillation - see 0x2a3 below */
+                    swing_horizontal_modes: ['focus', 'wide', 'left', 'right', 'split'],
                 } satisfies StandClimateComponent,
             },
         })
@@ -155,8 +156,21 @@ export default class Device extends TLVDevice {
             id: 0x1fa,
             name: 'fan_mode',
             comp: 'climate',
+            /*
+             * 2 .. 6 are the five speeds the user can pick. 7 and 8 are not selectable:
+             * they are the appliance saying "I am driving the fan myself right now" - 8 in
+             * dry mode, 7 while jet mode runs. Confirmed on hardware: in both states the
+             * fan control is greyed out on the appliance and in the LG app.
+             *
+             * Both must map to 'auto'. Discarding 7 (as this did originally) leaves HA
+             * displaying whatever speed was selected before jet was switched on, which is
+             * not what the appliance is doing.
+             *
+             * 'auto' stays writable because HA offers no way to publish a read-only member
+             * of fan_modes; writing it sends 8, which is what the app sends when it puts the
+             * appliance into dry.
+             */
             read_xform: (raw) => {
-                /* 7 is only ever reported while jet mode runs - discard it */
                 const modes2ha = [
                     undefined,
                     undefined,
@@ -165,8 +179,8 @@ export default class Device extends TLVDevice {
                     'medium',
                     'high',
                     'very high',
-                    undefined,
-                    'auto',
+                    'auto', // 7: jet mode drives the fan
+                    'auto', // 8: dry mode drives the fan
                 ]
                 return modes2ha[raw]
             },
@@ -198,13 +212,19 @@ export default class Device extends TLVDevice {
             write_attach: [0x1f9, 0x1fa],
         })
 
+        /*
+         * 0x2a3 aims the airflow sideways; it is not an oscillation setting, and this model
+         * has no vertical louvre control at all. So it belongs on swing_horizontal_mode -
+         * the same place RAC_056905_WW puts its left/right vane - and swing_modes is left
+         * undeclared rather than misused.
+         */
         this.addField(config, {
             id: 0x2a3,
-            name: 'swing_mode',
+            name: 'swing_horizontal_mode',
             comp: 'climate',
             read_xform: (raw) => {
                 const modes2ha: Record<number, string> = {
-                    1: 'concentrated',
+                    1: 'focus',
                     2: 'wide',
                     3: 'left',
                     4: 'right',
@@ -214,7 +234,7 @@ export default class Device extends TLVDevice {
             },
             write_xform: (val) => {
                 const modes2clip: Record<string, number> = {
-                    concentrated: 1,
+                    focus: 1,
                     wide: 2,
                     left: 3,
                     right: 4,
@@ -284,11 +304,17 @@ export default class Device extends TLVDevice {
          *
          * 0x3a2 reads back 1 while the heat exchanger clean runs and 255 while the all
          * clean cycle runs, hence the exact comparison rather than a truthiness test.
+         *
+         * They are diagnostic rather than config: these are occasional maintenance cycles,
+         * not settings, and they do not belong next to the everyday controls.
          */
-        this.addSwitchField(config, 0x3a2, 'hxclean', 'Heat exchanger clean', 'mdi:heating-coil')
+        this.addSwitchField(config, 0x3a2, 'hxclean', 'Heat exchanger clean', 'mdi:heating-coil', {
+            entityCategory: 'diagnostic',
+        })
         this.addSwitchField(config, 0x165, 'allclean', 'All clean', 'mdi:spray-bottle', {
             onValue: 100,
             readOnValue: 2,
+            entityCategory: 'diagnostic',
         })
 
         this.addSelectField(config, 0x2a8, 'onesidewind', 'One-side wind', 'mdi:arrow-left-right', [
@@ -346,13 +372,102 @@ export default class Device extends TLVDevice {
             },
         )
 
+        /*
+         * force_update matters here: the appliance refreshes 0x2b3 less often than the
+         * profile polls, so without it a Riemann sum over this sensor produces a staircase
+         * rather than an energy total.
+         *
+         * RAC_056905_WW corrects its reading with max(5, raw - 60) because that appliance
+         * is biased high and never reports a true zero. This one does: 0x2b3 reaches 0 when
+         * the unit stops, and the lowest running values observed are 72 / 133 / 160. There
+         * is no offset to remove, so the raw watts are published unmodified.
+         */
         this.addSensorField(config, 0x2b3, 'energy_current', 'Power', undefined, {
             device_class: 'power',
             unit_of_measurement: 'W',
             state_class: 'measurement',
             suggested_display_precision: 0,
+            force_update: true,
         })
         this.addSensorField(config, 0x221, 'error', 'Error code', 'mdi:alert')
+
+        /*
+         * The filter counters are ordinary TLV tags on this model:
+         *   0x356 is the filter's rated life in hours. Observed once, at 3000, in the
+         *     comprehensive dump - the only frame in the capture that carries it.
+         *   0x355 is how many of those hours are LEFT, and it counts DOWN. Observed twice:
+         *     2442 in the dump, then 2441 in a one-tag change notification.
+         *
+         * Confirmed numerically against the appliance's own LG ThinQ app, which showed
+         * 2438 h remaining and 562 h used - and 2438 + 562 = 3000 exactly. The app reading
+         * is a day newer than the capture's 2442, i.e. 4 h of runtime apart, which is one
+         * summer day on this appliance.
+         *
+         * Hours *used* is the number a filter reminder is actually built on, and no tag
+         * carries it, so it is derived as 0x356 - 0x355 and published from a read callback
+         * on both tags: the comprehensive dump carries the pair in one frame (0x356 first),
+         * and a change notification may carry either one alone.
+         */
+        const filterSensorExtra = { device_class: 'duration', unit_of_measurement: 'h' }
+        const publishUsed = () => {
+            this.publishFilterUsed()
+            /* let the primary sensor publish as usual */
+            return true
+        }
+        this.addSensorField(
+            config,
+            0x356,
+            'filterlife',
+            'Filter life time',
+            'mdi:air-filter',
+            filterSensorExtra,
+            undefined,
+            publishUsed,
+        )
+        this.addSensorField(
+            config,
+            0x355,
+            'filterremaining',
+            'Filter remaining time',
+            'mdi:air-filter',
+            filterSensorExtra,
+            undefined,
+            publishUsed,
+        )
+
+        /* Derived, so it has no tag and therefore no field - see publishFilterUsed(). */
+        const filterUsed = {
+            platform: 'sensor',
+            unique_id: '$deviceid-filterused',
+            state_topic: '$this/filterused',
+            name: 'Filter used time',
+            icon: 'mdi:air-filter',
+            device_class: 'duration',
+            unit_of_measurement: 'h',
+            state_class: 'total_increasing',
+            entity_category: 'diagnostic',
+        }
+        config['components']['filterused'] = filterUsed
+
+        /*
+         * MIGRATION. The previous version of this profile published two components that no
+         * longer exist: 'changeddate' (the private channel's filter-changed date) and
+         * 'filterreset' (the reset button). Both were really created - an installation that
+         * ran it still shows a "Reset filter usage" button wired to nothing at all - and
+         * dropping them from the payload does NOT remove them, it only stops updating them.
+         *
+         * HA removes a component when the payload carries its key with the platform and
+         * NOTHING else: mqtt/discovery.py pops the platform and treats what is left, if it
+         * is empty, as a removal. Adding unique_id - or any other key - to these two objects
+         * silently turns the removal back into a registration, so do not "fix" the casts by
+         * filling them in. 'filterlife' and 'filterused' are absent here on purpose: they
+         * keep their unique_ids above, so HA updates those entities rather than orphaning
+         * them.
+         *
+         * Safe to delete once every installation has run this version once.
+         */
+        config['components']['changeddate'] = { platform: 'sensor' } as ComponentInfo
+        config['components']['filterreset'] = { platform: 'button' } as ComponentInfo
 
         /*
          * Vertical swing genuinely does not exist on this model - it has no such control,
@@ -362,9 +477,10 @@ export default class Device extends TLVDevice {
          * absent from the reference capture, but that is NOT evidence the appliance lacks
          * it: a values query (TLV 0x1f5 = 2) is never sent in the capture, and on RAC that
          * query is the only path by which those tags arrive. The same reasoning already
-         * produced two wrong "not supported" conclusions on this appliance - the filter
-         * sensors and the capability response both turned out to work once something
-         * actually asked. Treat this as unqueried, not unsupported.
+         * produced two wrong "not supported" conclusions on this appliance - the capability
+         * response and the private command channel both turned out to answer once something
+         * actually asked. Treat this as unqueried, not unsupported. (Answering is not the
+         * same as answering usefully: see the filter note below.)
          *
          * There is also a positive hint: the 307-byte 0xa8 records this profile ignores are
          * a fixed-offset mirror of the same state (offset 261 tracks 0x2b3 in 51 of 52
@@ -375,14 +491,23 @@ export default class Device extends TLVDevice {
          * and RAC's racPipeTemp table belongs to a different model.
          *
          * Seen in the capture but not understood, so left without entities:
-         * 0x348 (mirrors 0x1f9), 0x279, 0x27a, 0x232, 0x233, 0x355, 0x356.
+         * 0x348 (mirrors 0x1f9), 0x279, 0x27a, 0x232, 0x233.
          *
          * 0x312 must never become an entity: it is the frame's own length field, matching
          * payload-minus-encoding-size in 123 of 123 frames. It is the most-observed tag in
          * the capture and therefore the most tempting false positive.
          *
-         * The filter sensors are not TLV-backed; they are added once the private command
-         * channel answers, see processFilterData().
+         * NO PRIVATE-CHANNEL FILTER SUPPORT HERE, deliberately. This profile used to copy
+         * RAC_056905_WW's filter handling - sendPrivCommand(0x02, 0x02), then decode used /
+         * life / changed-date out of the reply, plus a reset button. That channel does
+         * answer on this appliance: a live probe came back and RAC's decode applied
+         * unmodified, yielding used = 0 h, life = 720 h, changed date = 0. Those numbers are
+         * simply not this appliance's filter. Its own app reports a 3000 h part with 562 h
+         * used, which is exactly what 0x356 / 0x355 above carry. What the 720 h counter
+         * counts is unidentified - it is not the user-visible filter, and nothing else about
+         * it is known - so it is not published, and the reset button is gone with it: its
+         * target was never verified and pressing it would have written a lifetime that
+         * contradicts the appliance's own display.
          */
 
         this.setConfig(config)
@@ -393,35 +518,16 @@ export default class Device extends TLVDevice {
 
         // we want to be informed about all TLV changes - set an empty blacklist
         this.thinq.send('setMaskingInfo', 0, { blacklist_tlv: '1200' })
-
-        // give modem some time to process the command before continuing
-        this.filterInitialQueryTimeout = setTimeout(() => {
-            this.filterInitialQueryTimeout = undefined
-            log('status', this.id, 'sending initial filter data query')
-            this.sendFilterQuery()
-        }, 500)
     }
 
-    drop() {
-        if (this.filterInitialQueryTimeout != undefined) {
-            clearTimeout(this.filterInitialQueryTimeout)
-            this.filterInitialQueryTimeout = undefined
-        }
-
-        if (this.filterQueryTimer != undefined) {
-            clearInterval(this.filterQueryTimer)
-            this.filterQueryTimer = undefined
-        }
-
-        super.drop()
-    }
+    /* No drop() override: nothing here owns a timer, so TLVDevice.drop() is the whole job. */
 
     /*
      * Frame markers observed at buf[6] in the device -> cloud direction:
      *   0xa7  every one of the 143 state frames in the capture,
      *   0x87  both private command acknowledgements in the capture (buf[7] 0xfd, buf[8]
-     *         0x10), and the live filter probe response this profile's filter support is
-     *         built on,
+     *         0x10), and the one live private-channel read reply this appliance was ever
+     *         probed with,
      *   0x65  both 18-byte private data responses in the capture, which answer a read of
      *         private command 0x0c and echo the request's own marker.
      *
@@ -438,6 +544,13 @@ export default class Device extends TLVDevice {
      * markers are accepted on both channels anyway, because this appliance has already
      * demonstrated that its marker is not uniform, and a wrong-but-accepted marker can only
      * match a frame that satisfies every other structural test.
+     *
+     * The two private-channel branches classify frames this profile itself has no use for -
+     * it sends no private commands (see the filter note in the constructor) - and hand them
+     * to TLVDevice's processPrivData() / processPrivDataCmdResp() hooks, which are no-ops
+     * unless a subclass overrides them. They are kept because the marker widening is the
+     * only place this appliance's non-uniform framing is written down, and re-deriving it
+     * would mean re-capturing the appliance.
      */
     processData(buf: Buffer) {
         /* state frame */
@@ -455,7 +568,7 @@ export default class Device extends TLVDevice {
             return
         }
 
-        /* private data response, e.g. the answer to sendFilterQuery() */
+        /* private data response - the appliance answering a private-channel read */
         if (
             buf[1] === 0xff &&
             buf[2] === 0x04 &&
@@ -471,7 +584,7 @@ export default class Device extends TLVDevice {
             return
         }
 
-        /* private command acknowledgement, e.g. the answer to sendFilterReset() */
+        /* private command acknowledgement - the appliance confirming a private-channel write */
         if (
             (buf[0] === 0x02 || buf[0] === 0x03) &&
             buf[2] === 0x04 &&
@@ -491,6 +604,34 @@ export default class Device extends TLVDevice {
         }
 
         super.processData(buf)
+    }
+
+    /*
+     * Keep the capability reply away from the filter counters.
+     *
+     * TLVDevice.processTLV() dispatches every tag of every accepted frame to its field
+     * before it decides whether the frame is a capability reply, and the capability reply is
+     * the first frame this profile ever sees: the constructor queries for it and retries
+     * every 15 s until it answers. What its 54 TLVs contain is unknown - only ten of the
+     * tags were ever written down and the frame was never recorded in full - so whether
+     * 0x355 / 0x356 appear in it, and with what meaning if they do, cannot be answered from
+     * anything on file. The old private-channel filter code was structurally immune to this;
+     * sourcing the counters from TLV tags gives that immunity up unless it is restored here.
+     *
+     * A capability declaration is not a reading. Dropping the pair costs nothing if the
+     * reply does not carry them, and stops a declared range or default from being published
+     * as the user's filter if it does. That matters most for the derived 'filterused', which
+     * is state_class total_increasing: a wrong value there is not merely overwritten by the
+     * next state frame, it stays in HA's long-term statistics.
+     *
+     * Only the two tags are stripped, not the whole frame: the same reply carries 0x2e1 /
+     * 0x2e2 - the appliance's own setpoint range - and reading those out of raw_clip_state
+     * is the obvious next improvement, see isCapsResponse() below.
+     */
+    processTLV(tlvArray: TLV.TLV[]) {
+        if (this.isCapsResponse(tlvArray)) tlvArray = tlvArray.filter(({ t }) => t !== 0x355 && t !== 0x356)
+
+        super.processTLV(tlvArray)
     }
 
     /*
@@ -535,158 +676,35 @@ export default class Device extends TLVDevice {
     }
 
     /*
-     * Filter management uses the private command channel rather than TLV tags, exactly
-     * like RAC_056905_WW - sendPrivCommand(0x02, 0x02) returns a payload with the same
-     * layout, verified live on this model (used 0 h, life 720 h, changed date 0).
+     * 'used' has no tag of its own: it is 0x356 (rated life) minus 0x355 (hours left), and
+     * both read callbacks call this because either tag can arrive first - the comprehensive
+     * dump orders 0x356 before 0x355, but a change notification may carry 0x355 alone.
      *
-     * data[0] is the command byte the appliance echoes back, which RAC_056905_WW does not
-     * check because its appliance was never seen answering any other private read. This one
-     * was: the capture contains two responses to private command 0x0c (the humidity display
-     * setting), and they arrive with the same buf[0] == 0x02 that selects the filter path
-     * here. They are short enough that processFilterData() would reject them today, but
-     * only by accident, so dispatch on the echoed command byte as well.
+     * Nothing is published until both are known, so a lone 0x355 cannot briefly publish a
+     * value derived from a missing life. A negative result would mean the pair disagrees,
+     * for which there is no precedent in the two samples on file - 0x356 seen once at 3000,
+     * 0x355 seen at 2442 and then 2441 - so it is dropped rather than shown as a nonsensical
+     * filter reading.
+     *
+     * Dropping is not clearing: publishProperty retains, so whatever was published last
+     * stays live in the broker and HA goes on showing it, next to a 'filterlife' and
+     * 'filterremaining' that did publish. That is what the log line is for - a reading that
+     * silently stops tracking is how a wrong filter number survives unnoticed. It still
+     * beats the alternative: clamping to 0 would read as "brand-new filter", which is
+     * actively misleading rather than merely stale.
      */
-    processPrivData(cmd: number, buf9: number, data: Buffer) {
-        if (cmd == 0x02 && data[0] === 0x02) this.processFilterData(buf9, data)
-    }
+    publishFilterUsed() {
+        const life = this.raw_clip_state[0x356]
+        const remaining = this.raw_clip_state[0x355]
+        if (life === undefined || remaining === undefined) return
 
-    processPrivDataCmdResp(success: boolean, buf1: number, cmd: number, data: Buffer) {
-        if (cmd == 0x2) this.processFilterCmdResp(success, data)
-    }
-
-    sendFilterQuery() {
-        this.sendPrivCommand(0x02, 0x02)
-    }
-
-    sendFilterReset() {
-        if (!this.filterLifeTime) throw new Error('Filter lifetime not known')
-
-        const now = new Date()
-        const date = now.getUTCFullYear() * 10000 + (now.getUTCMonth() + 1) * 100 + now.getUTCDate()
-
-        const buf = Buffer.alloc(4 * 3)
-        // yes, it's opposite endianness vs read cmd
-        buf.writeUInt32BE(this.filterLifeTime, 1 * 4)
-        buf.writeUInt32BE(date, 2 * 4)
-
-        log('status', this.id, 'sending filter reset')
-        this.sendPrivCommand(0x02, 0x01, buf)
-    }
-
-    processFilterData(buf9: number, data: Buffer) {
-        if (data.length < 1 + 3 * 4) {
-            log('status', this.id, 'filter data too short:', data.length)
+        const used = life - remaining
+        if (used < 0) {
+            log('status', this.id, 'filter counters disagree, not publishing used:', life, remaining)
             return
         }
 
-        this.filterUsedTime = data.readUInt32LE(1 + 0 * 4)
-        this.filterLifeTime = data.readUInt32LE(1 + 1 * 4)
-        this.filterChangedDate = data.readUInt32LE(1 + 2 * 4)
-
-        if (!this.filterConfigured && this.filterLifeTime) this.addFilterComponents()
-        this.publishFilterData()
-    }
-
-    processFilterCmdResp(success: boolean, data: Buffer) {
-        if (!success) {
-            log('status', this.id, 'filter reset failed')
-            return
-        }
-
-        log('status', this.id, 'filter reset okay, re-querying')
-        this.sendFilterQuery()
-    }
-
-    /*
-     * Bolt the filter entities onto the already-published configuration and republish it.
-     * A device that never answers the filter query simply never gets them.
-     */
-    addFilterComponents() {
-        this.filterConfigured = true
-
-        const config = this.deviceConfig
-        const filterUsed = {
-            platform: 'sensor',
-            unique_id: '$deviceid-filterused',
-            state_topic: '$this/filterused',
-            name: 'Filter used time',
-            icon: 'mdi:air-filter',
-            device_class: 'duration',
-            unit_of_measurement: 'h',
-            state_class: 'total_increasing',
-            entity_category: 'diagnostic',
-        }
-        config['components']['filterused'] = filterUsed
-
-        const filterLife = {
-            platform: 'sensor',
-            unique_id: '$deviceid-filterlife',
-            state_topic: '$this/filterlife',
-            name: 'Filter life time',
-            icon: 'mdi:air-filter',
-            device_class: 'duration',
-            unit_of_measurement: 'h',
-            entity_category: 'diagnostic',
-        }
-        config['components']['filterlife'] = filterLife
-
-        const filterChanged = {
-            platform: 'sensor',
-            unique_id: '$deviceid-filterchangeddate',
-            state_topic: '$this/filterchangeddate',
-            name: 'Filter usage last reset',
-            icon: 'mdi:calendar-refresh-outline',
-            device_class: 'date',
-            entity_category: 'diagnostic',
-        }
-        config['components']['changeddate'] = filterChanged
-
-        const filterReset = {
-            platform: 'button',
-            unique_id: '$deviceid-filterreset',
-            command_topic: '$this/filterreset/set',
-            name: 'Reset filter usage',
-            icon: 'mdi:calendar-refresh-outline',
-            entity_category: 'diagnostic',
-        }
-        config['components']['filterreset'] = filterReset
-        this.fields_by_ha['filterreset'] = {
-            name: '',
-            comp: '',
-            write_xform: (val) => (val === 'PRESS' ? 1 : 0),
-            write_callback: (val) => {
-                if (val === 1) this.sendFilterReset()
-                return false
-            },
-        }
-
-        this.setConfig(config)
-
-        /* Refresh only once a day since a query might do an EEPROM write. */
-        if (this.filterQueryTimer == undefined) {
-            this.filterQueryTimer = setInterval(
-                () => {
-                    log('status', this.id, 'sending periodic filter data refresh query')
-                    this.sendFilterQuery()
-                },
-                24 * 60 * 60 * 1000,
-            )
-        }
-    }
-
-    publishFilterData() {
-        const changedDate =
-            Math.floor(this.filterChangedDate / 10000)
-                .toString()
-                .padStart(4, '0') +
-            '-' +
-            (Math.floor(this.filterChangedDate / 100) % 100).toString().padStart(2, '0') +
-            '-' +
-            (this.filterChangedDate % 100).toString().padStart(2, '0')
-
-        this.HA.publishProperty(this.id, 'filterused', this.filterUsedTime)
-        this.HA.publishProperty(this.id, 'filterlife', this.filterLifeTime)
-        this.HA.publishProperty(this.id, 'filterchangeddate', changedDate)
+        this.HA.publishProperty(this.id, 'filterused', used)
     }
 
     addSwitchField(
@@ -706,7 +724,7 @@ export default class Device extends TLVDevice {
             unique_id: '$deviceid-' + name,
             name: desc,
             icon: icon,
-            entity_category: 'config',
+            entity_category: options.entityCategory ?? 'config',
         }
         config['components'][name] = comp
 
@@ -761,6 +779,8 @@ export default class Device extends TLVDevice {
         icon?: string,
         extra?: Record<string, unknown>,
         read_xform?: FieldDefinition['read_xform'],
+        /* must return true, or this sensor stops publishing - see FieldDefinition */
+        read_callback?: FieldDefinition['read_callback'],
     ) {
         const comp = {
             icon: icon ?? undefined,
@@ -778,6 +798,7 @@ export default class Device extends TLVDevice {
             comp: name,
             writable: false,
             read_xform: read_xform,
+            read_callback: read_callback,
         })
     }
 }

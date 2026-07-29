@@ -13,8 +13,8 @@ const META: Metadata = { modelId: MODEL_ID, modelName: 'TEST', swVersion: '1.0' 
  * Real packet captures from a PAC_910604_WW stand air conditioner, driven by hand through
  * the LG ThinQ app while an operator annotated each action. Every state frame below is
  * marked 0xa7 at buf[6] - the quirk this profile exists to handle. The exceptions are
- * called out where they appear: one state frame deliberately re-marked 0x87, and the
- * private-channel fixtures, which are marked 0x65 or 0x87.
+ * called out where they appear: one state frame deliberately re-marked 0x87, and the single
+ * private-channel fixture, which is marked 0x65.
  *
  * Each fixture is labelled with the LG-app command that caused it rather than with the
  * nearest operator note: the operator types the note *after* acting, with a lag of 0.4 to
@@ -23,6 +23,29 @@ const META: Metadata = { modelId: MODEL_ID, modelName: 'TEST', swVersion: '1.0' 
 
 // Capability request emitted by the TLVDevice constructor (TLV 0x1f5 = 1).
 const CAPS_REQUEST_HEX = '01010400000065020201027D416A0D'
+
+/*
+ * SYNTHETIC. The only frame in this file that is not a capture, and it is one because the
+ * appliance's real capability reply was never recorded: a live probe established that it is
+ * 174 bytes carrying 54 TLVs, and wrote down ten of the tags - 0x2da, 0x2e1 = 36, 0x2e2 = 60
+ * among them - but the bytes themselves are gone and the other 44 tags are unknown.
+ *
+ * So this frame is built to the same shape - buf[8] = 0x01, which is what distinguishes a
+ * capability reply from a state frame's 0x04 - out of the tags that were recorded, plus
+ * 0x355 and 0x356 carrying values no live counter could hold: a 1 h filter with 1 h left.
+ * The CRC is computed rather than captured, using the same convention as the real frames
+ * (crc16 over buf[2 .. len-3], verified against STATE_FILTER_REMAINING_2441_HEX).
+ *
+ *      t=0x2e1 v=36    setpoint minimum, 18.0 C                   (recorded)
+ *      t=0x356 v=1     filter rated life                          (invented)
+ *      t=0x2e2 v=60    setpoint maximum, 30.0 C                   (recorded)
+ *      t=0x355 v=1     filter hours remaining                     (invented)
+ *      t=0x2da v=4660  eeprom checksum - what isCapsResponse() keys on (value invented)
+ *
+ * It cannot prove what the appliance really sends. It pins down the only thing that has to
+ * hold whatever the appliance sends: a capability reply must not reach the filter sensors.
+ */
+const CAPS_RESPONSE_HEX = '000004000000A70201400EB85024D581B8903CD541B6A012340EC4'
 
 /*
  * Comprehensive state dump, 221 bytes / 94 TLVs, emitted once at first connect.
@@ -35,7 +58,11 @@ const CAPS_REQUEST_HEX = '01010400000065020201027D416A0D'
  *      t=0x1fb v=0     temp step 0.5 C
  *      t=0x1fd v=50    current temp 25.0 C
  *      t=0x1fe v=42    target temp 21.0 C
+ *      t=0x356 v=3000  filter rated life, hours       (bytes D5A00BB8)
+ *      t=0x355 v=2442  filter hours remaining         (bytes D560098A)
  *      ...
+ * Note the wire order: 0x356 arrives before 0x355, so the derived "used" sensor cannot be
+ * computed when the first of the pair is processed.
  */
 const QUERY_RESPONSE_HEX =
     '000004000000A7020440' +
@@ -142,43 +169,30 @@ const STATE_ALLCLEAN_RUNNING_HEX = '000004000000A70204AE157DC17E407F90247E84D200
 const STATE_ALLCLEAN_STOPPED_HEX = '000004000000A70204B0147DC07E407F90247E84D2008F40E8805940C49011E98F'
 
 /*
- * Filter data over the private command channel. Provenance, because it differs per fixture
- * and the difference matters:
+ * Filter remaining hours ticking down by one. Captured verbatim, and it is the only frame
+ * in the whole capture besides the comprehensive dump that carries 0x355 or 0x356 - so the
+ * dump (0x356=3000, 0x355=2442) and this frame (0x355=2441) are the entire evidence base,
+ * and both are used below.
  *
- * FILTER_QUERY_HEX is what this profile's own sendPrivCommand(0x02, 0x02) emits, CRC
- * included, so asserting the device's output against it pins the encoder rather than
- * proving anything about the appliance. The framing is corroborated by the capture though:
- * the LG app issues exactly this shape of private read for command 0x0c, namely
- * 00FF0400000065FD0200050C00000000, sharing buf[0..8] with ours and differing only in the
- * command byte and the payload length.
+ * Decoding the payload D5600989 C484 by hand, because the numbers are the point:
+ *   D5 60   tag = (0xD5 << 2) | (0x60 >> 6) = 0x355, len = (0x60 >> 4) & 3 = 2, nibble = 0
+ *   09 89   => value 0x000989 = 2441 hours left
+ *   C4 84   tag 0x312 = 4, the frame's own length field - deliberately not an entity
  *
- * FILTER_RESPONSE_HEX is NOT from the capture and is not claimed to be: the LG app never
- * queries the filter, so the capture contains no command 0x02 traffic in either direction.
- * It is reconstructed - the three values a live probe of this model reported (used 0 h,
- * life 720 h, changed date 0) in RAC_056905_WW's processFilterData() layout, marked 0x87
- * because that probe was decoded by the unmodified base-class path.
- *
- * FILTER_RESPONSE_65_HEX is the same reconstructed payload marked the way this appliance
- * marked both of the private reads it *was* captured answering: buf[6] 0x65 and buf[9]
- * 0x00, see PRIV_0C_RESPONSE_HEX. Whether a real filter probe comes back 0x87 or
- * 0x65 is unsettled - the capture only shows command 0x0c, the live probe only command
- * 0x02 - so the profile accepts both markers and both are pinned here.
- *
- * PRIV_0C_RESPONSE_HEX is captured verbatim: the appliance answering a read of private
- * command 0x0c with humidity display = 0. Now that the 0x65 marker is accepted it reaches
- * processPrivData(), where the echoed command byte must keep it out of the filter fields.
- *
- * PRIV_0C_LONG_RESPONSE_HEX is CONSTRUCTED, not captured, and describes nothing about this
- * appliance: it is the same command 0x0c response padded to a filter response's length and
- * filled with values that would be visible if it were misdecoded (used 1 h, life 999 h).
- * The real one is short enough that processFilterData()'s length check rejects it by luck,
- * which is not the property under test - the dispatch on the echoed command byte is.
+ * 2442 -> 2441 against a constant 3000 h life is what fixes the direction of 0x355: it
+ * counts DOWN. The LG app read the same appliance a day later at 2438 h remaining / 562 h
+ * used, and 2438 + 562 = 3000 exactly.
  */
-const FILTER_QUERY_HEX = '00FF0400000065FD02000102511B'
-const FILTER_RESPONSE_HEX = '02FF0400000087FD03010D0200000000D0020000000000003920'
-const FILTER_RESPONSE_65_HEX = '02FF0400000065FD03000D0200000000D0020000000000008EC0'
+const STATE_FILTER_REMAINING_2441_HEX = '000004000000A70204DE06D5600989C4847922'
+
+/*
+ * Captured verbatim: the appliance answering a read of private command 0x0c (the humidity
+ * display setting) with buf[6] = 0x65. This profile sends no private commands and decodes
+ * no private payloads - see the filter note in the profile - so the only thing this fixture
+ * can now prove is the negative: a private-channel frame publishes nothing and, in
+ * particular, cannot resurrect a filter entity.
+ */
 const PRIV_0C_RESPONSE_HEX = '02FF0400000065FD0300050C000000003EC7'
-const PRIV_0C_LONG_RESPONSE_HEX = '02FF0400000065FD03000D0C01000000E7030000000000003021'
 
 /*
  * Bytes this profile emits for specific HA writes.
@@ -260,8 +274,8 @@ const WRITE_SELECTS: [string, string, string, string][] = [
 
 /* Wind direction. The app wrote all five values; each row quotes its frame. */
 const WRITE_SWINGS: [string, string, string][] = [
-    // HA swing_mode, our bytes, captured app frame
-    ['concentrated', '0101040000006502010102A8C1FF85', '0101040000006502010002A8C18931'],
+    // HA swing_horizontal_mode, our bytes, captured app frame
+    ['focus', '0101040000006502010102A8C1FF85', '0101040000006502010002A8C18931'],
     ['wide', '0101040000006502010102A8C2CFE6', '0101040000006502010002A8C2B952'],
     ['left', '0101040000006502010102A8C3DFC7', '0101040000006502010002A8C3A973'],
     ['right', '0101040000006502010102A8C4AF20', '0101040000006502010002A8C4D994'],
@@ -315,12 +329,13 @@ describe(MODEL_ID, () => {
         // This model has exactly three modes: no heat, no auto, no separate fan_only tag.
         assert.deepEqual(components.climate.modes, ['off', 'cool', 'dry', 'fan_only'])
         assert.deepEqual(components.climate.fan_modes, ['very low', 'low', 'medium', 'high', 'very high', 'auto'])
-        assert.deepEqual(components.climate.swing_modes, ['concentrated', 'wide', 'left', 'right', 'split'])
+        // Sideways airflow aim lives on swing_horizontal_mode, not swing_mode.
+        assert.deepEqual(components.climate.swing_horizontal_modes, ['focus', 'wide', 'left', 'right', 'split'])
         assert.equal(components.climate.min_temp, 18)
         assert.equal(components.climate.max_temp, 30)
 
-        // No vertical swing on this model.
-        assert.ok(!components.climate.swing_horizontal_modes, 'no horizontal swing')
+        // This model has no vertical louvre control at all, so no swing_mode.
+        assert.ok(!components.climate.swing_modes, 'no vertical swing')
 
         for (const name of [
             'jet',
@@ -337,6 +352,17 @@ describe(MODEL_ID, () => {
             'allclean',
         ]) {
             assert.equal(components[name]?.platform, 'switch', `${name} switch`)
+        }
+
+        /*
+         * The cleaning cycles are occasional maintenance, not settings, so they sit under
+         * diagnostics; every other switch is an everyday control and stays under config.
+         */
+        for (const name of ['hxclean', 'allclean']) {
+            assert.equal(components[name]?.entity_category, 'diagnostic', `${name} is diagnostic`)
+        }
+        for (const name of ['jet', 'quiet', 'uvnano', 'childlock', 'display', 'beep']) {
+            assert.equal(components[name]?.entity_category, 'config', `${name} is config`)
         }
 
         for (const name of ['onesidewind', 'aidrylevel']) {
@@ -362,12 +388,40 @@ describe(MODEL_ID, () => {
         // Tags the capture shows but nobody understands must not become entities.
         // 0x312 in particular is the frame's own length field - it is the most frequently
         // observed tag in the capture and therefore the most tempting false positive.
-        for (const name of ['348', '279', '27a', '312', '232', '233', '355', '356', '25e', '1fc']) {
+        for (const name of ['348', '279', '27a', '312', '232', '233', '25e', '1fc']) {
             assert.ok(!components[name], `no entity for unknown tag 0x${name}`)
         }
 
-        // Filter entities only appear once the private channel answers.
-        assert.ok(!components.filterused, 'filter entities deferred')
+        // The three filter entities are TLV-backed (0x355 / 0x356) and therefore present
+        // from the constructor, with no query and no private-channel handshake.
+        for (const name of ['filterlife', 'filterremaining', 'filterused']) {
+            assert.equal(components[name]?.platform, 'sensor', `${name} sensor`)
+            assert.equal(components[name]?.device_class, 'duration', `${name} is a duration`)
+            assert.equal(components[name]?.unit_of_measurement, 'h', `${name} is in hours`)
+            assert.equal(components[name]?.icon, 'mdi:air-filter', `${name} icon`)
+            assert.equal(components[name]?.entity_category, 'diagnostic', `${name} is diagnostic`)
+            assert.ok(!components[name]?.command_topic, `${name} is read-only`)
+        }
+        // Only the derived one accumulates.
+        assert.equal(components.filterused?.state_class, 'total_increasing')
+
+        /*
+         * The private-channel filter support is gone: its live probe reported a 720 h part
+         * while the appliance's own app reports 3000 h, so those numbers described something
+         * other than the user's filter. The reset button went with it - its target was never
+         * verified - and so did the changed-date sensor, which the old code registered under
+         * the key 'changeddate' rather than 'filterchangeddate'.
+         *
+         * Both keys are still in the payload, as removal markers. Omitting a component does
+         * not delete it from HA, it only stops updating it, so an installation that ran the
+         * previous version would keep a reset button wired to nothing. HA deletes a component
+         * whose config carries the platform and nothing else - hence deepEqual rather than a
+         * presence check: one extra key turns the removal back into a registration.
+         */
+        assert.deepEqual(components.filterreset, { platform: 'button' }, 'reset button marked for removal')
+        assert.deepEqual(components.changeddate, { platform: 'sensor' }, 'changed-date sensor marked for removal')
+        assert.ok(!dev.fields_by_ha['filterreset'], 'no filter reset write path')
+        assert.ok(!components.filterchangeddate, 'no filter changed-date sensor (topic name)')
 
         dev.drop()
     })
@@ -386,7 +440,7 @@ describe(MODEL_ID, () => {
         assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'temperature_state'), 21) // 0x1FE=42
         assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'current_temperature'), 25) // 0x1FD=50
         assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'fan_mode_state'), 'medium') // 0x1FA=4
-        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'swing_mode_state'), 'concentrated') // 0x2A3=1
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'swing_horizontal_mode_state'), 'focus') // 0x2A3=1
 
         assert.equal(ha.getProperty(DEVICE_ID, 'jet', 'state'), 'OFF') // 0x236=0
         assert.equal(ha.getProperty(DEVICE_ID, 'quiet', 'state'), 'OFF') // 0x29D=0
@@ -410,6 +464,11 @@ describe(MODEL_ID, () => {
         assert.equal(ha.getProperty(DEVICE_ID, 'energy_current', 'state'), 3501) // 0x2B3
         assert.equal(ha.getProperty(DEVICE_ID, 'error', 'state'), 0) // 0x221
         assert.equal(ha.getProperty(DEVICE_ID, 'humidity', 'state'), 57) // 0x336, integer %RH
+
+        // Filter, read straight off the two TLV tags plus the derived difference.
+        assert.equal(ha.getProperty(DEVICE_ID, 'filterlife', 'state'), 3000) // 0x356
+        assert.equal(ha.getProperty(DEVICE_ID, 'filterremaining', 'state'), 2442) // 0x355
+        assert.equal(ha.getProperty(DEVICE_ID, 'filterused', 'state'), 558) // 3000 - 2442
 
         dev.drop()
     })
@@ -518,34 +577,52 @@ describe(MODEL_ID, () => {
             [STATE_WIND_WIDE_HEX, 'wide'], // 0x2A3=2
             [STATE_WIND_LEFT_HEX, 'left'], // 0x2A3=3
             [STATE_WIND_RIGHT_HEX, 'right'], // 0x2A3=4
-            [STATE_WIND_CONCENTRATED_HEX, 'concentrated'], // 0x2A3=1
+            [STATE_WIND_CONCENTRATED_HEX, 'focus'], // 0x2A3=1
         ]
 
         for (const [frame, expected] of directions) {
             thinq.emit('data', buf(frame))
-            assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'swing_mode_state'), expected, expected)
+            assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'swing_horizontal_mode_state'), expected, expected)
         }
 
         thinq.emit('data', buf(STATE_WIND_SPLIT_HEX))
-        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'swing_mode_state'), 'split') // 0x2A3=5
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'swing_horizontal_mode_state'), 'split') // 0x2A3=5
         // the same frame carries a power reading
         assert.equal(ha.getProperty(DEVICE_ID, 'energy_current', 'state'), 297) // 0x2B3
 
         dev.drop()
     })
 
-    test('jet mode notification, and its pseudo fan speed 7 is discarded', (t) => {
+    test('jet mode reports fan speed 7 as auto, because the appliance owns the fan', (t) => {
         const { ha, thinq, dev } = buildReadyDevice(t)
+
+        // Before jet, the user's own selection is showing.
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'fan_mode_state'), 'medium')
 
         thinq.emit('data', buf(STATE_JET_ON_HEX))
         assert.equal(ha.getProperty(DEVICE_ID, 'jet', 'state'), 'ON') // 0x236=1
         assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'temperature_state'), 18) // forced 0x1FE=36
-        // 0x1FA=7 has no HA name; the previous value must survive rather than be corrupted.
-        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'fan_mode_state'), 'medium')
+        /*
+         * 0x1FA=7 means jet is driving the fan and the control is locked on the appliance.
+         * Reporting 'auto' is what the hardware actually shows; leaving 'medium' up would
+         * claim the user's old selection is still in force, which it is not.
+         */
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'fan_mode_state'), 'auto')
 
         thinq.emit('data', buf(STATE_JET_OFF_HEX))
         assert.equal(ha.getProperty(DEVICE_ID, 'jet', 'state'), 'OFF') // 0x236=0
         assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'fan_mode_state'), 'very high') // 0x1FA=6
+
+        dev.drop()
+    })
+
+    test('dry mode also reports auto, from the other device-driven fan value', (t) => {
+        const { ha, thinq, dev } = buildReadyDevice(t)
+
+        // 0x1FA=8 accompanies the dry-mode trio; the appliance greys the fan control out.
+        thinq.emit('data', buf(STATE_MODE_DRY_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'mode_state'), 'dry')
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'fan_mode_state'), 'auto')
 
         dev.drop()
     })
@@ -642,7 +719,7 @@ describe(MODEL_ID, () => {
         assert.equal(ha.getProperty(DEVICE_ID, 'allclean', 'state'), 'OFF')
         // the appliance resets these by itself while the cycle runs
         assert.equal(ha.getProperty(DEVICE_ID, 'smartcare', 'state'), 'OFF') // 0x23E=0
-        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'swing_mode_state'), 'concentrated') // 0x2A3=1
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'swing_horizontal_mode_state'), 'focus') // 0x2A3=1
 
         thinq.emit('data', buf(STATE_ALLCLEAN_RUNNING_HEX))
         assert.equal(ha.getProperty(DEVICE_ID, 'allclean', 'state'), 'ON') // 0x165=2
@@ -793,12 +870,12 @@ describe(MODEL_ID, () => {
         dev.drop()
     })
 
-    test('HA write climate-swing_mode emits the captured single-tag payload', (t) => {
+    test('HA write climate-swing_horizontal_mode emits the captured single-tag payload', (t) => {
         enableMockTimers(t)
         for (const [mode, expected, appFrame] of WRITE_SWINGS) {
             const { ha, thinq, dev } = readyDevice()
 
-            ha.setProperty(DEVICE_ID, 'climate', 'swing_mode_command', mode)
+            ha.setProperty(DEVICE_ID, 'climate', 'swing_horizontal_mode_command', mode)
 
             assert.equal(thinq.outbox.length, 1, mode)
             assert.equal(hex(thinq.outbox[0]), expected.toUpperCase(), mode)
@@ -874,122 +951,111 @@ describe(MODEL_ID, () => {
         dev.drop()
     })
 
-    // --- filter, over the private command channel ---
+    // --- filter, from TLV tags 0x355 / 0x356 ---
 
-    test('start() sends the filter query, whose response adds the filter entities', (t) => {
-        enableMockTimers(t)
-        const { ha, thinq, dev } = makeDevice()
-        thinq.resetRecorder()
-
-        dev.start()
-
-        // RAC-style: reset the TLV blacklist so the appliance notifies about everything,
-        // then give the modem a moment before probing the private channel.
-        assert.deepEqual(thinq.sent, [{ cmd: 'setMaskingInfo', type: 0, data: { blacklist_tlv: '1200' } }])
-        assert.equal(thinq.outbox.length, 0, 'filter query not sent yet')
-
-        tickMockTimers(t, 1000)
-        assert.equal(thinq.outbox.length, 1)
-        assert.equal(hex(thinq.outbox[0]), FILTER_QUERY_HEX.toUpperCase())
-
-        // Before the response there are no filter entities.
-        assert.ok(!ha.devices[DEVICE_ID].config!.components.filterused, 'no filter entities yet')
-
-        thinq.emit('data', buf(FILTER_RESPONSE_HEX))
-
-        const components = ha.devices[DEVICE_ID].config!.components
-        assert.ok(components.filterused, 'filterused added')
-        assert.ok(components.filterlife, 'filterlife added')
-        assert.ok(components.changeddate, 'changeddate added')
-        assert.ok(components.filterreset, 'filterreset button added')
-
-        assert.equal(dev.filterUsedTime, 0)
-        assert.equal(dev.filterLifeTime, 720)
-        assert.equal(dev.filterChangedDate, 0)
-
-        const props = ha.devices[DEVICE_ID].properties
-        assert.equal(props['filterused'], 0)
-        assert.equal(props['filterlife'], 720)
-        assert.equal(props['filterchangeddate'], '0000-00-00')
-
-        dev.drop()
-    })
-
-    test('a 0x65-marked filter response decodes too', (t) => {
-        enableMockTimers(t)
-        const { ha, thinq, dev } = makeDevice()
-
-        // 0x65 is the marker this appliance used on both private data responses it was
-        // captured sending. Marked that way, the base class would drop the frame and the
-        // filter entities would never appear.
-        thinq.emit('data', buf(FILTER_RESPONSE_65_HEX))
-
-        assert.ok(ha.devices[DEVICE_ID].config!.components.filterused, 'filterused added')
-        assert.equal(dev.filterUsedTime, 0)
-        assert.equal(dev.filterLifeTime, 720)
-        assert.equal(dev.filterChangedDate, 0)
-
-        dev.drop()
-    })
-
-    test('a private response to another command is not decoded as filter data', (t) => {
-        enableMockTimers(t)
-        const { ha, thinq, dev } = makeDevice()
-
-        // Captured verbatim: the appliance answering a read of private command 0x0c. It
-        // shares buf[0]=0x02 with a filter response and only the echoed command byte tells
-        // them apart, so this must not reach the filter fields or publish the entities.
-        thinq.emit('data', buf(PRIV_0C_RESPONSE_HEX))
-
-        assert.equal(dev.filterLifeTime, 0, 'filter lifetime untouched')
-        assert.ok(!ha.devices[DEVICE_ID].config!.components.filterused, 'no filter entities')
-
-        // The real 0x0c response is short enough that the length check in
-        // processFilterData() would have caught it anyway. This constructed one is not, so
-        // only the dispatch on the echoed command byte can keep it out.
-        thinq.emit('data', buf(PRIV_0C_LONG_RESPONSE_HEX))
-
-        assert.equal(dev.filterUsedTime, 0, 'filter used time untouched')
-        assert.equal(dev.filterLifeTime, 0, 'filter lifetime untouched')
-        assert.ok(!ha.devices[DEVICE_ID].config!.components.filterused, 'still no filter entities')
-
-        // A real filter response still works afterwards.
-        thinq.emit('data', buf(FILTER_RESPONSE_HEX))
-        assert.equal(dev.filterLifeTime, 720)
-
-        dev.drop()
-    })
-
-    test('the filter reset button issues a private reset command carrying the lifetime', (t) => {
-        enableMockTimers(t)
-        const { ha, thinq, dev } = makeDevice()
-        thinq.emit('data', buf(FILTER_RESPONSE_HEX))
-        thinq.resetRecorder()
-
-        ha.setProperty(DEVICE_ID, 'filterreset', 'command', 'PRESS')
-
-        assert.equal(thinq.outbox.length, 1)
-        const frame = thinq.outbox[0]
-        // sendPrivCommand(0x02, 0x01, <12 bytes>) - header, then the reset payload.
-        assert.equal(hex(frame.subarray(0, 12)), '00FF0400000065FD01000D02')
-        assert.equal(frame.length, 12 + 12 + 2)
-        // The payload is big-endian here, unlike the read direction.
-        assert.equal(frame.readUInt32BE(12 + 0), 0, 'used time field left zero')
-        assert.equal(frame.readUInt32BE(12 + 4), 720, 'life time echoed back')
-
-        const now = new Date()
-        const today = now.getUTCFullYear() * 10000 + (now.getUTCMonth() + 1) * 100 + now.getUTCDate()
-        assert.equal(frame.readUInt32BE(12 + 8), today, 'changed date set to today (UTC)')
-
-        dev.drop()
-    })
-
-    test('a filter response is not required for the rest of the profile to work', (t) => {
+    test('filter remaining counts down and used is derived from the pair', (t) => {
         const { ha, thinq, dev } = buildReadyDevice(t)
 
-        // No private-channel answer ever arrives, yet climate and friends still report.
-        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'mode_state'), 'cool')
-        assert.ok(!ha.devices[DEVICE_ID].config!.components.filterused, 'no filter entities')
+        // Both halves of the transition in one place. A second, lower remaining is what
+        // proves 0x355 counts DOWN rather than up, and that used tracks it the other way.
+        assert.equal(ha.getProperty(DEVICE_ID, 'filterremaining', 'state'), 2442) // from the dump
+        assert.equal(ha.getProperty(DEVICE_ID, 'filterused', 'state'), 558)
+
+        thinq.emit('data', buf(STATE_FILTER_REMAINING_2441_HEX))
+
+        assert.equal(ha.getProperty(DEVICE_ID, 'filterlife', 'state'), 3000) // 0x356, unchanged
+        assert.equal(ha.getProperty(DEVICE_ID, 'filterremaining', 'state'), 2441) // 0x355
+        assert.equal(ha.getProperty(DEVICE_ID, 'filterused', 'state'), 559) // 3000 - 2441
+
+        dev.drop()
+    })
+
+    test('used is not published until both tags are known', (t) => {
+        enableMockTimers(t)
+        const { ha, thinq, dev } = makeDevice()
+
+        // 0x355 alone. Its own sensor can publish, but 3000 - undefined is NaN, so the
+        // derived one must stay silent. This is the only arrangement in which the guard is
+        // observable: the dump carries 0x356 first, and a publish of NaN there would be
+        // overwritten by the correct value later in the very same frame.
+        thinq.emit('data', buf(STATE_FILTER_REMAINING_2441_HEX))
+
+        assert.equal(ha.getProperty(DEVICE_ID, 'filterremaining', 'state'), 2441)
+        assert.equal(ha.getProperty(DEVICE_ID, 'filterused', 'state'), undefined, 'nothing published yet')
+
+        // Once the life arrives, the pair resolves.
+        thinq.emit('data', buf(QUERY_RESPONSE_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'filterlife', 'state'), 3000)
+        assert.equal(ha.getProperty(DEVICE_ID, 'filterused', 'state'), 558) // dump carries 2442
+
+        dev.drop()
+    })
+
+    test('nothing on the private command channel is queried or decoded any more', (t) => {
+        enableMockTimers(t)
+        const { ha, thinq, dev } = makeDevice()
+        thinq.resetRecorder()
+
+        // start() resets the TLV blacklist and that is now all it does - no private probe is
+        // scheduled, because the 720 h counter that probe returned is not this appliance's
+        // filter and its meaning is unidentified.
+        dev.start()
+        assert.deepEqual(thinq.sent, [{ cmd: 'setMaskingInfo', type: 0, data: { blacklist_tlv: '1200' } }])
+
+        // The old code probed 500 ms after start() and then once a day. Nothing schedules a
+        // private command now; what is left on the wire is the base class' 15 s capability
+        // retry, which sends [0x01, 0x01, ...] rather than sendPrivCommand's [0x00, 0xff].
+        tickMockTimers(t, 24 * 60 * 60 * 1000)
+        assert.equal(thinq.outbox.filter((frame) => frame[1] === 0xff).length, 0, 'no private command sent')
+
+        // A private-channel frame still reaches processData()'s widened branches, and must
+        // now publish nothing at all.
+        thinq.emit('data', buf(PRIV_0C_RESPONSE_HEX))
+        assert.deepEqual(ha.devices[DEVICE_ID].properties, {}, 'no properties published')
+
+        // The filter entities exist regardless, and read only from TLV.
+        const components = ha.devices[DEVICE_ID].config!.components
+        assert.ok(components.filterlife && components.filterremaining && components.filterused)
+        assert.deepEqual(components.filterreset, { platform: 'button' }, 'reset button only marked for removal')
+
+        dev.drop()
+    })
+
+    test('the capability reply cannot feed the filter sensors', (t) => {
+        enableMockTimers(t)
+        const { ha, thinq, dev } = makeDevice()
+
+        /*
+         * The base class dispatches every tag of every accepted frame to its field before it
+         * looks at whether the frame is a capability reply, and the capability reply is the
+         * first frame this profile ever sees - so this is the state the filter sensors are
+         * born into, not an edge case.
+         */
+        thinq.emit('data', buf(CAPS_RESPONSE_HEX))
+
+        // First: the frame really was accepted and really did take the capability path.
+        // Without this the assertions below would also pass on a frame processData() had
+        // silently dropped, i.e. on a test that checks nothing.
+        assert.equal(dev.raw_clip_state[0x2e1], 36, 'caps frame was parsed (0x2E1)')
+        assert.equal(dev.raw_clip_state[0x2e2], 60, 'caps frame was parsed (0x2E2)')
+        assert.equal(dev.query_caps_timeout, undefined, 'recognised as the capability reply')
+
+        // And the filter tags inside it went nowhere - not to their own sensors, and not
+        // into the raw state the derived one is computed from.
+        assert.equal(dev.raw_clip_state[0x355], undefined, '0x355 not taken from caps')
+        assert.equal(dev.raw_clip_state[0x356], undefined, '0x356 not taken from caps')
+        assert.equal(ha.getProperty(DEVICE_ID, 'filterlife', 'state'), undefined, 'no life published')
+        assert.equal(ha.getProperty(DEVICE_ID, 'filterremaining', 'state'), undefined, 'no remaining published')
+        assert.equal(ha.getProperty(DEVICE_ID, 'filterused', 'state'), undefined, 'no used published')
+
+        // Real counters come from a state frame, and a capability reply arriving afterwards
+        // must not disturb them either.
+        thinq.emit('data', buf(QUERY_RESPONSE_HEX))
+        thinq.emit('data', buf(CAPS_RESPONSE_HEX))
+
+        assert.equal(ha.getProperty(DEVICE_ID, 'filterlife', 'state'), 3000)
+        assert.equal(ha.getProperty(DEVICE_ID, 'filterremaining', 'state'), 2442)
+        assert.equal(ha.getProperty(DEVICE_ID, 'filterused', 'state'), 558)
 
         dev.drop()
     })
