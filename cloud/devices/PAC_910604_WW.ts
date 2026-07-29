@@ -41,12 +41,132 @@ type SwitchOptions = {
     offValue?: number
     /* raw TLV value that reads back as 'ON', when it differs from onValue */
     readOnValue?: number
-    /* HA entity_category; 'config' unless the control is really a maintenance function */
+    /* HA entity_category; 'config' unless given, undefined for none - see entityCategoryOf() */
     entityCategory?: string
 }
 
+type SelectOptions = {
+    /* HA entity_category, with exactly the same convention as SwitchOptions */
+    entityCategory?: string
+}
+
+/*
+ * HA files an entity on the device page by its entity_category: 'config' puts it under
+ * "Configuration", 'diagnostic' under "Diagnostic", and NO KEY AT ALL under "Controls".
+ * There is no category string meaning "Controls", so an everyday control needs the key to be
+ * absent - which is why this returns a spreadable object rather than a bare value.
+ *
+ * `options.entityCategory ?? 'config'` cannot express that: it collapses "the caller asked
+ * for Controls" and "the caller said nothing" into the same answer. The presence of the key
+ * in `options` is the only thing that tells them apart, so that is what is tested. Note that
+ * `entity_category: undefined` is not good enough either - JSON.stringify() would drop it on
+ * the wire, but the component object HA's discovery payload is built from would still carry
+ * the key, and the tests assert on that object.
+ */
+function entityCategoryOf(options: { entityCategory?: string }) {
+    const category = 'entityCategory' in options ? options.entityCategory : 'config'
+    return category === undefined ? {} : { entity_category: category }
+}
+
+/*
+ * The 0xa8 telemetry record: NOT TLV, a FIXED-OFFSET binary struct, and therefore MODEL AND
+ * FIRMWARE SPECIFIC in a way nothing else in this file is. Everywhere else a tag carries its
+ * own identity, so a firmware that moves a field simply stops sending the tag; here a firmware
+ * that inserts one byte silently makes every offset below mean something different. Evidence
+ * is four annotated captures of ONE appliance on swVersion 310917 and nothing else.
+ *
+ * That is why the length test is exact rather than a lower bound. 66 of the 67 0xa8 frames on
+ * file are exactly 307 bytes with an identical header - 00 00 04 00 00 00 a8 <2-byte counter>
+ * 01 ff 0b 01 01 - and buf[10] is 0xff instead of the payload length every other frame kind
+ * puts there, which is why these frames fail the state-frame branch's `buf[10] === length - 13`
+ * test and reach here at all. The 67th is 15 bytes:
+ *
+ *   000004000000a8180201024ec1abda    (stand-capture.jsonl t+4341.7s)
+ *
+ * It is 0xa8 too, so a naive `buf[6] === 0xa8` predicate would index offset 160 of a 15-byte
+ * buffer and read `undefined`. It carries buf[10] = 0x02 = length - 13 and a TLV-shaped
+ * two-byte payload, so it fails BOTH extra tests below. Nothing else is known about it, and
+ * it is deliberately not decoded.
+ *
+ * buf[7] and buf[8] are left unconstrained on purpose: across the corpus they run 0x6665,
+ * 0x6701, 0x6702, 0x6703, 0x6705 ... 0x6766, increasing monotonically within a session. They
+ * are a counter, not a type code, and pinning them would reject valid frames.
+ */
+const A8_FRAME_LENGTH = 307
+
+/*
+ * Byte offset of the outdoor compressor running flag inside that record. MEASURED, and the
+ * derivation is written out in full because there is no tag name to fall back on and because
+ * an earlier draft of this file picked the wrong byte - the two candidates agree on every
+ * frame the owner actually watched, and differ only where he was predicting.
+ *
+ * hvac-action.jsonl is a purpose-run experiment: the owner set cooling to 18 C, raised the
+ * setpoint to 30 C so the compressor would stop, lowered it back to 18 C so it would restart,
+ * then switched to dry, annotating each step live and metering the outdoor unit.
+ *
+ * WHAT HE OBSERVED, kept strictly apart from what he predicted. Three of his eight notes are
+ * future tense - t+9.0s "압축기 돌 것" (the compressor WILL run), t+147.8s "압축기 설 것"
+ * (will stop), t+198.1s "다시 돌 것" (will run again) - and a prediction is not a reading.
+ * These are the frames a present-tense observation covers. 0x2b3 is tenths of a watt (see the
+ * power sensor below), so 13151 is 1315.1 W:
+ *
+ *      t+142.3s   @160=1   0x2b3=13151   "압축기 도는 중" (the compressor is running), t+125.4s
+ *      t+173.2s   @160=0   0x2b3=1008    "압축기 선 듯" (it seems to have stopped), t+156.6s
+ *      t+194.6s   @160=0   0x2b3=488     "압축기 진자 선듯. 실측 0w임" - really stopped, 0 W
+ *                                        measured at the outdoor unit, t+185.5s
+ *      t+433.1s   @160=1   0x2b3=11676   "다시 도는 중" (running again), t+420.1s
+ *      t+473.0s   @160=1   0x2b3=11387   running, now in dry mode
+ *
+ * THOSE FIVE LEAVE THREE CANDIDATES, NOT ONE. Of the 307 offsets, exactly @160, @173 and @198
+ * are strictly 0-or-1 across all 66 long frames in all four captures AND reproduce all five
+ * labels. @198 is eliminated because it disagrees with the compressor-Hz byte @177 in 21 of
+ * the 66. @160 and @173 disagree on exactly TWO frames in the whole corpus, hvac-action
+ * t+4.5s and t+337.3s - and those are precisely the two the owner never observed, the ones
+ * his two "will run" predictions point at. The choice between them is therefore made on
+ * telemetry, and the telemetry says the compressor was not cooling at either:
+ *
+ *   t+4.5s   @160=0 @173=1. The appliance has just been switched on. 0x2b3 reads 25.5 W at
+ *            t+8.2s and ramps 39.2, 59.3, 65.2, 65.3, 78.3, 88.2 W through t+68.1s - a fan
+ *            ramp, nothing more - and only steps to 943.2 W at t+77.8s. The compressor
+ *            started about 73 s AFTER this frame.
+ *   t+337.3s @160=0 @173=1, 0.4 s after a state frame carrying 0x2b3=1388 (138.8 W, against
+ *            an 87.1 W fan-only baseline 10 s earlier). Hz @177 and EEV @152 both read 0, and
+ *            coil temperature @175 reads 121 - the highest value anywhere in the corpus. At
+ *            t+4.5s it reads 116. Every one of the 30 frames with @177 > 0 has @175 <= 107.
+ *            Whatever 0x2b3 was about to do, nothing was being cooled at that instant.
+ *
+ * So @173 leads the machine by up to 73 s: it is a demand or enable, not a report. That is
+ * the wrong quantity for HA's hvac_action, which asks what the appliance IS doing - a fan
+ * ramping towards a compressor that has not started is 'idle', not 'cooling'.
+ *
+ * @160 is not an arbitrary pick out of the survivors either. Five offsets - 148, 153, 160,
+ * 165 and 177 - are non-zero in exactly the frames where @177 is non-zero, without a single
+ * exception in the 66; they are the compressor's own telemetry group. The other four carry
+ * magnitudes (@177 runs 50..77, @165 up to 55); @160 is the group's only strictly boolean
+ * member. It is the running bit that belongs to the same block as the Hz reading.
+ *
+ * The byte is strictly 0 or 1 in all 66 frames. It is read as `!== 0` anyway - if some
+ * firmware ever reports a compressor stage there, non-zero still means running.
+ *
+ * The name is COMPRESSOR_ and not IDU_ on purpose: RAC_056905_WW's getIDUActionRunningTLVNum
+ * is where the idea comes from, but this byte tracks the outdoor compressor, and calling it
+ * after the indoor unit would be a third wrong thing in one comment block.
+ */
+const COMPRESSOR_RUNNING_OFFSET = 160
+
 export default class Device extends TLVDevice {
     readonly deviceConfig: StandDiscovery
+
+    /*
+     * Last reading of the outdoor compressor flag, out of the 0xa8 record - see
+     * COMPRESSOR_RUNNING_OFFSET and updateClimateAction(). `undefined` means no 0xa8 frame
+     * has arrived that describes the run now in progress, which is a THIRD state and not a
+     * synonym for "not running": it is what suppresses the cooling/drying/idle publish
+     * entirely until the appliance has said. It is set back to `undefined` whenever the
+     * appliance is switched on, because a reading taken before or during an off period says
+     * nothing about the run that is starting - see forgetCompressorOnPowerUp().
+     */
+    compressorRunning: boolean | undefined = undefined
 
     constructor(HA: Connection, thinq: Thinq2Device, meta: Metadata) {
         super(HA, thinq)
@@ -68,6 +188,8 @@ export default class Device extends TLVDevice {
                     platform: 'climate',
                     unique_id: '$deviceid-climate',
                     name: null,
+                    /* hvac_action, published by updateClimateAction() - see the 0xa8 note there */
+                    action_topic: '$this/climate-action',
                     temperature_unit: 'C',
                     /* kept in sync with 0x1fb, see updateTempStep() */
                     temp_step: 0.5,
@@ -245,28 +367,66 @@ export default class Device extends TLVDevice {
         })
 
         /*
-         * 0x1fb selects the resolution of 0x1fe: 0 => 0.5 C, 1 => 1 C. It is exposed as the
-         * climate component's temp_step rather than as an entity of its own, so autoreg is
-         * off and the read callback suppresses the (topic-less) publish.
+         * 0x1fb selects the resolution of 0x1fe: 0 => 0.5 C, 1 => 1 C. It has two jobs, and
+         * exactly ONE field, because addField() registers fields_by_id[0x1fb] and a second
+         * registration would silently replace the first:
+         *   - it keeps the climate component's temp_step / precision in sync, via
+         *     updateTempStep() in the read callback, and
+         *   - it publishes a select of its own so the owner can change the resolution from
+         *     HA instead of only from the appliance.
          *
-         * Not writable: the LG app always writes it paired with 0x1fc, whose meaning is
-         * unknown and which this appliance never reports, so write_attach could not fill
-         * it in from raw_clip_state.
+         * So addSelectField() is deliberately NOT used here - it would build its own field
+         * for 0x1fb and take the temp_step sync with it. The component is built by hand and
+         * the topics come from addField()'s autoreg, which derives them from comp + '-' +
+         * name; hand-writing them would be one typo away from a silent desync.
+         *
+         * read_xform is total on purpose - it mirrors updateTempStep's own `raw === 1` rule
+         * rather than indexing the option list, so it can never return undefined and skip
+         * the read callback, which is what keeps temp_step tracking whatever the appliance
+         * reports. Diagnostic, because it describes how the setpoint is displayed rather
+         * than what the appliance does.
+         *
+         * WRITE CAVEAT, unattested on hardware. The LG app never writes 0x1fb alone: both
+         * writes in the capture pair it with 0x1fc = 0, whose meaning is unknown and which
+         * this appliance never reports, so write_attach cannot source it from
+         * raw_clip_state and inventing a value for it would be a guess.
+         *
+         *   01010400000065020100047f007ec14025   0x1fc = 0, 0x1fb = 1   ("1도로 변경")
+         *   01010400000065020100047f007ec05004   0x1fc = 0, 0x1fb = 0   ("0.5도로 변경")
+         *
+         * What goes out from here is therefore a bare 0x1fb. If a report ever arrives that
+         * HA moved this select and the appliance did not follow, 0x1fc is the first thing to
+         * try - the reads and the temp_step sync are unaffected either way.
          */
-        this.addField(
-            config,
-            {
-                id: 0x1fb,
-                name: 'temp_step',
-                comp: 'climate',
-                writable: false,
-                read_callback: (raw) => {
-                    this.updateTempStep(Number(raw))
-                    return false
-                },
+        const tempStepOptions = ['0.5', '1']
+        const tempStep = {
+            platform: 'select',
+            unique_id: '$deviceid-tempstep',
+            name: 'Temperature step',
+            icon: 'mdi:thermometer-lines',
+            entity_category: 'diagnostic',
+            options: tempStepOptions,
+        }
+        config['components']['tempstep'] = tempStep
+
+        this.addField(config, {
+            id: 0x1fb,
+            name: '',
+            comp: 'tempstep',
+            read_xform: (raw) => (raw === 1 ? '1' : '0.5'),
+            read_callback: () => {
+                /* processKeyValue() stores the raw value before it dispatches to the field */
+                this.updateTempStep(this.raw_clip_state[0x1fb])
+                /* ... and then let the select publish as usual */
+                return true
             },
-            false,
-        )
+            write_xform: (val) => {
+                const index = tempStepOptions.indexOf(val)
+                /* null cancels the write rather than sending a bogus resolution */
+                if (index < 0) return null
+                return index
+            },
+        })
 
         /*
          * None of these switches is declared optimistic, unlike RAC_056905_WW's. RAC needs
@@ -278,8 +438,19 @@ export default class Device extends TLVDevice {
         this.addSwitchField(config, 0x236, 'jet', 'Jet cool', 'mdi:wind-power')
         this.addSwitchField(config, 0x29d, 'quiet', 'Quiet mode', 'mdi:volume-off')
         this.addSwitchField(config, 0x2a2, 'uvnano', 'UVnano', 'mdi:bacteria')
-        this.addSwitchField(config, 0x1be, 'spacefit', 'Space-fit wind', 'mdi:arrow-expand-horizontal')
-        this.addSwitchField(config, 0x20f, 'airclean', 'Air purify', 'mdi:air-purifier')
+        /*
+         * Space-fit wind, air purify and the one-side wind select below carry NO
+         * entity_category, so HA files them under "Controls" next to the climate card rather
+         * than under "Configuration". They aim or clean the airflow - the owner reaches for
+         * them as often as for the fan speed, which is what separates a control from a
+         * setting here. Everything else stays 'config'.
+         */
+        this.addSwitchField(config, 0x1be, 'spacefit', 'Space-fit wind', 'mdi:arrow-expand-horizontal', {
+            entityCategory: undefined,
+        })
+        this.addSwitchField(config, 0x20f, 'airclean', 'Air purify', 'mdi:air-purifier', {
+            entityCategory: undefined,
+        })
         this.addSwitchField(config, 0x3a9, 'childlock', 'Child lock', 'mdi:lock')
         /* the appliance mirrors this into 0x25e, which needs no entity of its own */
         this.addSwitchField(config, 0x23e, 'smartcare', 'Smart care', 'mdi:auto-fix')
@@ -295,7 +466,8 @@ export default class Device extends TLVDevice {
             onValue: 0,
             offValue: 1,
         })
-        this.addSwitchField(config, 0x3a0, 'beep', 'Product beep', 'mdi:volume-high', { onValue: 0, offValue: 1 })
+        /* "Beep Sound" is the parallel of the display switch's "Display Light" above */
+        this.addSwitchField(config, 0x3a0, 'beep', 'Beep Sound', 'mdi:volume-high', { onValue: 0, offValue: 1 })
 
         /*
          * The cleaning cycles are start/stop pairs with a readable running state, so they
@@ -307,21 +479,30 @@ export default class Device extends TLVDevice {
          *
          * They are diagnostic rather than config: these are occasional maintenance cycles,
          * not settings, and they do not belong next to the everyday controls.
+         *
+         * Both are named "Cleaning - ..." so that the two sort together in HA's alphabetical
+         * entity list; the component keys are untouched, so entity_ids do not move.
          */
-        this.addSwitchField(config, 0x3a2, 'hxclean', 'Heat exchanger clean', 'mdi:heating-coil', {
+        this.addSwitchField(config, 0x3a2, 'hxclean', 'Cleaning - Heat exchanger', 'mdi:heating-coil', {
             entityCategory: 'diagnostic',
         })
-        this.addSwitchField(config, 0x165, 'allclean', 'All clean', 'mdi:spray-bottle', {
+        this.addSwitchField(config, 0x165, 'allclean', 'Cleaning - ALL', 'mdi:spray-bottle', {
             onValue: 100,
             readOnValue: 2,
             entityCategory: 'diagnostic',
         })
 
-        this.addSelectField(config, 0x2a8, 'onesidewind', 'One-side wind', 'mdi:arrow-left-right', [
-            'off',
-            'left',
-            'right',
-        ])
+        /* rawBase 0, and no entity_category - an everyday airflow control, see above */
+        this.addSelectField(
+            config,
+            0x2a8,
+            'onesidewind',
+            'One-side wind',
+            'mdi:arrow-left-right',
+            ['off', 'left', 'right'],
+            0,
+            { entityCategory: undefined },
+        )
         /* raw 2 .. 6 are the appliance's 1단 .. 5단 */
         this.addSelectField(
             config,
@@ -332,6 +513,177 @@ export default class Device extends TLVDevice {
             ['1', '2', '3', '4', '5'],
             2,
         )
+
+        /*
+         * How much of the AI dry cycle is left, and whether one is running at all. Both come
+         * from 0x225, the third member of the AI dry trio - 0x20e is the enable switch, 0x1f2
+         * the level - and both are read-only, because this is the appliance counting down,
+         * not a setting.
+         *
+         * MINUTES, NOT PERCENT, and that is measured rather than inherited. RAC_056905_WW
+         * publishes the same tag as 'autodryremain' in '%'; do not copy that here. A capture
+         * of a real cycle on this appliance (aidry-run.jsonl) has the operator transcribing
+         * what the appliance's own display said, and the tag matches it exactly.
+         *
+         * READ THE WHOLE FILE. aidry-run.jsonl holds TWO capture sessions: a `stopped` marker
+         * at t+213.8s and then a fresh `session` record at t+706.8s. An earlier version of
+         * this comment stopped scanning at that marker and cited only the first four
+         * readings; there are ten device-side values of 0x225 on disk, and the cancel below.
+         *
+         *      t+2.9s      0x225 = 32   (the unit had just been switched off)
+         *      t+34.5s     operator: "32분 남았다고 보임" - the display says 32 minutes left
+         *      t+47.1s     0x225 = 31
+         *      t+106.8s    0x225 = 30
+         *      t+166.6s    0x225 = 29
+         *      t+211.1s    operator: "29분 남았다고 보임"
+         *      ---         capture stopped t+213.8s, resumed t+706.8s: 28 .. 20 are simply
+         *                  not on disk, so the jump below is a recording gap, not a skip
+         *      t+763.6s    0x225 = 19
+         *      t+823.3s    0x225 = 18
+         *      t+883.1s    0x225 = 17
+         *      t+942.8s    0x225 = 16
+         *      t+1002.7s   0x225 = 15
+         *      t+1019.5s   operator: "지금 15분 남음" - 15 minutes left now
+         *      t+1021.3s   the LG app cancels the cycle - see the read-only note below
+         *
+         * The value decrements once every 60 s - 47.1 -> 106.8 -> 166.6 in the first session,
+         * then 59.7 / 59.8 / 59.7 / 59.9 s apart across 19 -> 15 in the second - which is
+         * what a minute counter does and what a percentage of an unknown-length cycle would
+         * not. Three independent transcriptions of the appliance's own display fix the unit.
+         *
+         * RAC gates its version on 0x2cc & 4; here it is unconditional, for the reason given
+         * at the sleep timer below.
+         */
+        this.addSensorField(
+            config,
+            0x225,
+            'aidryremain',
+            'AI dry remaining',
+            'mdi:hair-dryer-outline',
+            {
+                device_class: 'duration',
+                unit_of_measurement: 'min',
+                state_class: 'measurement',
+            },
+            undefined,
+            () => {
+                this.publishAiDryRunning()
+                /* let the remaining-time sensor publish as usual */
+                return true
+            },
+        )
+
+        /*
+         * Derived from the same tag, so it has NO field of its own - registering a second
+         * field for 0x225 would silently replace the first, exactly as at 0x1fb above. It is
+         * published from that field's read callback, the pattern 'filterused' already uses.
+         *
+         * ON when 0x225 > 0. The tag reads 0 in every other capture of this appliance,
+         * including throughout a long cooling run, and jumps to 32 in the very frame that
+         * reports the unit being switched off with AI dry enabled - so a non-zero remaining
+         * time is exactly the condition "a dry cycle is running now".
+         *
+         * NOT the same thing as the 'aidry' switch on 0x20e. That one is the user's enable
+         * setting: it stays ON whether or not a cycle is in progress, and it is what makes a
+         * cycle start when the appliance is next switched off. This is the cycle itself. Do
+         * not merge the two - one is a preference, the other is a live state.
+         *
+         * Both sensors are read-only, but a cycle CAN now be stopped from HA - see the
+         * 'aidrycancel' button below.
+         */
+        const aidryRunning = {
+            platform: 'binary_sensor',
+            unique_id: '$deviceid-aidryrunning',
+            state_topic: '$this/aidryrunning',
+            name: 'AI dry running',
+            icon: 'mdi:hair-dryer',
+            entity_category: 'diagnostic',
+        }
+        config['components']['aidryrunning'] = aidryRunning
+
+        /*
+         * Cancel a running AI dry cycle. THE CANCEL IS CAPTURED - it is a plain TLV write of 0
+         * to 0x225, and nothing about it is inferred. aidry-run.jsonl catches the LG app
+         * cancelling the running cycle, CRC valid, four seconds before the operator wrote down
+         * that they pressed stop:
+         *
+         *   TX 010104000000650201000289403d4f       0x225 = 0                    (t+1021.3s)
+         *          payload 8940: tag = (0x89 << 2) | (0x40 >> 6) = 0x225, len = 0, value = 0
+         *   rx 0201040000008701100000ec3c           acknowledgement              (t+1021.5s)
+         *   rx 000004000000a7020404068940a8c1c48485b6                            (t+1021.6s)
+         *          0x225 = 0, 0x2a3 = 1 - the appliance confirms, and resets the wind
+         *          direction as the cycle ends
+         *   operator: "지금 15분 남음" (15 minutes left now, t+1019.5s), then "중단 눌렀음"
+         *          (pressed stop, t+1025.3s), then "중단 됨 - 화면에서 건조 표시 사라짐"
+         *          (stopped, the drying indicator is gone from the display, t+1039.3s)
+         *
+         * Same shape as the filter reset below, for the same reasons. It goes through
+         * fields_by_ha directly rather than addField, because addField would take over
+         * fields_by_id[0x225] and break the 'aidryremain' sensor and the derived
+         * 'aidryrunning' with it. It carries no `id` key at all, so there is no tag for the
+         * default write path to stamp even if write_callback's return value were ever changed.
+         * The callback sends the frame itself and returns false: the appliance's own reply -
+         * the third line above - is what moves the two sensors, so a press that the appliance
+         * ignores leaves HA showing the cycle still running, which is the truth.
+         *
+         * A button rather than a switch, and not merged into the 'aidry' switch on 0x20e:
+         * that switch is the owner's standing preference for whether a cycle starts at the
+         * next power-off, and it stays ON across this cancel. Only 'aidryrunning' goes OFF.
+         * There is no captured way to START a cycle on demand - the appliance begins one by
+         * itself when it is switched off with 0x20e set - so a start button would be a guess
+         * and there is none.
+         */
+        const aidryCancel = {
+            platform: 'button',
+            unique_id: '$deviceid-aidrycancel',
+            command_topic: '$this/aidrycancel/set',
+            name: 'Cancel AI dry',
+            icon: 'mdi:hair-dryer-outline',
+            entity_category: 'diagnostic',
+        }
+        config['components']['aidrycancel'] = aidryCancel
+        this.fields_by_ha['aidrycancel'] = {
+            name: '',
+            comp: '',
+            write_xform: (val) => (val === 'PRESS' ? 0 : null),
+            write_callback: () => {
+                log('status', this.id, 'cancelling the AI dry cycle')
+                this.send([1, 1, 2, 1, 1], [{ t: 0x225, v: 0 }])
+                return false
+            },
+        }
+
+        /*
+         * Sleep timer: the appliance switches itself off after this many minutes. Stored in
+         * MINUTES, published in hours on a 0 .. 15 h slider in quarter-hour steps, exactly as
+         * RAC_056905_WW does.
+         *
+         * SCALE AND RANGE UNATTESTED ON THIS APPLIANCE, in the same sense as the 0x1fb write
+         * caveat above, and stated here rather than left to look like a measurement. Every
+         * capture was decoded tag by tag: 0x21a occurs exactly twice, once in each 94-TLV
+         * comprehensive dump, and reads 0 both times. There is no non-zero reading, no
+         * observed countdown, no write of it by the LG app, and not one operator annotation
+         * about a sleep or reservation timer. So the minute scale, the once-a-minute
+         * countdown, the 15 h ceiling the display shows as "FH" and the quarter-hour step are
+         * not observations of this appliance. They rest on three other things: addTimerField()
+         * below is a byte-identical re-implementation of RAC_056905_WW's, whose own comment is
+         * where the once-a-minute countdown comes from; the owner reports the range and the
+         * "FH" display; and the capability bit below says the feature exists at all. One
+         * 15-minute observation - set the timer, watch a single decrement - would settle it.
+         *
+         * Supported, on this model's own word: the capability reply carries
+         * 0x2d3 = 282643 = 0x45013, and 0x2d3 & 1 - the bit RAC gates its sleep timer on - is
+         * set. It is added UNCONDITIONALLY rather than gated, because this profile publishes
+         * its whole configuration from the constructor and the capability reply only arrives
+         * later; gating would mean rebuilding the config after caps, which is the change
+         * RAC's design implies and this profile deliberately does not make.
+         *
+         * NO turn-on / turn-off timers, and do not add them from a tag dump: RAC gates its
+         * 0x21c / 0x21b pair on 0x2d3 & 4, and in the same word - 0x45013 - that bit is
+         * CLEAR. This model does not support them.
+         */
+        this.addTimerField(config, 0x21a, 'sleeptimer', 'Sleep timer', 'mdi:bed-clock', 15)
+
         /*
          * Read-only. Every other writable tag in this profile has a captured LG-app TLV
          * write behind it; 0x337 has none. The app does change this setting, but over the
@@ -363,11 +715,20 @@ export default class Device extends TLVDevice {
          * The LG app changes this over the private command channel rather than with a TLV
          * write, so it was first exposed read-only. A TLV write was then tried against the
          * appliance and does take effect, so it is a proper select.
+         *
+         * Diagnostic: it changes what the appliance's own panel shows, not what the
+         * appliance does, so it sits with the readings rather than with the settings.
          */
-        this.addSelectField(config, 0x337, 'humiditydisplay', 'Humidity display', 'mdi:water-percent', [
-            'while running',
-            'always',
-        ])
+        this.addSelectField(
+            config,
+            0x337,
+            'humiditydisplay',
+            'Humidity display',
+            'mdi:water-percent',
+            ['while running', 'always'],
+            0,
+            { entityCategory: 'diagnostic' },
+        )
 
         /*
          * force_update matters here: the appliance refreshes 0x2b3 less often than the
@@ -380,13 +741,25 @@ export default class Device extends TLVDevice {
          * The rest of the range agrees: 72 .. 251 raw while only the fan runs is 7 .. 25 W,
          * and 2556 .. 3501 raw under partial cooling load is 256 .. 350 W.
          *
-         * There is no additive bias to remove. RAC applies max(5, raw - 60) because that
-         * appliance never reports a true zero; this one reports exactly 0 the moment it
-         * stops, so subtracting anything would be wrong.
+         * There is no additive bias to remove, and this is now measured rather than assumed.
+         * RAC applies max(5, raw - 60) because that appliance never reports a true zero; this
+         * one reports exactly 0 when it is switched off (stand-capture.jsonl t+4336.0s, in the
+         * frame after 0x1f7 goes to 0), so subtracting anything would be wrong.
          *
-         * Note for whoever sums these across a house: the figure is this indoor unit's share
-         * of the outdoor compressor and excludes the indoor fan, so the units will not add
-         * up to the real total. It is for apportioning between rooms.
+         * THE FIGURE INCLUDES THE INDOOR FAN. An earlier version of this comment repeated
+         * RAC's claim that it is the indoor unit's share of the outdoor compressor and
+         * EXCLUDES the fan; on this appliance that is backwards, and hvac-action.jsonl says so
+         * directly. With the compressor stopped - @160 = 0 at t+173.2s and t+194.6s, see
+         * COMPRESSOR_RUNNING_OFFSET - the owner metered the OUTDOOR unit at 0 W and wrote down
+         * ("압축기 진자 선듯. 실측 0w임", t+185.5s) while 0x2b3 was reading 488, i.e. 48.8 W.
+         * A tag that excluded the indoor fan would have had to read 0 there. What it reports
+         * instead is the 48.8 W the outdoor meter cannot see, which is the indoor fan.
+         *
+         * That single reading does two jobs. It fixes the offset at zero - 488 raw against a
+         * true outdoor 0 W leaves no room for a subtraction that would also have to survive
+         * the 0 reported when the unit is off - and it makes this figure the whole indoor
+         * unit's draw, so these DO sum across a house rather than being a share to apportion
+         * between rooms.
          */
         this.addSensorField(
             config,
@@ -533,8 +906,9 @@ export default class Device extends TLVDevice {
          * actually asked. Treat this as unqueried, not unsupported. (Answering is not the
          * same as answering usefully: see the filter note below.)
          *
-         * There is also a positive hint: the 307-byte 0xa8 records this profile ignores are
-         * a fixed-offset mirror of the same state (offset 261 tracks 0x2b3 in 51 of 52
+         * There is also a positive hint: the 307-byte 0xa8 records - of which this profile
+         * now decodes exactly one byte, the compressor flag at COMPRESSOR_RUNNING_OFFSET - are a
+         * fixed-offset mirror of the same state (offset 261 tracks 0x2b3 in 51 of 52
          * frames across 32 distinct values), and they contain a byte at offset 175 that
          * behaves exactly like an evaporator coil temperature - it falls as compressor
          * power ramps and recovers monotonically over 13 samples after shutdown. It is
@@ -619,6 +993,27 @@ export default class Device extends TLVDevice {
             return
         }
 
+        /*
+         * 0xa8 telemetry record. Everything about the predicate and the offset is argued at
+         * A8_FRAME_LENGTH / COMPRESSOR_RUNNING_OFFSET above; the two extra tests keep the
+         * 15-byte 0xa8 variant out, so neither may be dropped as redundant. Note this cannot
+         * be folded into the state branch: buf[10] is 0xff here, so `buf[10] === length - 13`
+         * is false by construction.
+         */
+        if (
+            buf[2] === 0x04 &&
+            buf[3] === 0x00 &&
+            buf[4] === 0x00 &&
+            buf[5] === 0x00 &&
+            buf[6] === 0xa8 &&
+            buf[10] === 0xff &&
+            buf.length === A8_FRAME_LENGTH
+        ) {
+            this.compressorRunning = buf[COMPRESSOR_RUNNING_OFFSET] !== 0
+            this.updateClimateAction()
+            return
+        }
+
         /* private data response - the appliance answering a private-channel read */
         if (
             buf[1] === 0xff &&
@@ -682,7 +1077,163 @@ export default class Device extends TLVDevice {
     processTLV(tlvArray: TLV.TLV[]) {
         if (this.isCapsResponse(tlvArray)) tlvArray = tlvArray.filter(({ t }) => t !== 0x355 && t !== 0x356)
 
+        const powerBefore = this.raw_clip_state[0x1f7]
         super.processTLV(tlvArray)
+
+        this.forgetCompressorOnPowerUp(powerBefore)
+
+        /*
+         * hvac_action is derived from three inputs and has to be republished when ANY of them
+         * moves, not only when a 0xa8 frame lands - the 0xa8 records arrive every 20 .. 100 s
+         * and a mode change in between would otherwise leave HA showing 'cooling' during a
+         * dry cycle for over a minute. The 0xa8 branch in processData() covers the third input.
+         *
+         * Gated on the frame carrying one of the two tags rather than run unconditionally,
+         * because a state frame carrying only room temperature or humidity cannot have changed
+         * the action. This is a relevance test, not a de-duplicator: the 0xa8 branch above
+         * republishes on every record, so an unchanged action is re-sent every 20 .. 100 s
+         * regardless. That is deliberate - it is roughly one retained MQTT message a minute -
+         * and the gate here would not reduce it.
+         *
+         * The gate is deliberately applied to the post-filter array, but that is not what keeps
+         * the capability reply out - checked rather than assumed: the appliance's real 54-TLV
+         * capability reply carries NEITHER 0x1f7 nor 0x1f9, so it cannot reach this at all.
+         * Were a future firmware to include them, the base class would already have stamped
+         * them into raw_clip_state before this line runs, so recomputing from them changes
+         * nothing that has not already happened.
+         *
+         * This is done here rather than from the fields' read callbacks, which is how
+         * RAC_056905_WW does it, because both of those callbacks are unreachable for exactly
+         * the values that matter most: processKeyValue() drops a reading whose read_xform
+         * returns undefined BEFORE it reaches the callback, and 0x1f9's read_xform returns
+         * undefined for any raw outside {0, 1, 5}. Sourcing the tags from raw_clip_state,
+         * which the base class has already stamped, means an unmapped mode still reaches
+         * updateClimateAction() and still gets an answer computed for it.
+         *
+         * What it does NOT do is make the answer a good one. modes2ha there covers 0 and 1
+         * only, so with the unit on, the flag set and a mode outside {0, 1, 5}, the action is
+         * undefined and nothing is published - HA keeps showing whatever it last saw. That is
+         * the same freeze, one layer up, and it is left alone rather than papered over: mode 2
+         * was injected into this appliance and rejected, the capability reply declares exactly
+         * {0, 1, 5}, and no other value appears in any of the four captures. There is no
+         * evidence about what such a mode would be doing, and inventing a string for it would
+         * be the mistake COMPRESSOR_RUNNING_OFFSET is a note about.
+         */
+        if (tlvArray.some(({ t }) => t === 0x1f7 || t === 0x1f9)) this.updateClimateAction()
+    }
+
+    /*
+     * THE COMPRESSOR FLAG DOES NOT SURVIVE AN OFF PERIOD. Call with the value of 0x1f7 read
+     * BEFORE whatever may have changed it; this throws the flag away if that turned the
+     * appliance on.
+     *
+     * updateClimateAction() answers 'off' from power alone and never reads the flag while the
+     * unit is off, so a stale reading is harmless *during* the off period - but without this
+     * it is still sitting there when the appliance comes back on, and the first recomputation
+     * after power returns publishes it as 'cooling'. The stale reading is real, not
+     * hypothetical: aidry-run.jsonl goes 0x1f7 = 0 at t+2.9s and the flag still reads 1 at
+     * t+5.1s and t+8.4s, reaching 0 only at t+14.0s.
+     *
+     * THE RISING EDGE, NOT THE FALLING ONE. Clearing when the appliance switches off looks
+     * equivalent and is not: 0xa8 records keep arriving while it is off - t+5.1s above is one
+     * of them - so the flag would simply be re-latched a second or two later and the same
+     * wrong 'cooling' would appear at the next power-on. Only the rising edge is a moment
+     * after which no earlier reading can possibly describe the run that is starting.
+     *
+     * BOTH WAYS THE APPLIANCE CAN COME ON. A state frame carrying 0x1f7 = 1 is only the case
+     * where the user pressed the button on the remote. When the user presses it in HA,
+     * TLVDevice.setProperty() stamps raw_clip_state before it sends anything and 0x1f9's
+     * write_attach does the same for a mode select made while off, so by the time the
+     * appliance echoes the change back there is no transition left to see. That is why this
+     * is a helper called from two places rather than three lines inside processTLV().
+     *
+     * THE COST, stated rather than glossed: for the first moments of a new run the action is
+     * unknown again, so nothing is published and HA goes on showing the 'off' it was last
+     * told, until a 0xa8 record lands - within 100 s in every observed session, and 3.3 s in
+     * the one real power cycle on file (stand-capture.jsonl, 0x1f7 = 1 at t+4340.5s, next
+     * 0xa8 at t+4343.8s). That is the same trade this profile already makes at startup and for
+     * the same reason. Clearing to `false` instead - i.e. claiming 'idle' - was rejected
+     * because it is not entailed: the compressor really can still be turning seconds after an
+     * off, which is exactly what t+5.1s shows, and a fast off/on would then be misreported in
+     * the other direction.
+     */
+    forgetCompressorOnPowerUp(powerBefore: number | undefined) {
+        if (powerBefore === 0 && this.raw_clip_state[0x1f7] === 1) this.compressorRunning = undefined
+    }
+
+    /*
+     * The HA-side half of that. Everything a user can press in HA arrives here, so reading
+     * 0x1f7 around the base class' write is enough to catch both routes that turn the
+     * appliance on: the power switch, which writes 0x1f7 itself, and a mode select made while
+     * the entity reads 'off', which reaches it through 0x1f9's write_attach.
+     */
+    setProperty(prop: string, mqttValue: string) {
+        const powerBefore = this.raw_clip_state[0x1f7]
+        super.setProperty(prop, mqttValue)
+        this.forgetCompressorOnPowerUp(powerBefore)
+    }
+
+    /*
+     * Publish HA's hvac_action - what the appliance is doing right now, as opposed to
+     * hvac_mode, which is what it has been asked to do. The mechanism is RAC_056905_WW's:
+     * an action_topic on the climate component plus a plain publishProperty() to it, with no
+     * field and no tag behind it.
+     *
+     * WHY THIS PROFILE NEEDS ITS OWN. RAC reads the indoor-unit running flag from TLV 0x189 or
+     * 0x6c (getIDUActionRunningTLVNum). Neither tag appears anywhere in any of the four
+     * captures of this appliance - not in the 94-tag comprehensive dump, not in the 54-TLV
+     * capability reply, not in any change notification. The information is not missing though:
+     * it is in the fixed-offset 0xa8 record this profile used to ignore. See
+     * COMPRESSOR_RUNNING_OFFSET.
+     *
+     * ORDER IS LOAD-BEARING, not stylistic:
+     *
+     *   power 0x1f7 === 0        -> 'off'.  Tested FIRST because the compressor coasts down
+     *        after the unit is switched off and the flag lags: aidry-run.jsonl t+5.1s and
+     *        t+8.4s are real frames with 0x1f7 = 0 and @160 = 1. Checking the flag first would
+     *        report a powered-off appliance as cooling.
+     *   mode 0x1f9 === 5         -> 'fan'.  Air-clean, which HA has no better word for.
+     *        Tested BEFORE the flag for the same class of reason: stand-capture.jsonl has six
+     *        frames with mode 5 and @160 = 1 (t+587.5s, 590.4s, 1003.6s, 1006.0s, 3319.0s,
+     *        3321.8s), the compressor still winding down from the mode that preceded it.
+     *        Checking the flag first would report 'cooling' while the appliance air-cleans.
+     *   flag set                 -> 'cooling' (mode 0) or 'drying' (mode 1).
+     *   flag clear, unit on      -> 'idle'.
+     *
+     * WHAT IS PUBLISHED WHILE THE FLAG IS UNKNOWN: nothing, unless the answer does not depend
+     * on it. 'off' and 'fan' are published from the state frame alone, because power and mode
+     * settle them. For a running cool or dry the choice is between 'cooling' and 'idle' and
+     * there is no evidence either way, so this publishes NEITHER and HA shows no action - or
+     * goes on showing the previous one - until a 0xa8 record lands, within 100 s in every
+     * observed session. That window opens twice: at startup, and again on every power-on, when
+     * processTLV() discards the pre-off reading. RAC defaults its equivalent flag to "running"
+     * when it has no tag to read; that is not copied here, because on this appliance the flag
+     * genuinely exists and assuming it would mean showing 'cooling' during the minute a
+     * compressor typically takes to start - which is exactly what hvac-action.jsonl t+4.5s
+     * measures, 73 s of fan before the compressor drew anything. A missing reading is better
+     * than an invented one.
+     *
+     * Deliberately no analogue of RAC's `action = 'None'`: that is not one of HA's hvac_action
+     * values, it exists for RAC's auto mode, and this model has no auto mode. Only the five
+     * HA-valid strings are ever emitted. Deliberately no analogue of updateQueryInterval()
+     * either - it owns a setTimeout, and this profile owns no timers (see drop()).
+     */
+    updateClimateAction() {
+        const power = this.raw_clip_state[0x1f7]
+        const mode = this.raw_clip_state[0x1f9]
+        const modes2ha: Record<number, string> = { 0: 'cooling', 1: 'drying' }
+
+        let action: string | undefined = undefined
+        if (power === 0) {
+            action = 'off'
+        } else if (power === 1) {
+            if (mode === 5) action = 'fan'
+            else if (this.compressorRunning === false) action = 'idle'
+            else if (this.compressorRunning === true) action = modes2ha[mode]
+        }
+
+        /* undefined means "not known yet", which is published as silence, not as a string */
+        if (action !== undefined) this.HA.publishProperty(this.id, 'climate-action', action)
     }
 
     /*
@@ -758,6 +1309,20 @@ export default class Device extends TLVDevice {
         this.HA.publishProperty(this.id, 'filterused', used)
     }
 
+    /*
+     * 'aidryrunning' has no tag of its own: it is the truth of 0x225 > 0, published from the
+     * read callback of the field that owns 0x225 - see the AI dry block in the constructor.
+     *
+     * processKeyValue() stores the raw value before it dispatches to the field, so reading it
+     * back out of raw_clip_state here sees this frame's value, not the previous one. It is
+     * read from there rather than taken as the callback's argument so that the rule stays
+     * written against the raw tag, which is what the observation above is about.
+     */
+    publishAiDryRunning() {
+        const remaining = this.raw_clip_state[0x225]
+        this.HA.publishProperty(this.id, 'aidryrunning', remaining > 0 ? 'ON' : 'OFF')
+    }
+
     addSwitchField(
         config: DeviceDiscovery,
         id: number,
@@ -775,7 +1340,7 @@ export default class Device extends TLVDevice {
             unique_id: '$deviceid-' + name,
             name: desc,
             icon: icon,
-            entity_category: options.entityCategory ?? 'config',
+            ...entityCategoryOf(options),
         }
         config['components'][name] = comp
 
@@ -788,6 +1353,41 @@ export default class Device extends TLVDevice {
         })
     }
 
+    /*
+     * A countdown timer, published as an HA number in hours while the appliance stores
+     * minutes. This is RAC_056905_WW's addTimerField() re-implemented rather than imported:
+     * that one is a private method of the RAC profile, and the two profiles share no base
+     * class below TLVDevice.
+     *
+     * No entity_category, so HA files it under "Controls" - it is a thing the owner sets,
+     * not a setting about the appliance. `max` is a parameter only because it is RAC's
+     * shape; this profile has exactly one timer and passes 15.
+     */
+    addTimerField(config: DeviceDiscovery, id: number, name: string, desc: string, icon: string, max: number) {
+        const comp = {
+            platform: 'number',
+            unique_id: '$deviceid-' + name,
+            name: desc,
+            icon: icon,
+            device_class: 'duration',
+            unit_of_measurement: 'h',
+            min: 0,
+            max: max,
+            step: 0.25,
+            mode: 'slider',
+        }
+        config['components'][name] = comp
+
+        this.addField(config, {
+            id: id,
+            name: '',
+            comp: name,
+            /* round UP: 61 minutes left is still more than one hour, so show 1.25 h */
+            read_xform: (raw) => Math.ceil(raw / 60 / 0.25) * 0.25,
+            write_xform: (val) => Math.round(Number(val) * 60),
+        })
+    }
+
     /* `options[raw - rawBase]` names each raw value; a raw value outside the list is discarded */
     addSelectField(
         config: DeviceDiscovery,
@@ -797,13 +1397,14 @@ export default class Device extends TLVDevice {
         icon: string,
         options: string[],
         rawBase: number = 0,
+        selectOptions: SelectOptions = {},
     ) {
         const comp = {
             platform: 'select',
             unique_id: '$deviceid-' + name,
             name: desc,
             icon: icon,
-            entity_category: 'config',
+            ...entityCategoryOf(selectOptions),
             options: options,
         }
         config['components'][name] = comp
