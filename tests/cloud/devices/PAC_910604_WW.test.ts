@@ -176,6 +176,131 @@ const STATE_HUMIDITY_ALWAYS_HEX = '000004000000A70204FF04CDC1C482CF2E' // 0x337=
 const STATE_TEMPSTEP_1C_HEX = '000004000000A70204A2047EC1C4829BF4' // 0x1fb=1
 const STATE_TEMPSTEP_05C_HEX = '000004000000A70204A3027EC0629A' // 0x1fb=0
 
+/*
+ * NO CHANGE FRAME EXISTS for 0x21a, the sleep timer, and none is invented here. Every capture
+ * file was decoded frame by frame and searched for the tag, to the end of each file. It
+ * appears exactly twice, once in each of the two 94-TLV comprehensive dumps, and reads 0 both
+ * times:
+ *
+ *      t=0x21a v=0     bytes 8680, at payload offset 51 of QUERY_RESPONSE_HEX above
+ *
+ * The operator never set a sleep timer while capturing, so a nonzero reading was never
+ * recorded, no countdown was ever seen, and the LG app was never observed writing the tag.
+ * The decode of 0 is therefore asserted from the dump, and the nonzero read conversion is
+ * driven through processKeyValue() - the same entry point processTLV() uses for every tag of
+ * every frame - rather than through a frame that was never seen on the wire. The writes below
+ * are a different matter: those are bytes this profile emits, so they are asserted exactly,
+ * they just have no captured app frame to be compared against.
+ *
+ * 0x225 is NOT such a case. It has TEN real device-side readings and a real cancel write, all
+ * in aidry-run.jsonl, a capture of a genuine AI dry cycle - see STATE_AIDRY_* below.
+ *
+ * SCAN TO THE END OF THE FILE, both times this comment has been wrong it was for not doing
+ * that. The first version claimed 0x225 had no change frames at all, having searched only
+ * stand-capture.jsonl and filter-reset.jsonl. The second claimed it had "four", having
+ * searched aidry-run.jsonl but stopped at its `stopped` marker at t+213.8s - the file
+ * continues with a fresh `session` record at t+706.8s and six more 0x225 frames after it.
+ *
+ * 0x1fb is real on both sides: the two change frames above are captures, and so are the LG
+ * app's own writes of it, quoted at the temp-step select in the profile:
+ *
+ *      01010400000065020100047f007ec14025      0x1fc = 0, 0x1fb = 1
+ *      01010400000065020100047f007ec05004      0x1fc = 0, 0x1fb = 0
+ *
+ * Note the 0x1fc = 0 the app pairs with each write. This profile sends a bare 0x1fb, because
+ * 0x1fc is never reported by the appliance and so cannot be sourced from raw_clip_state; the
+ * write below asserts what we actually emit, and is deliberately not compared against these
+ * app frames the way every other write in this file is.
+ */
+const WRITE_TEMPSTEP_1C_HEX = '01010400000065020101027EC14004' // 0x1fb=1
+const WRITE_TEMPSTEP_05C_HEX = '01010400000065020101027EC05025' // 0x1fb=0
+
+/*
+ * Sleep timer writes. No captured app frame exists for these either - the app was never seen
+ * setting the timer - so they are what this profile emits, with the TLV hand-checked:
+ *   2.5 h -> 150 min: t0 = 0x21a >> 2 = 0x86, then (0x21a & 3) << 6 | 0x10 = 0x90, then 150
+ *   = 0x96, i.e. payload 869096. 15 h -> 900 min needs two value bytes: 86 A0 03 84.
+ */
+const WRITE_SLEEPTIMER_25H_HEX = '0101040000006502010103869096AE72' // 0x21a=150
+const WRITE_SLEEPTIMER_15H_HEX = '010104000000650201010486A00384B247' // 0x21a=900
+const WRITE_SLEEPTIMER_OFF_HEX = '010104000000650201010286808289' // 0x21a=0
+
+/*
+ * A REAL AI DRY CYCLE, captured verbatim from aidry-run.jsonl while the operator watched the
+ * appliance's own display and wrote down what it said. This is the evidence that 0x225 is in
+ * MINUTES on this model rather than the percent RAC_056905_WW publishes:
+ *
+ *      t+2.0s      the app sends 0x1f7 = 0, i.e. switch off
+ *      t+2.9s      STATE_AIDRY_START_HEX below: 0x1f7 = 0 and 0x225 = 32 in one frame
+ *      t+11.8s     operator: "전원 껐음 - 건조 시작될 것"  (turned it off, drying will start)
+ *      t+18.2s     operator: "화면에 건조 표시 보임"       (the display shows drying)
+ *      t+34.5s     operator: "32분 남았다고 보임"          (it says 32 minutes left)
+ *      t+47.1s     0x225 = 31
+ *      t+106.8s    0x225 = 30
+ *      t+166.6s    0x225 = 29
+ *      t+211.1s    operator: "29분 남았다고 보임"          (it says 29 minutes left)
+ *      ---         the capture stops at t+213.8s and resumes at t+706.8s, so 28 .. 20 were
+ *                  never recorded: the jump below is a recording gap, not a skipped tick
+ *      t+763.6s    0x225 = 19  |
+ *      t+823.3s    0x225 = 18  |  59.7 / 59.8 / 59.7 / 59.9 s apart
+ *      t+883.1s    0x225 = 17  |
+ *      t+942.8s    0x225 = 16  |
+ *      t+1002.7s   0x225 = 15  |
+ *      t+1019.5s   operator: "지금 15분 남음"              (15 minutes left now)
+ *      t+1021.3s   the app cancels the cycle - see the read-only test for the frame
+ *      t+1021.6s   STATE_AIDRY_END_HEX below: the appliance confirms 0x225 = 0
+ *
+ * Two independent things are pinned here. THREE operator transcriptions fix the UNIT: the
+ * display said 32, 29 and 15 at moments when the tag held 32, 29 and 15.
+ *
+ * SIX intervals fix the RATE - 59.7, 59.8 in the first session and 59.7, 59.8, 59.7, 59.9 in
+ * the second. Count them rather than counting decrements: seven transitions were observed and
+ * the seventh, 32 -> 31, is 44.2 s because the cycle started part-way through a minute, so it
+ * measures nothing. The recording gap is a seventh interval in disguise and the longest one
+ * on file: 29 at t+166.6s and 19 at t+763.6s is 597.0 s for ten steps, i.e. 59.70 s a step,
+ * agreeing with the six to a tenth of a second across ten minutes of wall clock. One step per
+ * minute is a minute counter, and is not how a percentage of a ~32-minute cycle would move.
+ *
+ * Decoding the single-tag payload 89501F by hand, because the scale is the whole point:
+ *   89 50   tag = (0x89 << 2) | (0x50 >> 6) = 0x225, len = (0x50 >> 4) & 3 = 1, nibble = 0
+ *   1F      => value 31
+ */
+// 0x1f7=0 0x1f9=0 0x1fe=50 0x1fa=4 0x348=0 0x225=32 0x336=65 0x23d=0 0x312=19
+const STATE_AIDRY_START_HEX = '000004000000A70204D7167DC07E407F90327E84D200895020CD90418F40C49013025A'
+const STATE_AIDRY_REMAIN_31_HEX = '000004000000A70204DC0389501F45D8' // 0x225=31, single tag
+// 0x225=30, alongside the unmapped 0x279 / 0x27a and the length field 0x312
+const STATE_AIDRY_REMAIN_30_HEX = '000004000000A70204E20A89501E9E508B9E8EC488E7F0'
+const STATE_AIDRY_REMAIN_29_HEX = '000004000000A70204E50389501DC108' // 0x225=29, single tag
+
+/*
+ * The second session's run, t+763.6s .. t+1002.7s. Kept as a list rather than as five more
+ * named constants because no one of them means anything alone - the point is the rate, and
+ * then the operator's third transcription landing on the last of them.
+ *
+ * The last one encodes DIFFERENTLY from its siblings, which is worth decoding by hand:
+ *   89 4F   tag = (0x89 << 2) | (0x4F >> 6) = 0x225, len = (0x4F >> 4) & 3 = 0
+ *           => the value is the low nibble itself, 15, with no value byte at all - unlike
+ *              the 8950 1F above, which spends a byte to say 31.
+ */
+const STATE_AIDRY_TICKS_19_TO_15: [string, number][] = [
+    ['000004000000A70204FD0389501326B1', 19],
+    ['000004000000A70204FE03895012D842', 18],
+    ['000004000000A70204FF038950114270', 17],
+    ['000004000000A70204000389501008FE', 16],
+    ['000004000000A702040309894F9E50149E82C4879B48', 15], // + the unmapped 0x279 / 0x27a
+]
+
+/*
+ * The cycle ENDING, t+1021.6s: the appliance's own answer to the cancel, and the real OFF
+ * edge. Three tags - 0x225 = 0, 0x2a3 = 1 (it resets the wind direction as the cycle ends,
+ * so this frame moves swing_horizontal_mode too) and the length field 0x312 = 4.
+ *
+ * Used for the OFF edge in place of QUERY_RESPONSE_HEX, which rewrites all 94 tags at once
+ * and therefore cannot distinguish "the running flag cleared BECAUSE 0x225 reached 0" from
+ * "everything was rewritten at once".
+ */
+const STATE_AIDRY_END_HEX = '000004000000A7020404068940A8C1C48485B6' // 0x225=0 0x2a3=1 0x312=4
+
 // "열교환기 세척 시작" - heat exchanger clean started. The appliance also resets the fan
 // speed and wind direction and clears smart care by itself.
 const STATE_HXCLEAN_START_HEX = '000004000000A70204AA0E7E8481808F809780A8C1E881C48C4242' // 0x3a2=1
@@ -302,6 +427,139 @@ const WRITE_SWINGS: [string, string, string][] = [
     ['right', '0101040000006502010102A8C4AF20', '0101040000006502010002A8C4D994'],
     ['split', '0101040000006502010102A8C5BF01', '0101040000006502010002A8C5C9B5'],
 ]
+
+/*
+ * --- the 0xa8 telemetry record, for hvac_action ---
+ *
+ * All of these are real frames, quoted whole. The long ones are from hvac-action.jsonl, a
+ * capture the owner ran specifically to make the compressor start and stop on command: cooling
+ * at 18 C, setpoint raised to 30 C so it would stop, lowered to 18 C so it would restart, then
+ * a switch to dry - annotating each step live and metering the outdoor unit.
+ *
+ * These frames are NOT TLV. They are a fixed-offset struct, they carry 0xff at buf[10] where
+ * every other frame kind puts a payload length, and they are 307 bytes. Only byte 160 is
+ * decoded, and only after the profile has checked all three of those things.
+ *
+ * WHICH BYTE, AND WHY IT IS NOT OBVIOUS: the five frames the owner labelled with a
+ * present-tense observation are reproduced equally well by @160, @173 and @198, and the first
+ * two disagree on only two frames in the entire four-capture corpus. Both of those are frames
+ * he predicted rather than watched. COMPRESSOR_RUNNING_OFFSET in the profile carries the full
+ * derivation; the fixtures below are chosen so that the ones the tests lean on hardest are the
+ * observed frames, and the two disputed frames are labelled as disputed.
+ *
+ * The short 0xa8 variant is the reason the length test is not optional: it is 15 bytes, so
+ * buf[160] of it is `undefined`. It appears once, in stand-capture.jsonl at t+4341.7s, and
+ * nothing else about it is known.
+ */
+/* t+4.5s, the appliance being switched on: @160=0 (@173=1 - one of the two disputed frames).
+ * 0x2b3 reads 25.5 W here and ramps to 88.2 W by t+68.1s before stepping to 943.2 W at
+ * t+77.8s, so the compressor started roughly 73 s after this frame: fan only, i.e. 'idle'. */
+const A8_POWERON_HEX =
+    '000004000000A8670301FF0B01010353010100000400000000000000000000010024350000000000000000000100000B' +
+    'B80BB80100050000000000004E000000000100000103003C0001000000001800000202010156142D1E00320000000000' +
+    '0000000000610000191900030C03340320000003160339032500007A007A180100000005250004800005D30001125A00' +
+    '1612001300000A020A0008000000000000010200D400000002F8000000016C74D30035D300000F06A9000005C1039400' +
+    '0000000001040100D7000000000000000000000000006400E20002620E0000012C012C00000000010000000012010000' +
+    '000000000ACE000100030000000A0000330001C200008000000000000000000000000000000000000A0D3000FFFFFF00' +
+    '020000000000000000000000000000000535EC'
+const A8_COOLING_HEX = // hvac-action.jsonl t+142.3s, @160=1, "압축기 도는 중" at t+125.4s
+    '000004000000A8670301FF0B0101035601010000040000000000000000000001003C350000000000000000000100000B' +
+    'B80BB801000500000000000044000000000100000100003C0001000000001800000202010156142D1E00320000000000' +
+    '00000000006100001919000226024E023A000002E4030702F8000099009A180000000005250004800005D300020F4618' +
+    '4646009F080015021702180000000000010004000026170002EE000000014B51CA3735CE000055093209F00420036C00' +
+    '0000000101010100FF000000000000000000000000006400DE0003DE3900030186018601000000010000000012010000' +
+    '000000000ACE000100030000000A00005600024D00335F00000000000000000000000000000000000A0A3300FFFFFF00' +
+    '020000000000000000000000000000000530AD'
+const A8_STOPPED_HEX = // t+173.2s, @160=0, "압축기 선 듯" at t+156.6s, 0 W metered at t+185.5s
+    '000004000000A8666501FF0B0101655801010000040000000000000000000001003C350000000000000000000100000B' +
+    'B80BB801000500000000000044000000000100000100003C0001000000001800000202010156142D1E00320000000000' +
+    '00000000006100001919000226024E023A0000022B0253023F0000900091180000000005250004800005D300000A2800' +
+    '00000000000016020000000000000000000005002800000002EE000000004B5FCB0035D3000000098209F00458036C00' +
+    '00000001010100001C000000000000000000000000006400E20001CC050000012C012C00000000010000000012010000' +
+    '000000000ACE000100030000000A00005700026C0003F0000000000000000000000000000000000004033300FFFFFF00' +
+    '02000000000000000000000000000000051BA1'
+/* t+337.3s, 145 s after the setpoint was lowered back to 18 C: @160=0 (@173=1 - the OTHER
+ * disputed frame). The owner's note here, at t+198.1s, is "다시 돌 것" - it WILL run again -
+ * a prediction, so this frame has no observed label. Hz @177 and EEV @152 read 0 and coil
+ * temperature @175 reads 121, the corpus maximum, against <= 107 in all 30 frames with
+ * @177 > 0; 0x2b3 has moved 87.1 -> 138.8 W. Something is starting, nothing is cooling yet. */
+const A8_NOT_YET_RESTARTED_HEX =
+    '000004000000A8670D01FF0B01010D62010100000700000000000101000100000024350000000000000000000100000B' +
+    'B70BB80100050000000000004C000000000100000100003C0001000000001800000202010156142D1E00320000000000' +
+    '000000000061000019190004A604CE04BA000004B004DD04C4000079007A180100000005250004800005D300000A5A00' +
+    '0000000000001602000000000000000000010100D600000001F4000000014E79D50035D30000550932000005C1000000' +
+    '0000000001070100C6000000000000000000000000006400E2000208050000012C012C00000000010000000012010000' +
+    '000000000ACE000000030000000A00005A000311000367000000000000000000000000000000000004043600FFFFFF00' +
+    '0200000000000000000000000000000005A943'
+const A8_RUNNING_AGAIN_HEX = // t+433.1s, @160=1, "다시 도는 중" (running again) at t+420.1s
+    '000004000000A8670201FF0B0101026301010100080000000000000000000000002E340000000000000000000100000B' +
+    'B70BB801000500000000000048000000000100000103003C0001000000001800000202010156142D1E00320000000000' +
+    '000000000061000019190004A604CE04BA000004A104C904AB0000910081180101080005250004800005CC00023F5A00' +
+    '3E4C005C010C120C150717010000000001010400D61F00000302000000015157CF3635D000005208B60A0904A403F000' +
+    '0000000001030100FF000000000000000000000000006400DE0002B2470003011D011D00000000010000000012010000' +
+    '000000000ACE000000030000000A00006C000371002D9C00000000000000000000000000000000000D043800FFFFFF00' +
+    '0200000000000000000000000000000005DE0B'
+const A8_DRYING_HEX = // t+473.0s, @160=1, taken while the appliance was in dry mode
+    '000004000000A8666501FF0B0101656701010100080000000000000000000000002E340000000000000000000100000B' +
+    'B70BB801000500000000000045000000000100000100003C0001000000001800000202010156142D1E00320000000000' +
+    '0000000000610000191900029E02C602B20000029902C102BC00009900901801010800052500048000057801020F3F18' +
+    '3F3F00840B001600160316000000000001010400ED0B170002F8000000014D53CC3B35CE000020094A0A030443046600' +
+    '0000000001030100FF000000000000000000000000006400DF0003D9310002015E016301000000010000000012010000' +
+    '000000000ACE000000030000000A000079000399002C7B000000000000000000000000000000000004043800FFFFFF00' +
+    '0200000000000000000000000000000005368F'
+/* The short variant: 15 bytes, buf[10] = 0x02 = length - 13. stand-capture.jsonl t+4341.7s. */
+const A8_SHORT_HEX = '000004000000A8180201024EC1ABDA'
+
+/*
+ * Two more real frames, and the reason the profile tests power and mode BEFORE the compressor
+ * flag. Both are the appliance genuinely reporting a running compressor in a situation where
+ * 'cooling' would be the wrong answer, and each follows its partner state frame directly on
+ * the wire - no combination of unrelated captures is involved:
+ *
+ *   aidry-run.jsonl     t+2.9s  STATE_AIDRY_START_HEX, 0x1f7=0 - the appliance switched off
+ *                       t+5.1s  this frame, @160=1 - the compressor is still coasting down.
+ *                               Operator at t+11.8s: "전원 껐음 - 건조 시작될 것" (turned the
+ *                               power off, the dry will start). @160 only reaches 0 at t+14.0s.
+ *   stand-capture.jsonl t+585.5s STATE_MODE_AIRCLEAN_HEX, 0x1f9=5 - switched to air-clean
+ *                       t+587.5s this frame, @160=1 - still winding down from the dry cycle
+ *                               that preceded it. Operator at t+590.6s: "공기청정".
+ */
+const A8_RUNNING_WHILE_OFF_HEX = // aidry-run.jsonl t+5.1s, @160=1 with 0x1f7=0
+    '000004000000A8670101FF0B01010139000000000400000000000000000000000032330000000000000000000100000B' +
+    'B80BB801000500000000000041000000000200000103003C0001000000001800000002010156142D1E00320000000000' +
+    '000000000061000019190003DE040603F200000307032F032500009B008D1800000000052500048000049200020A4618' +
+    '29291B2B1A001301150315000000000001000400001A09000384000000015B6BAE3E36CE00000807EB06D403FF03EF00' +
+    '0000000100060100FF000000000000000000000000006400E00002AD3000020122012200000000010000000012010020' +
+    '000000000ACE000000030000000A000B6B00000000048200000000000000000000000000000000000A652900FFFFFF00' +
+    '0000000000000000000000000000000005A770'
+const A8_RUNNING_WHILE_AIRCLEAN_HEX = // stand-capture.jsonl t+587.5s, @160=1 with 0x1f9=5
+    '000004000000A8670201FF0B010102090101050002000000000000000000000100343100000000000000000001000009' +
+    '8A0BB801000500000000000037000000000100000103003C0001000000001800000202010156142D1E00320000000000' +
+    '00000000006100001919000276029E028A0000029E02BC02B20000A900AC1800010800057F0004D00003FB01020F3F18' +
+    '3F3F04E415EA1804180319000000000001010400C433FE00033400000001454AB74D3CB50000060A6E0A26037D039200' +
+    '0000000101020100FF000000000000000000000000006400DA0003DE3900030168016D0100000001000000000D010000' +
+    '000000000AC900010003000000060001EF0005A6000A190000000000000000000000000000000000030A0C00FFFFFF00' +
+    '0200000000000000000000000000000005B5B7'
+
+/*
+ * The appliance's own state frames from the same run, so a whole scenario can be replayed out
+ * of one capture rather than assembled from several.
+ *   t+430.9s - the app switched the appliance to dry; 0x1f9=1, 0x1fe=46, 0x1fa=8, 0x348=1
+ *   t+138.5s / t+192.0s - the two setpoint moves that made the compressor stop and restart,
+ *              0x1fe=60 (30.0 C) and 0x1fe=36 (18.0 C). Quoted to show the experiment really
+ *              is what the owner said it was; the action does not depend on 0x1fe.
+ */
+const STATE_HVAC_TO_DRY_HEX = '000004000000A702049D0F7E417F902E7E8881808D80D201C48D5A9F'
+const STATE_HVAC_SETPOINT_30_HEX = '000004000000A7020470057F903CC4834753'
+const STATE_HVAC_SETPOINT_18_HEX = '000004000000A7020478057F9024C4833E3C'
+
+/*
+ * stand-capture.jsonl t+4327.8s: 0x1f7=0, the falling half of the only real power cycle in the
+ * corpus. Its rising half at t+4340.5s is already quoted above as STATE_ALLCLEAN_RUNNING_HEX -
+ * one frame, two facts, because the owner switched the appliance on and started all-clean in
+ * the same action.
+ */
+const STATE_POWER_OFF_HEX = '000004000000A70204AC117DC07E407F90327E86D2008F40E880C48F64F0'
 
 function makeDevice() {
     const ha = new MockHAConnection()
@@ -792,6 +1050,769 @@ describe(MODEL_ID, () => {
         dev.drop()
     })
 
+    /*
+     * 0x1FB has TWO jobs and exactly ONE field. addSelectField() would have registered its own
+     * field for the tag and silently replaced the temp_step sync, which is why the profile
+     * builds this select by hand. The point of this test is that both jobs still happen from
+     * the one field, so it asserts them together rather than in separate tests.
+     */
+    test('the temperature step select publishes AND still moves the climate temp_step', (t) => {
+        const { ha, thinq, dev } = buildReadyDevice(t)
+        const climate = () => ha.devices[DEVICE_ID].config!.components.climate as Record<string, unknown>
+
+        // The dump carried 0x1FB=0: the select reads it out, and so does the climate card.
+        assert.equal(ha.getProperty(DEVICE_ID, 'tempstep', 'state'), '0.5')
+        assert.equal(climate().temp_step, 0.5)
+
+        thinq.emit('data', buf(STATE_TEMPSTEP_1C_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'tempstep', 'state'), '1') // 0x1FB=1
+        assert.equal(climate().temp_step, 1, 'the select did not take over the temp_step sync')
+        assert.equal(climate().precision, 1)
+
+        thinq.emit('data', buf(STATE_TEMPSTEP_05C_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'tempstep', 'state'), '0.5') // 0x1FB=0
+        assert.equal(climate().temp_step, 0.5)
+
+        dev.drop()
+    })
+
+    test('HA write tempstep emits a bare 0x1FB, and an unknown option sends nothing', (t) => {
+        const { ha, thinq, dev } = buildReadyDevice(t)
+
+        ha.setProperty(DEVICE_ID, 'tempstep', 'command', '1')
+        assert.equal(thinq.outbox.length, 1)
+        assert.equal(hex(thinq.outbox[0]), WRITE_TEMPSTEP_1C_HEX.toUpperCase())
+
+        thinq.resetRecorder()
+        ha.setProperty(DEVICE_ID, 'tempstep', 'command', '0.5')
+        assert.equal(hex(thinq.outbox[0]), WRITE_TEMPSTEP_05C_HEX.toUpperCase())
+
+        /*
+         * The LG app pairs each of its own writes with 0x1FC = 0 (see the fixture comment
+         * above); we deliberately do not, because the appliance never reports 0x1FC. This is
+         * the assertion that would have to change if that ever turns out to matter.
+         */
+        const ours = buf(WRITE_TEMPSTEP_05C_HEX)
+        assert.equal(hex(ours.subarray(11, ours.length - 2)), '7EC0', 'one TLV, no 0x1FC')
+
+        thinq.resetRecorder()
+        ha.setProperty(DEVICE_ID, 'tempstep', 'command', '0.25')
+        assert.equal(thinq.outbox.length, 0, 'no bogus resolution written')
+
+        dev.drop()
+    })
+
+    // --- sleep timer, 0x21A ---
+
+    test('the sleep timer reads minutes as hours, rounding up', (t) => {
+        const { ha, dev } = buildReadyDevice(t)
+
+        // 0x21A=0 in the comprehensive dump - the only reading of this tag in any capture.
+        assert.equal(ha.getProperty(DEVICE_ID, 'sleeptimer', 'state'), 0)
+
+        /*
+         * No captured frame carries a running timer, so these go through processKeyValue(),
+         * which is the exact entry point processTLV() calls for every tag of every frame.
+         *
+         * These cases assert the CONVERSION, which is this profile's own arithmetic, and
+         * nothing more. The minute scale itself is not attested on this appliance - see the
+         * sleep-timer note in the profile - so read the 900 case as "the top of the range the
+         * owner reports and RAC_056905_WW uses", not as a measurement.
+         *
+         * 61 minutes is the case that fixes the rounding direction: an hour and a bit left
+         * must not display as one hour, or HA would show the timer expiring early.
+         */
+        const cases: [number, number][] = [
+            [15, 0.25],
+            [61, 1.25],
+            [150, 2.5],
+            [900, 15], // 15 h, the top of the declared range - reported, not captured
+        ]
+        for (const [minutes, hours] of cases) {
+            dev.processKeyValue(0x21a, minutes)
+            assert.equal(ha.getProperty(DEVICE_ID, 'sleeptimer', 'state'), hours, `${minutes} min`)
+        }
+
+        dev.drop()
+    })
+
+    test('HA write sleeptimer converts hours back to minutes, exactly', (t) => {
+        const { ha, thinq, dev } = buildReadyDevice(t)
+
+        // 2.5 h -> 150 min. The payload is 869096: tag 0x21A, one value byte, 0x96 = 150.
+        ha.setProperty(DEVICE_ID, 'sleeptimer', 'command', '2.5')
+        assert.equal(thinq.outbox.length, 1, 'exactly one frame')
+        assert.equal(hex(thinq.outbox[0]), WRITE_SLEEPTIMER_25H_HEX.toUpperCase())
+
+        // 15 h -> 900 min, which needs two value bytes rather than one.
+        thinq.resetRecorder()
+        ha.setProperty(DEVICE_ID, 'sleeptimer', 'command', '15')
+        assert.equal(hex(thinq.outbox[0]), WRITE_SLEEPTIMER_15H_HEX.toUpperCase())
+
+        // 0 h cancels it, and must still go out - it is how the timer is switched off.
+        thinq.resetRecorder()
+        ha.setProperty(DEVICE_ID, 'sleeptimer', 'command', '0')
+        assert.equal(hex(thinq.outbox[0]), WRITE_SLEEPTIMER_OFF_HEX.toUpperCase())
+
+        // The value really reached the appliance as minutes, not as hours.
+        assert.equal(dev.raw_clip_state[0x21a], 0)
+        ha.setProperty(DEVICE_ID, 'sleeptimer', 'command', '2.5')
+        assert.equal(dev.raw_clip_state[0x21a], 150, 'stored in minutes')
+
+        dev.drop()
+    })
+
+    // --- AI dry, 0x225 ---
+
+    test('AI dry remaining counts down in MINUTES and drives the running flag', (t) => {
+        const { ha, thinq, dev } = buildReadyDevice(t)
+
+        /*
+         * The dump was taken while the appliance was cooling: the AI dry ENABLE switch is on,
+         * and no cycle is running. That pair is the whole reason these are two entities - a
+         * profile that published only 0x20E would claim a dry cycle was in progress here.
+         */
+        assert.equal(ha.getProperty(DEVICE_ID, 'aidry', 'state'), 'ON') // 0x20E=255, the setting
+        assert.equal(ha.getProperty(DEVICE_ID, 'aidryremain', 'state'), 0) // 0x225=0
+        assert.equal(ha.getProperty(DEVICE_ID, 'aidryrunning', 'state'), 'OFF')
+
+        /*
+         * A real cycle, frame by frame, from aidry-run.jsonl. The first frame is the one that
+         * switches the appliance off and starts the dry in the same breath.
+         */
+        thinq.emit('data', buf(STATE_AIDRY_START_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'aidryremain', 'state'), 32) // 0x225=32
+        assert.equal(ha.getProperty(DEVICE_ID, 'aidryrunning', 'state'), 'ON')
+        // ... with the appliance itself off. The cycle runs after shutdown, not during cooling.
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'mode_state'), 'off') // 0x1F7=0
+        // The enable switch has not moved, and must not be confused with the running flag.
+        assert.equal(ha.getProperty(DEVICE_ID, 'aidry', 'state'), 'ON')
+
+        const ticks: [string, number][] = [
+            [STATE_AIDRY_REMAIN_31_HEX, 31],
+            [STATE_AIDRY_REMAIN_30_HEX, 30],
+            [STATE_AIDRY_REMAIN_29_HEX, 29],
+            /*
+             * ... then the capture stops and resumes, so the cycle reappears at 19. That is a
+             * recording gap, not a jump the appliance made; the five ticks that follow are
+             * from the same real cycle and are the second half of the rate evidence.
+             */
+            ...STATE_AIDRY_TICKS_19_TO_15,
+        ]
+        for (const [frame, expected] of ticks) {
+            thinq.emit('data', buf(frame))
+            assert.equal(ha.getProperty(DEVICE_ID, 'aidryremain', 'state'), expected, `${expected} min left`)
+            assert.equal(ha.getProperty(DEVICE_ID, 'aidryrunning', 'state'), 'ON', `${expected} min: running`)
+        }
+
+        /*
+         * And back to no cycle, on the appliance's own cycle-end frame rather than on the
+         * comprehensive dump: a real OFF edge, three tags wide, following a real ON state.
+         * The dump would reset all 94 tags at once and so could not show that the running
+         * flag cleared because THIS tag reached 0.
+         */
+        thinq.emit('data', buf(STATE_AIDRY_END_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'aidryremain', 'state'), 0)
+        assert.equal(ha.getProperty(DEVICE_ID, 'aidryrunning', 'state'), 'OFF')
+        // the same frame resets the wind direction - the appliance does that as the cycle ends
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'swing_horizontal_mode_state'), 'focus') // 0x2a3=1
+
+        dev.drop()
+    })
+
+    test('the two AI dry sensors stay read-only - only the cancel button writes', (t) => {
+        const { ha, thinq, dev } = buildReadyDevice(t)
+        const components = ha.devices[DEVICE_ID].config!.components as Record<string, Record<string, unknown>>
+
+        /*
+         * The countdown and the running flag are the appliance reporting, not settings, so
+         * neither may be written. Cancelling is a separate entity - see the button test below -
+         * because a cancel is not "set the remaining time to 0 in HA": it is a frame the
+         * appliance may act on or ignore, and the sensors must keep showing what it says.
+         */
+        assert.ok(!components.aidryremain?.command_topic, 'aidryremain is read-only')
+        assert.ok(!components.aidryrunning?.command_topic, 'aidryrunning is read-only')
+        assert.equal(dev.fields_by_ha['aidryrunning-'], undefined, 'aidryrunning has no field at all')
+        assert.equal(dev.fields_by_ha['aidryremain-']?.writable, false, 'aidryremain field is not writable')
+
+        // Nothing reaches the wire even if something does try to write it.
+        dev.setProperty('aidryremain-', '5')
+        assert.equal(thinq.outbox.length, 0, 'no frame emitted')
+
+        dev.drop()
+    })
+
+    test('the AI dry cancel writes 0 to 0x225, exactly as the LG app does', (t) => {
+        const { ha, thinq, dev } = buildReadyDevice(t)
+
+        // Put a real cycle in progress first, so there is something for the cancel to stop.
+        thinq.emit('data', buf(STATE_AIDRY_START_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'aidryremain', 'state'), 32)
+        assert.equal(ha.getProperty(DEVICE_ID, 'aidryrunning', 'state'), 'ON')
+        thinq.outbox.length = 0
+
+        ha.emit('setProperty', DEVICE_ID, 'aidrycancel', 'PRESS')
+
+        /*
+         * The cancel is captured, from aidry-run.jsonl, and this asserts our bytes against the
+         * app's own:
+         *
+         *   TX 010104000000650201000289403d4f       0x225 = 0                    (t+1021.3s)
+         *   rx 0201040000008701100000ec3c           acknowledgement              (t+1021.5s)
+         *   rx STATE_AIDRY_END_HEX above            0x225 = 0, the cycle is over (t+1021.6s)
+         *   operator: "지금 15분 남음" (15 minutes left now, t+1019.5s), "중단 눌렀음" (pressed
+         *   stop, t+1025.3s), "중단 됨 - 화면에서 건조 표시 사라짐" (stopped, drying indicator
+         *   gone from the display, t+1039.3s)
+         *
+         * Ours differs from the app's in buf[9] only - the sequence byte, which TLVDevice
+         * hardcodes to 1 where the app happened to send 0 - and in the CRC that follows from
+         * it. The TLV payload 8940 (tag 0x225, value 0) is identical, byte for byte, which is
+         * the same relationship the filter reset has to its captured frame.
+         */
+        assert.equal(thinq.outbox.length, 1, 'exactly one frame')
+        assert.equal(hex(thinq.outbox[0]).toLowerCase(), '010104000000650201010289404bfb')
+        const app = buf('010104000000650201000289403d4f')
+        const ours = thinq.outbox[0]
+        assert.equal(ours.length, app.length)
+        const differing = [...app.keys()].filter((i) => app[i] !== ours[i])
+        assert.deepEqual(differing, [9, 13, 14], 'only the sequence byte and the CRC differ')
+        assert.equal(hex(ours.subarray(11, 13)), '8940', 'identical TLV payload')
+        assert.equal(thinq.outbox.filter((frame) => frame[1] === 0xff).length, 0, 'not a private command')
+
+        /*
+         * The cancel must not fake the outcome locally. Until the appliance answers, the
+         * sensors still say a cycle is running with 32 minutes left, and raw_clip_state is
+         * untouched - write_callback returns false precisely so the default write path does
+         * not stamp 0 into it.
+         */
+        assert.equal(ha.getProperty(DEVICE_ID, 'aidryremain', 'state'), 32, 'countdown not faked')
+        assert.equal(ha.getProperty(DEVICE_ID, 'aidryrunning', 'state'), 'ON', 'still shown as running')
+        assert.equal(dev.raw_clip_state[0x225], 32, 'raw state not stamped locally')
+
+        // The appliance's own reply is what moves them - the frame it really sent, 0.3 s later.
+        thinq.emit('data', buf(STATE_AIDRY_END_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'aidryremain', 'state'), 0)
+        assert.equal(ha.getProperty(DEVICE_ID, 'aidryrunning', 'state'), 'OFF')
+
+        /*
+         * The cancel stops the CYCLE, not the standing preference: 0x20e is untouched, so the
+         * appliance will start another dry the next time it is switched off. Confusing the two
+         * is the mistake this pair of entities exists to prevent.
+         */
+        assert.equal(ha.getProperty(DEVICE_ID, 'aidry', 'state'), 'ON', 'the enable switch is not a cycle')
+
+        dev.drop()
+    })
+
+    test('the cancel button is diagnostic and carries no TLV id of its own', (t) => {
+        const { ha, dev } = buildReadyDevice(t)
+        const components = ha.devices[DEVICE_ID].config!.components as Record<string, Record<string, unknown>>
+
+        assert.equal(components.aidrycancel?.platform, 'button')
+        assert.equal(components.aidrycancel?.unique_id, '$deviceid-aidrycancel')
+        assert.equal(components.aidrycancel?.entity_category, 'diagnostic')
+        assert.equal(components.aidrycancel?.command_topic, '$this/aidrycancel/set')
+
+        /*
+         * No `id` key, for the same reason the filter reset has none: addField would take over
+         * fields_by_id[0x225] and replace the 'aidryremain' field, killing that sensor and the
+         * derived 'aidryrunning' with it. Without an id, the default write path cannot stamp
+         * raw_clip_state even if write_callback's return value were changed by a later edit.
+         */
+        assert.equal(dev.fields_by_ha['aidrycancel']?.id, undefined, 'cancel owns no tag')
+        assert.equal(dev.fields_by_id[0x225]?.comp, 'aidryremain', '0x225 still belongs to the sensor')
+
+        dev.drop()
+    })
+
+    // --- hvac_action, from the 0xa8 record ---
+
+    test('hvac_action is published on an action_topic and stays silent until a 0xa8 arrives', (t) => {
+        const { ha, thinq, dev } = buildReadyDevice(t)
+        const climate = ha.devices[DEVICE_ID].config!.components.climate as Record<string, unknown>
+
+        assert.equal(climate.action_topic, '$this/climate-action')
+
+        /*
+         * The comprehensive dump has already been applied, so power and mode are known - but
+         * the compressor flag is not, and 'cooling' and 'idle' are both consistent with what
+         * the appliance has said so far. Publishing NOTHING is the point: HA shows no action
+         * rather than a guess. A profile that defaulted the flag to "running", as RAC does when
+         * it has no tag to read, would claim 'cooling' here and be wrong for the minute a
+         * compressor typically takes to start.
+         */
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'mode_state'), 'cool') // 0x1f9=0, power ON
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'action'), undefined, 'no action guessed')
+
+        /*
+         * And this is why the guess would have been wrong - shown with the actual frame the
+         * actual appliance actually sent at power-on, hvac-action.jsonl t+4.5s, rather than
+         * with any later frame that happens to read 0. It is the FIRST 0xa8 of that capture,
+         * 2.7 s after the connection came up and 4.5 s before the owner wrote "냉방 18도 -
+         * 압축기 돌 것" (cooling 18 C - the compressor WILL run). It says the compressor is not
+         * running, and the metered power agrees: 25.5 W here, ramping to 88.2 W over the next
+         * minute - the indoor fan alone - and only reaching 943.2 W at t+77.8s. 'idle' is the
+         * truth for those 73 s. A profile that defaulted the flag to running, or that read the
+         * demand byte @173 instead, would have claimed 'cooling' for all of them.
+         */
+        thinq.emit('data', buf(A8_POWERON_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'action'), 'idle', 'idle from cold, not cooling')
+
+        thinq.emit('data', buf(A8_COOLING_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'action'), 'cooling')
+
+        dev.drop()
+    })
+
+    test('the compressor stopping and restarting moves hvac_action between cooling and idle', (t) => {
+        const { ha, thinq, dev } = buildReadyDevice(t)
+
+        /*
+         * hvac-action.jsonl replayed in capture order. This is the experiment the owner ran:
+         * raise the setpoint until the compressor stops, lower it until it restarts, with the
+         * outdoor unit metered at 0 W in the middle.
+         */
+        thinq.emit('data', buf(A8_COOLING_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'action'), 'cooling')
+
+        // Setpoint to 30 C. The action must not move yet - the compressor is still running.
+        thinq.emit('data', buf(STATE_HVAC_SETPOINT_30_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'temperature_state'), 30) // 0x1fe=60
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'action'), 'cooling', 'setpoint alone proves nothing')
+
+        // ... and now the appliance says the compressor stopped.
+        thinq.emit('data', buf(A8_STOPPED_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'action'), 'idle')
+        // hvac_mode is unchanged: the appliance is still SET to cool, it just is not cooling.
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'mode_state'), 'cool')
+
+        thinq.emit('data', buf(STATE_HVAC_SETPOINT_18_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'temperature_state'), 18) // 0x1fe=36
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'action'), 'idle', 'not running until it says so')
+
+        /*
+         * t+337.3s, 145 s after that setpoint move. Still 'idle', and this is the one step of
+         * the replay the owner did not label - his note at t+198.1s is the prediction "다시 돌
+         * 것" (it will run again). Coil temperature is at the corpus maximum and both Hz and
+         * EEV read 0 here, so 'idle' is what the appliance's own telemetry says; the byte this
+         * profile deliberately does not read, @173, is 1 in this frame. If a future capture
+         * ever pins a compressor start to a frame like this one, this is the assertion that
+         * has to change - it is an inference, not an observation.
+         */
+        thinq.emit('data', buf(A8_NOT_YET_RESTARTED_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'action'), 'idle', 'still not cooling')
+
+        /*
+         * t+433.1s, and NOW it is observed: "다시 도는 중" (running again) at t+420.1s, with
+         * 1167.6 W metered. This is the frame that closes the experiment.
+         */
+        thinq.emit('data', buf(A8_RUNNING_AGAIN_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'action'), 'cooling')
+
+        dev.drop()
+    })
+
+    test('a mode change republishes hvac_action without waiting for the next 0xa8', (t) => {
+        const { ha, thinq, dev } = buildReadyDevice(t)
+
+        thinq.emit('data', buf(A8_COOLING_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'action'), 'cooling')
+
+        /*
+         * The 0xa8 records arrive every 20 .. 100 s - here 42 s separate the mode change at
+         * t+430.9s from the next record at t+473.0s. If the action were only recomputed when
+         * one lands, HA would show 'cooling' throughout a dry cycle for the whole of that gap.
+         */
+        thinq.emit('data', buf(STATE_HVAC_TO_DRY_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'mode_state'), 'dry') // 0x1f9=1
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'action'), 'drying', 'republished on the mode change')
+
+        // The record that eventually arrives agrees - it was captured while drying.
+        thinq.emit('data', buf(A8_DRYING_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'action'), 'drying')
+
+        dev.drop()
+    })
+
+    test('power off beats the compressor flag, which lags behind it', (t) => {
+        const { ha, thinq, dev } = buildReadyDevice(t)
+
+        thinq.emit('data', buf(A8_COOLING_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'action'), 'cooling')
+
+        // aidry-run.jsonl t+2.9s: the appliance is switched off. Published from the TLV alone.
+        thinq.emit('data', buf(STATE_AIDRY_START_HEX)) // 0x1f7=0
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'mode_state'), 'off')
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'action'), 'off')
+
+        /*
+         * t+5.1s, 2.2 s later on the real wire: the appliance reports the compressor STILL
+         * RUNNING while it is switched off. Testing the flag before power would publish
+         * 'cooling' for a machine the owner had just turned off.
+         */
+        thinq.emit('data', buf(A8_RUNNING_WHILE_OFF_HEX)) // @160=1
+        assert.equal(dev.compressorRunning, true, 'the flag really is set in that frame')
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'action'), 'off', 'power wins')
+
+        dev.drop()
+    })
+
+    test('a compressor reading from before an off period is discarded at the next power-on', (t) => {
+        const { ha, thinq, dev } = buildReadyDevice(t)
+
+        /*
+         * 'off' winning over the flag protects the off period itself and nothing after it. The
+         * flag keeps its value across the whole off period, so unless it is thrown away the
+         * state frame that reports 0x1f7 = 1 recomputes the action from a reading taken before
+         * the appliance was switched off, and publishes 'cooling' the instant it comes back.
+         *
+         * Replayed from the real power cycle in stand-capture.jsonl - 0x1f7 = 0 at t+4327.8s,
+         * 0x1f7 = 1 at t+4340.5s - with one substitution, argued below.
+         */
+        thinq.emit('data', buf(A8_COOLING_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'action'), 'cooling')
+
+        thinq.emit('data', buf(STATE_POWER_OFF_HEX)) // 0x1f7=0
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'action'), 'off')
+
+        /*
+         * The substitution, and the reason clearing on the FALLING edge would not be enough.
+         * 0xa8 records keep arriving while the appliance is off, and they can still report a
+         * turning compressor: this is aidry-run.jsonl t+5.1s, 2.2 s after that capture's own
+         * 0x1f7 = 0. A falling-edge clear would be undone right here.
+         *
+         * stand-capture's own off-window record, 2.1 s after the power-off, happens to read 0 -
+         * which is the only reason a replay of that capture alone produces the right answer.
+         * That is an accident of one 12.7 s off window, not a property of the appliance: in
+         * aidry-run the flag needs 11.1 s to reach 0 and the next record after that is 960 s
+         * later. The test must not depend on it, so it uses the frame that does not cooperate.
+         */
+        thinq.emit('data', buf(A8_RUNNING_WHILE_OFF_HEX)) // @160=1, arriving while off
+        assert.equal(dev.compressorRunning, true, 'the appliance really does say 1 while off')
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'action'), 'off', 'still off, as before')
+
+        /*
+         * And back on, with NO 0xa8 in between - a fast off/on, a dropped message, or simply an
+         * off window shorter than the ~2 s gap between frames. The stale reading must not be
+         * republished: nothing is known about the run that is now starting, so nothing is said
+         * about it, exactly as at startup. HA goes on showing 'off' until a fresh record lands,
+         * 3.3 s later in this capture.
+         */
+        thinq.emit('data', buf(STATE_ALLCLEAN_RUNNING_HEX)) // t+4340.5s, 0x1f7=1 0x1f9=0
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'mode_state'), 'cool', 'the unit is on again')
+        assert.equal(dev.compressorRunning, undefined, 'the pre-off reading was discarded')
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'action'), 'off', 'no invented cooling')
+
+        // The next record settles it, and it is the record that decides - not the stale flag.
+        thinq.emit('data', buf(A8_STOPPED_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'action'), 'idle')
+
+        dev.drop()
+    })
+
+    /*
+     * The same thing, but with the user pressing the button in HA rather than on the remote -
+     * which is the likelier of the two and does NOT reach the appliance-side path above.
+     *
+     * setProperty() stamps the written value into raw_clip_state before it sends anything, so
+     * by the time the appliance echoes the change back, power has already read 1 for some time.
+     * An edge detector that only watches incoming frames sees no transition at all in this
+     * case, and would carry the pre-off compressor reading straight through the power cycle.
+     * Both HA-side routes are covered because they set power in different places: the power
+     * switch through TLVDevice.setProperty(), the mode select through 0x1f9's write_attach.
+     */
+    for (const [what, prop, value] of [
+        ['the power switch', 'power_command', 'ON'],
+        ['a mode select while off', 'mode_command', 'cool'],
+    ] as const) {
+        test(`a compressor reading from before an off period is discarded when HA turns it on with ${what}`, (t) => {
+            const { ha, thinq, dev } = buildReadyDevice(t)
+
+            thinq.emit('data', buf(A8_COOLING_HEX))
+            assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'action'), 'cooling')
+
+            thinq.emit('data', buf(STATE_POWER_OFF_HEX)) // 0x1f7=0
+            thinq.emit('data', buf(A8_RUNNING_WHILE_OFF_HEX)) // @160=1, arriving while off
+            assert.equal(dev.compressorRunning, true)
+            assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'action'), 'off')
+
+            ha.setProperty(DEVICE_ID, 'climate', prop, value)
+            assert.equal(dev.raw_clip_state[0x1f7], 1, 'the write path turns power on optimistically')
+            assert.equal(dev.compressorRunning, undefined, 'and the stale reading goes with it')
+            assert.notEqual(ha.getProperty(DEVICE_ID, 'climate', 'action'), 'cooling', 'nothing invented')
+
+            // The appliance echoes the change back. Still nothing invented from the old reading.
+            thinq.emit('data', buf(STATE_ALLCLEAN_RUNNING_HEX)) // 0x1f7=1 0x1f9=0
+            assert.equal(dev.compressorRunning, undefined, 'and the echo does not resurrect it')
+            assert.notEqual(ha.getProperty(DEVICE_ID, 'climate', 'action'), 'cooling', 'still nothing invented')
+
+            thinq.emit('data', buf(A8_STOPPED_HEX))
+            assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'action'), 'idle', 'the record decides')
+
+            dev.drop()
+        })
+    }
+
+    test('air-clean reports fan, even while the compressor is still winding down', (t) => {
+        const { ha, thinq, dev } = buildReadyDevice(t)
+
+        thinq.emit('data', buf(A8_COOLING_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'action'), 'cooling')
+
+        // stand-capture.jsonl t+585.5s: switched to air-clean, which HA calls fan_only.
+        thinq.emit('data', buf(STATE_MODE_AIRCLEAN_HEX)) // 0x1f9=5
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'mode_state'), 'fan_only')
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'action'), 'fan')
+
+        /*
+         * t+587.5s, 2.0 s later: the compressor has not stopped yet. Mode 5 has to be tested
+         * before the flag or this publishes 'cooling' while the appliance air-cleans.
+         */
+        thinq.emit('data', buf(A8_RUNNING_WHILE_AIRCLEAN_HEX)) // @160=1
+        assert.equal(dev.compressorRunning, true, 'the flag really is set in that frame')
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'action'), 'fan', 'mode wins')
+
+        dev.drop()
+    })
+
+    test('the short 0xa8 frame changes nothing and cannot be read past its end', (t) => {
+        const { ha, thinq, dev } = buildReadyDevice(t)
+
+        /*
+         * Before any long record: the short frame must not leave `compressorRunning` set from
+         * a byte that does not exist. buf[160] of a 15-byte buffer is `undefined`, and
+         * `undefined !== 0` is true - so a predicate that let this frame through would latch
+         * the compressor ON forever, which is exactly the bug the length test prevents.
+         */
+        assert.equal(dev.compressorRunning, undefined)
+        thinq.emit('data', buf(A8_SHORT_HEX))
+        assert.equal(dev.compressorRunning, undefined, 'not latched from a byte past the end')
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'action'), undefined, 'nothing published')
+
+        // And after one: it must not disturb a good reading either, in either direction.
+        thinq.emit('data', buf(A8_STOPPED_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'action'), 'idle')
+        const before = { ...ha.devices[DEVICE_ID].properties }
+
+        thinq.emit('data', buf(A8_SHORT_HEX))
+        assert.equal(dev.compressorRunning, false, 'flag untouched')
+        assert.deepEqual(ha.devices[DEVICE_ID].properties, before, 'no property moved')
+
+        thinq.emit('data', buf(A8_COOLING_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'action'), 'cooling', 'still tracking')
+
+        dev.drop()
+    })
+
+    test('the 0xa8 length test is exact, not a lower bound', (t) => {
+        const { ha, thinq, dev } = buildReadyDevice(t)
+
+        /*
+         * The short frame above is rejected by buf[10] = 0x02 alone, so it does not exercise
+         * the length test at all. These two do. A truncated long frame keeps buf[10] = 0xff and
+         * is still longer than the offset, so `length > OFFSET` or `length >= A8_FRAME_LENGTH`
+         * would both accept one of them - and then decode a byte out of a frame whose fields
+         * are not where they are believed to be. There is no evidence any such frame exists;
+         * that is the point. The profile decodes a fixed-offset struct on the strength of four
+         * captures of one firmware, so it accepts only the shape those captures contain.
+         */
+        const truncated = buf(A8_COOLING_HEX).subarray(0, 200)
+        assert.equal(truncated[10], 0xff, 'still looks like a long record')
+        assert.equal(truncated[160], 1, 'and offset 160 is still in range and still reads 1')
+
+        thinq.emit('data', truncated)
+        assert.equal(dev.compressorRunning, undefined, 'not decoded from a truncated frame')
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'action'), undefined, 'nothing published')
+
+        // Over-long, for the same reason in the other direction.
+        thinq.emit('data', Buffer.concat([buf(A8_COOLING_HEX), Buffer.from([0x00])]))
+        assert.equal(dev.compressorRunning, undefined, 'nor from an over-long one')
+
+        // The real frame, unmodified, is still accepted - the test above is not vacuous.
+        thinq.emit('data', buf(A8_COOLING_HEX))
+        assert.equal(dev.compressorRunning, true)
+        assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'action'), 'cooling')
+
+        dev.drop()
+    })
+
+    test('only HA-valid hvac_action strings are ever published', (t) => {
+        const { ha, thinq, dev } = buildReadyDevice(t)
+
+        /*
+         * There is no analogue of RAC_056905_WW's `action = 'None'`, which is not an HA
+         * hvac_action value and exists for an auto mode this model does not have. Replaying
+         * every action-bearing fixture in the file must only ever produce these five.
+         */
+        const valid = ['off', 'idle', 'cooling', 'drying', 'fan']
+        const frames = [
+            A8_COOLING_HEX,
+            STATE_HVAC_SETPOINT_30_HEX,
+            A8_STOPPED_HEX,
+            A8_POWERON_HEX,
+            A8_NOT_YET_RESTARTED_HEX,
+            A8_RUNNING_AGAIN_HEX,
+            STATE_HVAC_TO_DRY_HEX,
+            A8_DRYING_HEX,
+            STATE_MODE_AIRCLEAN_HEX,
+            A8_RUNNING_WHILE_AIRCLEAN_HEX,
+            STATE_AIDRY_START_HEX,
+            A8_RUNNING_WHILE_OFF_HEX,
+            A8_SHORT_HEX,
+            STATE_MODE_COOL_HEX,
+            STATE_MODE_DRY_HEX,
+            QUERY_RESPONSE_HEX,
+        ]
+        const seen = new Set<string>()
+        for (const frame of frames) {
+            thinq.emit('data', buf(frame))
+            const action = ha.getProperty(DEVICE_ID, 'climate', 'action')
+            if (action !== undefined) seen.add(String(action))
+        }
+        for (const action of seen) assert.ok(valid.includes(action), `${action} is a valid hvac_action`)
+        // named explicitly, because membership alone cannot distinguish "never published it"
+        // from "never reached that state": 'None' is RAC's, and must never appear here.
+        assert.ok(!seen.has('None'), "RAC's 'None' is not an HA hvac_action and is not copied")
+        // and the run really did exercise the interesting ones rather than passing vacuously
+        assert.ok(seen.has('cooling') && seen.has('drying') && seen.has('fan') && seen.has('off'))
+
+        dev.drop()
+    })
+
+    // --- entity classification on the HA device page ---
+
+    test('the three new entities are published with the right platform, unit and category', (t) => {
+        enableMockTimers(t)
+        const { ha, dev } = makeDevice()
+        const components = ha.devices[DEVICE_ID].config!.components as Record<string, Record<string, unknown>>
+
+        // Sleep timer: an HA number in hours, filed under Controls - the owner sets it.
+        assert.equal(components.sleeptimer?.platform, 'number')
+        assert.equal(components.sleeptimer?.device_class, 'duration')
+        assert.equal(components.sleeptimer?.unit_of_measurement, 'h')
+        assert.equal(components.sleeptimer?.min, 0)
+        assert.equal(components.sleeptimer?.max, 15)
+        assert.equal(components.sleeptimer?.step, 0.25)
+        assert.equal(components.sleeptimer?.mode, 'slider')
+        assert.ok(!('entity_category' in components.sleeptimer), 'sleeptimer is a control')
+
+        /*
+         * AI dry remaining is in MINUTES on this model - see the captured cycle above. RAC
+         * publishes the same tag in '%'; copying that here would be wrong by a factor of the
+         * cycle length, so the unit is asserted rather than left to a reviewer's eye.
+         */
+        assert.equal(components.aidryremain?.platform, 'sensor')
+        assert.equal(components.aidryremain?.device_class, 'duration')
+        assert.equal(components.aidryremain?.unit_of_measurement, 'min')
+        assert.notEqual(components.aidryremain?.unit_of_measurement, '%')
+        assert.equal(components.aidryremain?.state_class, 'measurement')
+        assert.equal(components.aidryremain?.icon, 'mdi:hair-dryer-outline')
+        assert.equal(components.aidryremain?.entity_category, 'diagnostic')
+
+        assert.equal(components.aidryrunning?.platform, 'binary_sensor')
+        assert.equal(components.aidryrunning?.icon, 'mdi:hair-dryer')
+        assert.equal(components.aidryrunning?.entity_category, 'diagnostic')
+
+        // Temperature step: a control the owner can move, filed with the readings.
+        assert.equal(components.tempstep?.platform, 'select')
+        assert.deepEqual(components.tempstep?.options, ['0.5', '1'])
+        assert.equal(components.tempstep?.entity_category, 'diagnostic')
+        assert.ok(components.tempstep?.command_topic, 'tempstep is writable')
+
+        /*
+         * The two HAND-TYPED unique_ids in this profile, asserted here because they are the
+         * only two that can drift. Every other component is built by addSwitchField() /
+         * addSelectField() / addSensorField() / addTimerField(), which compute the unique_id
+         * as '$deviceid-' + the component key, so key and id cannot diverge by construction.
+         * 'tempstep' and 'aidryrunning' are written out by hand next to their key, and a typo
+         * there orphans a live entity and loses the owner's history on an appliance that is
+         * already in daily use. The rename test below covers the derived ones.
+         */
+        assert.equal(components.tempstep?.unique_id, '$deviceid-tempstep')
+        assert.equal(components.aidryrunning?.unique_id, '$deviceid-aidryrunning')
+        assert.equal(components.aidryrunning?.state_topic, '$this/aidryrunning')
+
+        dev.drop()
+    })
+
+    /*
+     * NO TURN-ON / TURN-OFF TIMERS on this model, and this is here so that nobody adds them
+     * from RAC_056905_WW's tag list alone. RAC gates its 0x21C / 0x21B pair on 0x2D3 & 4, and
+     * this appliance's capability reply carries 0x2D3 = 282643 = 0x45013, in which that bit is
+     * clear - while bit 0, the one RAC gates the sleep timer on, is set.
+     */
+    test('the turn-on and turn-off timers do not exist', (t) => {
+        enableMockTimers(t)
+        const { ha, dev } = makeDevice()
+        const components = ha.devices[DEVICE_ID].config!.components as Record<string, Record<string, unknown>>
+
+        // By tag, which is what would actually have to be registered - a key name is arbitrary.
+        assert.equal(dev.fields_by_id[0x21b], undefined, 'no field for 0x21B (turn-off timer)')
+        assert.equal(dev.fields_by_id[0x21c], undefined, 'no field for 0x21C (turn-on timer)')
+
+        // And by shape: the sleep timer is the only number entity this profile publishes.
+        const numbers = Object.keys(components).filter((key) => components[key].platform === 'number')
+        assert.deepEqual(numbers, ['sleeptimer'], 'sleeptimer is the only number entity')
+
+        dev.drop()
+    })
+
+    /*
+     * HA files an entity on the device page by entity_category: 'config' under
+     * "Configuration", 'diagnostic' under "Diagnostic", and NO KEY AT ALL under "Controls".
+     * There is no category string meaning "Controls", so `in` is the assertion, not a
+     * truthiness test - `entity_category: undefined` would pass the latter while still putting
+     * the key in the object HA's discovery payload is built from.
+     */
+    test('the everyday airflow controls carry no entity_category key at all', (t) => {
+        enableMockTimers(t)
+        const { ha, dev } = makeDevice()
+        const components = ha.devices[DEVICE_ID].config!.components as Record<string, Record<string, unknown>>
+
+        for (const name of ['airclean', 'onesidewind', 'spacefit']) {
+            assert.ok(components[name], `${name} exists`)
+            assert.ok(!('entity_category' in components[name]), `${name} has no entity_category key`)
+        }
+
+        // The switches around them are untouched: everything else is still a setting.
+        for (const name of ['jet', 'quiet', 'uvnano', 'childlock', 'smartcare', 'aidry', 'display', 'beep']) {
+            assert.equal(components[name]?.entity_category, 'config', `${name} is config`)
+        }
+        // ... and the humidity display option moved the other way, to the readings.
+        assert.equal(components.humiditydisplay?.entity_category, 'diagnostic')
+        // The cleaning cycles were already diagnostic and stay there.
+        assert.equal(components.hxclean?.entity_category, 'diagnostic')
+        assert.equal(components.allclean?.entity_category, 'diagnostic')
+
+        dev.drop()
+    })
+
+    /*
+     * Display strings only. The component keys - and therefore the unique_ids, and therefore
+     * HA's entity_ids and the owner's history - must not move, so each unique_id is asserted
+     * next to the name it now carries.
+     */
+    test('the renamed entities keep their unique_ids', (t) => {
+        enableMockTimers(t)
+        const { ha, dev } = makeDevice()
+        const components = ha.devices[DEVICE_ID].config!.components as Record<string, Record<string, unknown>>
+
+        // was "All clean"
+        assert.equal(components.allclean?.name, 'Cleaning - ALL')
+        assert.equal(components.allclean?.unique_id, '$deviceid-allclean')
+
+        // was "Heat exchanger clean"; the two now sort together in HA's entity list
+        assert.equal(components.hxclean?.name, 'Cleaning - Heat exchanger')
+        assert.equal(components.hxclean?.unique_id, '$deviceid-hxclean')
+
+        // was "Product beep", now the parallel of the display switch's "Display Light"
+        assert.equal(components.beep?.name, 'Beep Sound')
+        assert.equal(components.beep?.unique_id, '$deviceid-beep')
+        assert.equal(components.display?.name, 'Display Light')
+
+        dev.drop()
+    })
+
     // --- writes ---
 
     test('HA write climate-mode emits the captured TLV trio', (t) => {
@@ -1066,8 +2087,9 @@ describe(MODEL_ID, () => {
         ha.emit('setProperty', DEVICE_ID, 'filterreset', 'PRESS')
 
         /*
-         * The app's own frame was 0101040000006502010002d540769d; ours differs only in
-         * buf[3], which TLVDevice hardcodes - the TLV payload D540 (tag 0x355, value 0) is
+         * The app's own frame was 0101040000006502010002d540769d; ours differs only in buf[9],
+         * the sequence byte, which TLVDevice hardcodes to 1 where the app happened to send 0 -
+         * and in the CRC that follows from it. The TLV payload D540 (tag 0x355, value 0) is
          * identical. Nothing else goes out: no private command, no attached trio.
          */
         assert.equal(thinq.outbox.length, 1, 'exactly one frame')
