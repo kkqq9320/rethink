@@ -48,6 +48,27 @@ const CAPS_REQUEST_HEX = '01010400000065020201027D416A0D'
 const CAPS_RESPONSE_HEX = '000004000000A70201400EB85024D581B8903CD541B6A012340EC4'
 
 /*
+ * The REAL capability reply, captured from the appliance by injecting queryCaps()'s frame
+ * (CAPS_REQUEST_HEX above) and recording what came back. 174 bytes, 54 TLVs, buf[8] = 0x01.
+ * The synthetic fixture above stays because it carries filter tags this one does not, which
+ * is the only way to test that a capability reply cannot reach the filter sensors.
+ *
+ *      t=0x2da v=3485736   eeprom checksum - what isCapsResponse() keys on
+ *      t=0x2e1 v=36        setpoint minimum, 18.0 C
+ *      t=0x2e2 v=60        setpoint maximum, 30.0 C
+ *      t=0x2d7 v=0 / 1 / 5 three entries: the modes this appliance supports, i.e. cool,
+ *                          dry and air-clean - the same three the remote offers
+ *      ... 48 further tags, meaning unknown
+ */
+const CAPS_RESPONSE_REAL_HEX =
+    '000004000000A7020161A1' +
+    '6400644F64907C6C6018036C816D01B000B05023B0B001F07CB0C0B10DB23004F800B290C0B2E0084' +
+    '3B340B4F0045013B500B5601213B5A0C002B76001A0B780B7C0B801B85024B8903CB8D020B9103CBC' +
+    '600201BD1010BD60580FB240D3F0020000BC08D42001FFEA1021E1901CDD05FB102FB4A00200B6B03' +
+    '53028B6F0310917EFC0F010FFF06003FEFA01B5C0B61030B644B5C1B61030B648B5C5B61030B643' +
+    '2A9C'
+
+/*
  * Comprehensive state dump, 221 bytes / 94 TLVs, emitted once at first connect.
  * Deliberately NOT called a "response to query 0x1f5/2": the LG app never sends 0x1f5 to
  * this appliance, so what provokes the dump is unproven. It does contain 0x1f7, so
@@ -379,11 +400,22 @@ describe(MODEL_ID, () => {
         assert.equal(components.humidity?.unit_of_measurement, '%')
         // a room measurement belongs on the device card, not under diagnostics
         assert.ok(!components.humidity?.entity_category, 'humidity is not diagnostic')
+        // Power is a primary measurement too, and needs force_update or a Riemann sum over
+        // it staircases: the appliance refreshes slower than the profile polls.
+        assert.ok(!components.energy_current?.entity_category, 'power is not diagnostic')
+        assert.equal(components.energy_current?.force_update, true)
 
-        // 0x337 is read-only: the app changes this setting over the private command channel
-        // (command 0x0c) and never by a TLV write, so it is a sensor with no command topic.
-        assert.equal(components.humiditydisplay?.platform, 'sensor')
-        assert.ok(!components.humiditydisplay?.command_topic, 'humiditydisplay is not writable')
+        // Names the user reads on the device page.
+        assert.equal(components.display?.name, 'Display Light')
+        assert.equal(components.jet?.name, 'Jet cool')
+
+        /*
+         * The LG app sets this over the private command channel (command 0x0c), never by a
+         * TLV write, so it was first exposed read-only. A TLV write was then tried on the
+         * appliance and does take effect, hence a writable select.
+         */
+        assert.equal(components.humiditydisplay?.platform, 'select')
+        assert.deepEqual(components.humiditydisplay?.options, ['while running', 'always'])
 
         // Tags the capture shows but nobody understands must not become entities.
         // 0x312 in particular is the frame's own length field - it is the most frequently
@@ -418,10 +450,14 @@ describe(MODEL_ID, () => {
          * whose config carries the platform and nothing else - hence deepEqual rather than a
          * presence check: one extra key turns the removal back into a registration.
          */
-        assert.deepEqual(components.filterreset, { platform: 'button' }, 'reset button marked for removal')
         assert.deepEqual(components.changeddate, { platform: 'sensor' }, 'changed-date sensor marked for removal')
-        assert.ok(!dev.fields_by_ha['filterreset'], 'no filter reset write path')
         assert.ok(!components.filterchangeddate, 'no filter changed-date sensor (topic name)')
+
+        // The reset button is back, on the same unique_id, now driving a TLV write.
+        assert.equal(components.filterreset?.platform, 'button')
+        assert.equal(components.filterreset?.unique_id, '$deviceid-filterreset')
+        assert.equal(components.filterreset?.entity_category, 'diagnostic')
+        assert.ok(dev.fields_by_ha['filterreset'], 'filter reset write path exists')
 
         dev.drop()
     })
@@ -461,7 +497,7 @@ describe(MODEL_ID, () => {
         assert.equal(ha.getProperty(DEVICE_ID, 'aidrylevel', 'state'), '5') // 0x1F2=6
         assert.equal(ha.getProperty(DEVICE_ID, 'humiditydisplay', 'state'), 'always') // 0x337=1
 
-        assert.equal(ha.getProperty(DEVICE_ID, 'energy_current', 'state'), 3501) // 0x2B3
+        assert.equal(ha.getProperty(DEVICE_ID, 'energy_current', 'state'), 350.1) // 0x2B3=3501, tenths of a W
         assert.equal(ha.getProperty(DEVICE_ID, 'error', 'state'), 0) // 0x221
         assert.equal(ha.getProperty(DEVICE_ID, 'humidity', 'state'), 57) // 0x336, integer %RH
 
@@ -588,7 +624,7 @@ describe(MODEL_ID, () => {
         thinq.emit('data', buf(STATE_WIND_SPLIT_HEX))
         assert.equal(ha.getProperty(DEVICE_ID, 'climate', 'swing_horizontal_mode_state'), 'split') // 0x2A3=5
         // the same frame carries a power reading
-        assert.equal(ha.getProperty(DEVICE_ID, 'energy_current', 'state'), 297) // 0x2B3
+        assert.equal(ha.getProperty(DEVICE_ID, 'energy_current', 'state'), 29.7) // 0x2B3=297, tenths of a W
 
         dev.drop()
     })
@@ -1016,7 +1052,39 @@ describe(MODEL_ID, () => {
         // The filter entities exist regardless, and read only from TLV.
         const components = ha.devices[DEVICE_ID].config!.components
         assert.ok(components.filterlife && components.filterremaining && components.filterused)
-        assert.deepEqual(components.filterreset, { platform: 'button' }, 'reset button only marked for removal')
+
+        dev.drop()
+    })
+
+    test('the filter reset writes 0 to 0x355, exactly as the LG app does', (t) => {
+        const { ha, thinq, dev } = buildReadyDevice(t)
+
+        thinq.emit('data', buf(QUERY_RESPONSE_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'filterremaining', 'state'), 2442)
+        thinq.outbox.length = 0
+
+        ha.emit('setProperty', DEVICE_ID, 'filterreset', 'PRESS')
+
+        /*
+         * The app's own frame was 0101040000006502010002d540769d; ours differs only in
+         * buf[3], which TLVDevice hardcodes - the TLV payload D540 (tag 0x355, value 0) is
+         * identical. Nothing else goes out: no private command, no attached trio.
+         */
+        assert.equal(thinq.outbox.length, 1, 'exactly one frame')
+        assert.equal(hex(thinq.outbox[0]).toLowerCase(), '0101040000006502010102d5400029')
+        assert.equal(thinq.outbox.filter((frame) => frame[1] === 0xff).length, 0, 'not a private command')
+
+        /*
+         * The reset must not fake the outcome locally. Until the appliance answers, the
+         * sensors still read what it last reported.
+         */
+        assert.equal(ha.getProperty(DEVICE_ID, 'filterremaining', 'state'), 2442)
+        assert.equal(ha.getProperty(DEVICE_ID, 'filterused', 'state'), 558)
+
+        // The appliance's reply is what moves them - captured verbatim after a real reset.
+        thinq.emit('data', buf('000004000000A70204C606D5600BB8C48445B1')) // 0x355=3000
+        assert.equal(ha.getProperty(DEVICE_ID, 'filterremaining', 'state'), 3000)
+        assert.equal(ha.getProperty(DEVICE_ID, 'filterused', 'state'), 0)
 
         dev.drop()
     })
@@ -1056,6 +1124,35 @@ describe(MODEL_ID, () => {
         assert.equal(ha.getProperty(DEVICE_ID, 'filterlife', 'state'), 3000)
         assert.equal(ha.getProperty(DEVICE_ID, 'filterremaining', 'state'), 2442)
         assert.equal(ha.getProperty(DEVICE_ID, 'filterused', 'state'), 558)
+
+        dev.drop()
+    })
+
+    test("the appliance's real capability reply is recognised", (t) => {
+        enableMockTimers(t)
+        const { thinq, dev } = makeDevice()
+
+        thinq.emit('data', buf(CAPS_RESPONSE_REAL_HEX))
+
+        // 0x2da is present, so the retry loop stops and the values query goes out.
+        assert.equal(dev.query_caps_timeout, undefined, 'recognised as the capability reply')
+        assert.equal(dev.raw_clip_state[0x2da], 3485736)
+
+        /*
+         * The appliance declares its own setpoint range here. min_temp / max_temp in the
+         * climate component are hardcoded to these values; if this assertion ever fails on
+         * another unit, the hardcoding is what has to change.
+         */
+        assert.equal(dev.raw_clip_state[0x2e1], 36, 'declared minimum, 18.0 C')
+        assert.equal(dev.raw_clip_state[0x2e2], 60, 'declared maximum, 30.0 C')
+
+        /*
+         * 0x2d7 appears three times, once per supported mode; raw_clip_state keeps the last,
+         * which is 5 - air-clean. That the appliance's own list ends at 5 and not at 6 is
+         * independent confirmation of the mode table, which was otherwise derived by
+         * pressing buttons on the remote: no auto (6) and no heat (4).
+         */
+        assert.equal(dev.raw_clip_state[0x2d7], 5)
 
         dev.drop()
     })
