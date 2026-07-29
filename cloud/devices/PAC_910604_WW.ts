@@ -275,7 +275,7 @@ export default class Device extends TLVDevice {
          * appliance echoes the resulting value back, so letting the real state win is both
          * simpler and more honest.
          */
-        this.addSwitchField(config, 0x236, 'jet', 'Jet mode', 'mdi:wind-power')
+        this.addSwitchField(config, 0x236, 'jet', 'Jet cool', 'mdi:wind-power')
         this.addSwitchField(config, 0x29d, 'quiet', 'Quiet mode', 'mdi:volume-off')
         this.addSwitchField(config, 0x2a2, 'uvnano', 'UVnano', 'mdi:bacteria')
         this.addSwitchField(config, 0x1be, 'spacefit', 'Space-fit wind', 'mdi:arrow-expand-horizontal')
@@ -291,7 +291,7 @@ export default class Device extends TLVDevice {
          * 1 = display off / muted. Confirmed by the operator-annotated capture, where
          * "제품 화면 OFF" produced 0x21f = 1 and "제품 소리 OFF" produced 0x3a0 = 1.
          */
-        this.addSwitchField(config, 0x21f, 'display', 'Product display', 'mdi:television-ambient-light', {
+        this.addSwitchField(config, 0x21f, 'display', 'Display Light', 'mdi:television-ambient-light', {
             onValue: 0,
             offValue: 1,
         })
@@ -359,36 +359,52 @@ export default class Device extends TLVDevice {
             entity_category: undefined,
         })
 
-        this.addSensorField(
-            config,
-            0x337,
-            'humiditydisplay',
-            'Humidity display',
-            'mdi:water-percent',
-            undefined,
-            (raw) => {
-                const values2ha: Record<number, string> = { 0: 'while running', 1: 'always' }
-                return values2ha[raw]
-            },
-        )
+        /*
+         * The LG app changes this over the private command channel rather than with a TLV
+         * write, so it was first exposed read-only. A TLV write was then tried against the
+         * appliance and does take effect, so it is a proper select.
+         */
+        this.addSelectField(config, 0x337, 'humiditydisplay', 'Humidity display', 'mdi:water-percent', [
+            'while running',
+            'always',
+        ])
 
         /*
          * force_update matters here: the appliance refreshes 0x2b3 less often than the
          * profile polls, so without it a Riemann sum over this sensor produces a staircase
          * rather than an energy total.
          *
-         * RAC_056905_WW corrects its reading with max(5, raw - 60) because that appliance
-         * is biased high and never reports a true zero. This one does: 0x2b3 reaches 0 when
-         * the unit stops, and the lowest running values observed are 72 / 133 / 160. There
-         * is no offset to remove, so the raw watts are published unmodified.
+         * On this model 0x2b3 is in tenths of a watt, unlike RAC_056905_WW where it is whole
+         * watts. Taken raw the appliance would claim 10085 W at full load, which no single
+         * indoor unit draws; a tenth of that, 1008 W, is exactly right for a stand unit.
+         * The rest of the range agrees: 72 .. 251 raw while only the fan runs is 7 .. 25 W,
+         * and 2556 .. 3501 raw under partial cooling load is 256 .. 350 W.
+         *
+         * There is no additive bias to remove. RAC applies max(5, raw - 60) because that
+         * appliance never reports a true zero; this one reports exactly 0 the moment it
+         * stops, so subtracting anything would be wrong.
+         *
+         * Note for whoever sums these across a house: the figure is this indoor unit's share
+         * of the outdoor compressor and excludes the indoor fan, so the units will not add
+         * up to the real total. It is for apportioning between rooms.
          */
-        this.addSensorField(config, 0x2b3, 'energy_current', 'Power', undefined, {
-            device_class: 'power',
-            unit_of_measurement: 'W',
-            state_class: 'measurement',
-            suggested_display_precision: 0,
-            force_update: true,
-        })
+        this.addSensorField(
+            config,
+            0x2b3,
+            'energy_current',
+            'Power',
+            undefined,
+            {
+                device_class: 'power',
+                unit_of_measurement: 'W',
+                state_class: 'measurement',
+                suggested_display_precision: 0,
+                force_update: true,
+                /* a primary measurement, not diagnostics - override addSensorField's default */
+                entity_category: undefined,
+            },
+            (raw) => raw / 10,
+        )
         this.addSensorField(config, 0x221, 'error', 'Error code', 'mdi:alert')
 
         /*
@@ -450,24 +466,59 @@ export default class Device extends TLVDevice {
         config['components']['filterused'] = filterUsed
 
         /*
-         * MIGRATION. The previous version of this profile published two components that no
-         * longer exist: 'changeddate' (the private channel's filter-changed date) and
-         * 'filterreset' (the reset button). Both were really created - an installation that
-         * ran it still shows a "Reset filter usage" button wired to nothing at all - and
-         * dropping them from the payload does NOT remove them, it only stops updating them.
+         * Resetting the filter counter is a plain TLV write of 0 to 0x355; the appliance
+         * answers by reporting 0x355 = 0x356, i.e. a full life again. Captured from the LG
+         * app doing exactly this:
+         *
+         *   TX 0101040000006502010002d540769d   0x355 = 0
+         *   rx 0201040000008701100000ec3c       acknowledgement
+         *   rx 000004000000a70204c606d5600bb8…  0x355 = 3000
+         *
+         * An earlier version of this profile drove the reset over the private command
+         * channel, copied from RAC_056905_WW. That was wrong - the private channel's
+         * counter is a different one - and it is why the button was withdrawn for a
+         * release. The unique_id is unchanged, so installations that saw the withdrawn
+         * button get this one wired up in its place rather than a second entity.
+         *
+         * It goes through fields_by_ha directly rather than addField, because addField
+         * would take over fields_by_id[0x355] and break the filterremaining sensor. The
+         * write_callback sends the frame itself and returns false so the default path does
+         * not also stamp 0 into raw_clip_state - the appliance's own reply is what should
+         * update the sensors.
+         */
+        const filterReset = {
+            platform: 'button',
+            unique_id: '$deviceid-filterreset',
+            command_topic: '$this/filterreset/set',
+            name: 'Reset filter usage',
+            icon: 'mdi:air-filter',
+            entity_category: 'diagnostic',
+        }
+        config['components']['filterreset'] = filterReset
+        this.fields_by_ha['filterreset'] = {
+            name: '',
+            comp: '',
+            write_xform: (val) => (val === 'PRESS' ? 0 : null),
+            write_callback: () => {
+                log('status', this.id, 'resetting the filter counter')
+                this.send([1, 1, 2, 1, 1], [{ t: 0x355, v: 0 }])
+                return false
+            },
+        }
+
+        /*
+         * MIGRATION. The previous version published a 'changeddate' component - the private
+         * channel's filter-changed date - that no longer exists. It was really created, and
+         * dropping it from the payload does NOT remove it, it only stops updating it.
          *
          * HA removes a component when the payload carries its key with the platform and
          * NOTHING else: mqtt/discovery.py pops the platform and treats what is left, if it
-         * is empty, as a removal. Adding unique_id - or any other key - to these two objects
-         * silently turns the removal back into a registration, so do not "fix" the casts by
-         * filling them in. 'filterlife' and 'filterused' are absent here on purpose: they
-         * keep their unique_ids above, so HA updates those entities rather than orphaning
-         * them.
+         * is empty, as a removal. Adding unique_id - or any other key - silently turns the
+         * removal back into a registration, so do not "fix" the cast by filling it in.
          *
          * Safe to delete once every installation has run this version once.
          */
         config['components']['changeddate'] = { platform: 'sensor' } as ComponentInfo
-        config['components']['filterreset'] = { platform: 'button' } as ComponentInfo
 
         /*
          * Vertical swing genuinely does not exist on this model - it has no such control,
