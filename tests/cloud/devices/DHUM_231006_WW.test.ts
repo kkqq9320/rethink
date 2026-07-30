@@ -921,6 +921,24 @@ describe(MODEL_ID, () => {
         assert.equal(ha.devices[DEVICE_ID].properties['compressor'], 'OFF')
     })
 
+    test('the compressor group is published raw, for an external meter to settle', (t) => {
+        const { ha, thinq } = readyDevice(t)
+        const props = () => ha.devices[DEVICE_ID].properties
+
+        thinq.emit('data', buf(TELEMETRY_COMPRESSOR_ON_HEX))
+        /* the bytes of that captured record, at the four offsets that track the compressor */
+        assert.equal(props()['telemetry_84'], 5)
+        assert.equal(props()['telemetry_87'], 59)
+        assert.equal(props()['telemetry_89'], 38)
+        assert.equal(props()['telemetry_90'], 38)
+
+        /* all four are zero whenever the compressor is - that is what picked them out */
+        thinq.emit('data', buf(TELEMETRY_COMPRESSOR_OFF_HEX))
+        for (const offset of [84, 87, 89, 90]) {
+            assert.equal(props()[`telemetry_${offset}`], 0, `@${offset} zero while stopped`)
+        }
+    })
+
     test('a telemetry record of another subtype is left alone', (t) => {
         const { ha, thinq } = readyDevice(t)
 
@@ -950,8 +968,11 @@ describe(MODEL_ID, () => {
 
         const after = { ...ha.devices[DEVICE_ID].properties }
         assert.equal(typeof after['compressor'], 'string', 'the compressor was published')
-        delete after['compressor']
-        delete before['compressor']
+        /* the compressor group's raw bytes come from the same record and are expected too */
+        for (const key of ['compressor', 'telemetry_84', 'telemetry_87', 'telemetry_89', 'telemetry_90']) {
+            delete after[key]
+            delete before[key]
+        }
         assert.deepEqual(after, before, 'nothing else changed')
     })
 

@@ -288,6 +288,23 @@ const HUMIDITY_MAX = 70
 const COMPRESSOR_FRAME_LENGTH = 97
 const COMPRESSOR_RUNNING_OFFSET = 86
 
+/*
+ * The rest of the compressor group, published as RAW BYTES with no unit and no scale, at the
+ * owner's request, so they can be compared against a real power meter.
+ *
+ * Across all 43 telemetry records on file, exactly five offsets are zero when @86 is zero and
+ * non-zero when it is not: 84, 86, 87, 89 and 90. @86 is the two-valued one and became the
+ * compressor sensor; these four carry magnitudes - @84 spans 0..23+ in small steps and is the
+ * most analogue-looking of them, @87 sits at 50/57/59, @89 and @90 at 24/38/50/57.
+ *
+ * NOTHING HERE CLAIMS THEY ARE WATTS. No tag on this appliance carries power (the ACs' 0x2b3
+ * appears in none of the 66 tags seen across nine captures), so there is no in-appliance
+ * reading to calibrate against; that is exactly why they go out raw, for an external meter to
+ * settle. If a correlation turns up, the right change is a proper sensor with a unit - not a
+ * relabelling of these.
+ */
+const COMPRESSOR_TELEMETRY_OFFSETS = [84, 87, 89, 90]
+
 type SwitchOptions = {
     /* raw TLV value written for 'ON' (default 1) */
     onValue?: number
@@ -764,6 +781,18 @@ export default class Device extends TLVDevice {
             entity_category: 'diagnostic',
         } as ComponentInfo
 
+        for (const offset of COMPRESSOR_TELEMETRY_OFFSETS) {
+            config.components[`telemetry_${offset}`] = {
+                platform: 'sensor',
+                unique_id: `$deviceid-telemetry_${offset}`,
+                name: `Compressor telemetry @${offset}`,
+                icon: 'mdi:help-circle-outline',
+                state_topic: `$this/telemetry_${offset}`,
+                state_class: 'measurement',
+                entity_category: 'diagnostic',
+            } as ComponentInfo
+        }
+
         /*
          * The two mode-dependent entities get their own availability topic ON TOP OF the two
          * device-wide ones. A component's `availability` REPLACES the device-level list rather
@@ -855,6 +884,9 @@ export default class Device extends TLVDevice {
             buf.length === COMPRESSOR_FRAME_LENGTH
         ) {
             this.HA.publishProperty(this.id, 'compressor', buf[COMPRESSOR_RUNNING_OFFSET] !== 0 ? 'ON' : 'OFF')
+            for (const offset of COMPRESSOR_TELEMETRY_OFFSETS) {
+                this.HA.publishProperty(this.id, `telemetry_${offset}`, buf[offset])
+            }
             return
         }
 
