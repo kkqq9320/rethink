@@ -146,6 +146,44 @@ const OP_RESUME = 0x03
 
 const COURSE_EXTENDED = 0xff
 
+// ---------------------------------------------------------------------------------------------------
+// Which controls a course actually lets you touch, and with which values.
+//
+// THIS IS OBSERVATION, NOT CAPABILITY DATA. The appliance never declares it. The 0x86 message the app
+// exchanges while browsing courses turned out to be a device-wide feature list (length-prefixed ASCII
+// keys like "201-2-1"), not a per-course mask, so unlike the air conditioners - which do answer with a
+// capability bitmap - there is nothing here to read. Every row below comes from the owner working the
+// panel and reporting which buttons did nothing.
+//
+// Deriving it from the traffic alone does not work, in either direction: a sweep that stops early
+// under-reports, and side effects over-report - setting wash to none drags water temperature to none
+// with it, which reads exactly like "temperature is selectable" if you only look at the bytes.
+//
+// `null` means the control is locked on that course. An absent key means the full range is available.
+// Consequently this can be wrong, and it is advisory only: it drives a diagnostic sensor and nothing
+// else. A write the appliance rejects simply leaves the record unchanged, which the raw options sensor
+// makes visible.
+type CourseLimits = {
+    wash?: number[] | null
+    water_temp?: number[] | null
+    rinse?: number[] | null
+    spin?: number[] | null
+    steam?: false
+}
+const COURSE_LIMITS: Record<string, CourseLimits> = {
+    114: { wash: [3, 7], steam: false }, // 인공지능세탁
+    46: {}, // 표준 - the permissive one, everything on full range
+    'ext:245': {}, // 표준1
+    'ext:246': {}, // 타월1
+    94: { wash: [0, 3], water_temp: null, spin: [0, 1, 2], steam: false }, // 울/섬세
+    27: { wash: [0, 1, 3], water_temp: [2, 3, 8], spin: [0, 1, 2, 4], steam: false }, // 이불
+    135: { wash: [0, 3], water_temp: null, steam: false }, // 쾌속스팀살균 - steam is driven by the
+    // appliance here rather than by the user: its bit follows the wash stage on its own.
+    55: { wash: null, water_temp: null, steam: false }, // 헹굼+탈수
+    85: { wash: null, water_temp: null, rinse: null, spin: null, steam: false }, // 통살균 - nothing
+    134: { wash: null, water_temp: null, rinse: null, spin: null, steam: false }, // 급속통헹굼 - nothing
+}
+
 // The whole dial, named by sweeping it one position at a time through a full revolution and writing the
 // names down in order. The alignment is self-checking: the sweep started and ended on the same position
 // and came back to the same value, and three of the courses had already been identified independently
@@ -310,6 +348,15 @@ export default class Device extends AABBDevice {
                         state_topic: '$this/end_time',
                         name: 'Finishes at',
                         device_class: 'timestamp',
+                    },
+                    available_options: {
+                        platform: 'sensor',
+                        unique_id: '$deviceid-available-options',
+                        state_topic: '$this/available_options',
+                        json_attributes_topic: '$this/available_options_attrs',
+                        name: 'Adjustable options',
+                        icon: 'mdi:tune-variant',
+                        entity_category: 'diagnostic',
                     },
                     options_raw: {
                         platform: 'sensor',
@@ -507,6 +554,8 @@ export default class Device extends AABBDevice {
             'current_course',
             courseName ?? `#${course === COURSE_EXTENDED ? rec[OFF_COURSE_EXT] : course}`,
         )
+        // Depends only on which course is selected, so it is published in every phase, not just standby.
+        this.publishLimits(course, rec[OFF_COURSE_EXT])
 
         // The rest are consumed as the appliance works through them and read 0 from the first stage
         // onwards, so they only report the selection while it sits at standby. Anywhere else,
@@ -529,6 +578,36 @@ export default class Device extends AABBDevice {
             'options_raw',
             `course=${course} ext=${rec[OFF_COURSE_EXT]} wash=${rec[OFF_WASH]} temp=${rec[OFF_WATER_TEMP]} rinse=${rec[OFF_RINSE]} spin=${rec[OFF_SPIN]} steam=${rec[OFF_STEAM]}`,
         )
+    }
+
+    /**
+     * What the current course lets the user change. Advisory - see COURSE_LIMITS; the appliance does
+     * not declare this, so it is a record of what was tried by hand rather than something authoritative.
+     */
+    publishLimits(course: number, ext?: number) {
+        const limits = COURSE_LIMITS[course === COURSE_EXTENDED ? `ext:${ext}` : String(course)]
+        if (!limits) {
+            this.publishProperty('available_options', 'unknown')
+            this.publishProperty('available_options_attrs', '{}')
+            return
+        }
+
+        const named = (values: number[] | undefined | null, map: Record<number, string>) =>
+            values === null ? null : (values ?? Object.keys(map).map(Number)).map((v) => map[v] ?? String(v))
+
+        const attrs = {
+            wash: named(limits.wash, WASH),
+            water_temp: named(limits.water_temp, WATER_TEMP),
+            rinse: limits.rinse === null ? null : (limits.rinse ?? RINSE).map(String),
+            spin: named(limits.spin, SPIN),
+            steam: limits.steam !== false,
+        }
+        const adjustable = Object.entries(attrs)
+            .filter(([, v]) => (Array.isArray(v) ? v.length > 1 : v === true))
+            .map(([k]) => k)
+
+        this.publishProperty('available_options', adjustable.join(', ') || 'none')
+        this.publishProperty('available_options_attrs', JSON.stringify(attrs))
     }
 
     /** Publish a select's state only when the appliance's value is one of the options we declared. */

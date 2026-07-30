@@ -217,6 +217,27 @@ describe('FX___S washer', () => {
         assert.equal(get(HA, 'beep'), 'very_high')
     })
 
+    test('reports which controls the current course actually lets you change', () => {
+        const { HA, thinq } = setup()
+        feed(thinq, STANDBY) // AI Wash
+
+        // Steam cannot be switched on this course, and wash is limited to two of its six positions -
+        // both reported by the owner working the panel, since the appliance never declares any of it.
+        assert.equal(get(HA, 'available_options'), 'wash, water_temp, rinse, spin')
+        const attrs = JSON.parse(String(get(HA, 'available_options_attrs')))
+        assert.deepEqual(attrs.wash, ['normal', 'soak'])
+        assert.equal(attrs.steam, false)
+        assert.equal(attrs.water_temp.length, 5)
+    })
+
+    test('reports a course that locks everything', () => {
+        const { HA, thinq } = setup()
+        feed(thinq, RINSE_SPIN_STARTED) // Rinse + Spin, which fixes wash and temperature
+        const attrs = JSON.parse(String(get(HA, 'available_options_attrs')))
+        assert.equal(attrs.wash, null)
+        assert.equal(attrs.water_temp, null)
+    })
+
     test('ignores frames that are not from the appliance', () => {
         const { HA, thinq } = setup()
         feed(thinq, buf('aa09f0241001018cbb')) // our own start command echoed back
