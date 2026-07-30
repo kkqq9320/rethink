@@ -265,6 +265,63 @@ describe('FX___S washer', () => {
         assert.equal(get(HA, 'running'), 'OFF')
     })
 
+    test('adds a course it has no name for and makes it selectable', () => {
+        const { HA, thinq, dut } = setup()
+        // The current record starts at byte 83 of the frame, so its course byte is 87. 0x63 is not one
+        // of the ten positions the dial sweep found.
+        const unknown = Buffer.from(STANDBY)
+        unknown[87] = 0x63
+        feed(thinq, unknown)
+
+        assert.equal(get(HA, 'current_course'), '#99')
+        assert.ok(
+            (HA.devices[DEVICE_ID].config!.components.course as unknown as { options: string[] }).options.includes(
+                '#99',
+            ),
+        )
+
+        thinq.resetRecorder()
+        dut.setProperty('course', '#99')
+        assert.equal(hex(thinq.outbox[0]), hex(buf('aa0df0e5000201ff010a63a9bb')))
+    })
+
+    // The frame the LG app itself sends to read settings and state; the pair count is zero, so it
+    // writes nothing.
+    const QUERY = 'aa0bf0e5000201ff00d9bb'
+
+    test('asks for the current state as soon as it attaches', () => {
+        const { thinq, dut } = setup()
+        dut.start() // what the bridge calls when the appliance attaches
+        assert.equal(hex(thinq.outbox[0]), hex(buf(QUERY)))
+    })
+
+    test('asks for state when a heartbeat contradicts what we last saw', () => {
+        const { thinq } = setup()
+        feed(thinq, POWERED_OFF)
+        thinq.resetRecorder()
+
+        // Heartbeats only flow while the appliance is powered on, so one arriving after an off record
+        // means the record is stale - switching it on at the panel announces nothing, measured at
+        // eighty seconds of silence before any state frame followed.
+        const HEARTBEAT = buf('aaff200a001800840e000101030006100b0b0110019ab7bb')
+        feed(thinq, HEARTBEAT)
+        assert.equal(hex(thinq.outbox[0]), hex(buf(QUERY)))
+
+        // ...but not once per heartbeat, which arrive every second and a half.
+        thinq.resetRecorder()
+        feed(thinq, HEARTBEAT)
+        feed(thinq, HEARTBEAT)
+        assert.equal(thinq.outbox.length, 0)
+    })
+
+    test('does not ask again while the record already says it is on', () => {
+        const { thinq, dut } = setup()
+        feed(thinq, STANDBY)
+        thinq.resetRecorder()
+        feed(thinq, buf('aaff200a001800840e000101030006100b0b0110019ab7bb'))
+        assert.equal(thinq.outbox.length, 0)
+    })
+
     test('ignores frames that are not from the appliance', () => {
         const { HA, thinq } = setup()
         feed(thinq, buf('aa09f0241001018cbb')) // our own start command echoed back

@@ -51,6 +51,8 @@ const INNER_STATE = 0xec
 // (re)connects - there is no prior state to diff against yet. Without it a restart leaves every entity
 // unknown until the appliance next changes state, which on an idle washer can be a very long time.
 const INNER_STATE_SINGLE = 0xeb
+// Sent about every 1.5 s, and only while the appliance is powered on.
+const INNER_HEARTBEAT = 0x03
 
 const RECORD_LEN = 66
 // data = <record> <1 byte separator> <record>; the current state is the second one.
@@ -283,6 +285,20 @@ export default class Device extends AABBDevice {
 
     /** Last state record seen, so an extended-course write can carry the options along with it. */
     lastRecord: Buffer | undefined
+
+    /**
+     * Courses the select currently offers. Ten were named by sweeping the dial, but a dial position
+     * that was missed - or a course on a sibling model reporting the same modelId - would otherwise be
+     * unselectable forever. An unrecognised one is added here under its number and the discovery config
+     * is republished, so it becomes selectable without waiting for the table to be updated.
+     *
+     * Nothing is ever removed. A course that has been seen once stays on the list: dropping it would
+     * break any automation referring to it, and courses do not disappear from a dial.
+     */
+    courseOptions = [...Object.values(COURSE), ...Object.values(COURSE_EXT)]
+
+    /** When the last state query was sent, so a stream of heartbeats cannot turn into a stream of them. */
+    lastQuery = 0
 
     constructor(HA: Connection, thinq: Thinq2Device, meta: Metadata) {
         super(HA, thinq)
@@ -541,6 +557,20 @@ export default class Device extends AABBDevice {
         )
     }
 
+    /**
+     * Ask for the current settings and state. The appliance answers with a 0xE6 carrying a full record.
+     * This is the read the LG app itself makes - byte for byte the frame it sends - and it writes
+     * nothing: the pair count is zero.
+     */
+    query() {
+        this.lastQuery = Date.now()
+        this.send(Buffer.from([0xf0, 0xe5, 0x00, 0x02, 0x01, 0xff, 0x00]))
+    }
+
+    start() {
+        this.query()
+    }
+
     processAABB(buf: Buffer) {
         if (buf[0] !== FROM_DEVICE || buf.length < 4) return
 
@@ -552,6 +582,17 @@ export default class Device extends AABBDevice {
 
         if (type === MSG_TUNNEL) {
             if (payload.length < 10) return
+
+            // Powering the appliance on does not make it report anything: measured, the heartbeat
+            // resumed at once but no state frame followed for eighty seconds, so Home Assistant kept
+            // showing it as off. Heartbeats only flow while it is powered on, so one arriving while our
+            // last record says otherwise means we are stale, and asking is the only way to find out.
+            if (payload[6] === INNER_HEARTBEAT) {
+                const stale = !this.lastRecord || this.lastRecord[OFF_PHASE] === PHASE_OFF
+                if (stale && Date.now() - this.lastQuery > 10_000) this.query()
+                return
+            }
+
             const data = payload.subarray(10)
             // 0xEC stacks the previous record ahead of the current one; 0xEB carries the current one
             // alone. Same 66-byte layout either way.
@@ -612,12 +653,10 @@ export default class Device extends AABBDevice {
         // The course byte is not consumed - it survives the cycle, the finished state and even powering
         // off - so it is always worth publishing.
         const course = rec[OFF_COURSE]
-        const courseName = course === COURSE_EXTENDED ? COURSE_EXT[rec[OFF_COURSE_EXT]] : COURSE[course]
-        this.publishOption('course', courseName)
-        this.publishProperty(
-            'current_course',
-            courseName ?? `#${course === COURSE_EXTENDED ? rec[OFF_COURSE_EXT] : course}`,
-        )
+        const label = this.courseLabel(course, rec[OFF_COURSE_EXT])
+        this.registerCourse(label)
+        this.publishProperty('course', label)
+        this.publishProperty('current_course', label)
         // Depends only on which course is selected, so it is published in every phase, not just standby.
         this.publishLimits(course, rec[OFF_COURSE_EXT])
 
@@ -642,6 +681,21 @@ export default class Device extends AABBDevice {
             'options_raw',
             `course=${course} ext=${rec[OFF_COURSE_EXT]} wash=${rec[OFF_WASH]} temp=${rec[OFF_WATER_TEMP]} rinse=${rec[OFF_RINSE]} spin=${rec[OFF_SPIN]} steam=${rec[OFF_STEAM]}`,
         )
+    }
+
+    courseLabel(course: number, ext: number) {
+        if (course === COURSE_EXTENDED) return COURSE_EXT[ext] ?? `#ext${ext}`
+        return COURSE[course] ?? `#${course}`
+    }
+
+    /** Add a course to the select and republish discovery, the once, when it is first seen. */
+    registerCourse(label: string) {
+        if (this.courseOptions.includes(label)) return
+        this.courseOptions.push(label)
+        const course = this.config?.components?.course as { options?: string[] } | undefined
+        if (!course) return
+        course.options = [...this.courseOptions]
+        this.publishConfig()
     }
 
     /**
@@ -777,9 +831,15 @@ export default class Device extends AABBDevice {
         const value = byName[mqttValue]
         if (value !== undefined) return this.setField(key, value)
 
-        if (prop === 'course') {
-            const ext = Object.entries(COURSE_EXT).find(([, name]) => name === mqttValue)
-            if (ext) this.setExtendedCourse(Number(ext[0]))
-        }
+        if (prop !== 'course') return
+
+        const ext = Object.entries(COURSE_EXT).find(([, name]) => name === mqttValue)
+        if (ext) return this.setExtendedCourse(Number(ext[0]))
+
+        // The auto-registered labels for courses we have no name for.
+        const extNumber = /^#ext(\d+)$/.exec(mqttValue)
+        if (extNumber) return this.setExtendedCourse(Number(extNumber[1]))
+        const plain = /^#(\d+)$/.exec(mqttValue)
+        if (plain) this.setField(KEY_COURSE, Number(plain[1]))
     }
 }
