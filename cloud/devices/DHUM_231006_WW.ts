@@ -32,7 +32,7 @@ import HADevice from './base'
  *                   leaves the same pair unmapped.
  *   0x173 = 5641235, 0x174 = 1376511   constant over the whole session, 3-byte counters
  *   0x3b9 = 4, 0x3ec, 0x350, 0x374, 0x2af   constant
- *   0x21c, 0x226, 0x324, 0x33a, 0x2ac, 0x186, 0x3ea   zero throughout
+ *   0x21c, 0x226, 0x324, 0x33a, 0x2ac, 0x3ea   zero throughout
  *   0x360           tracks 0x1f7 exactly in both observed power transitions (1 while on,
  *                   0 while off). Two observations cannot separate "second power flag" from
  *                   "something that merely agreed twice", so it publishes nothing.
@@ -690,12 +690,39 @@ export default class Device extends TLVDevice {
         })
 
         /*
-         * STILL NOT HERE: whether the tank is full or removed. Pulling the tank out of a
-         * running appliance for four minutes produced no state frame at all, no sound and no
-         * panel indication (2026-07-31, dehum-watertank-20260730.jsonl), so there is nothing
-         * to map yet. The next thing to try is a tank filled to its line, which trips the
-         * float switch the appliance does react to.
+         * The water tank, TLV 0x186. 1 while the appliance is complaining about it, 0 when it
+         * is not, and it survives in the comprehensive dump rather than only appearing on the
+         * transition - so it is state, not an event.
+         *
+         * Measured as a matched pair (2026-07-31, dehum-tankfull-20260731.jsonl): a tank
+         * filled to its line went in and 0x186 went 0 -> 1, the appliance said
+         * "물통이 가득 찼거나 빠져있다" and chimed; the dump 50 s later still read 1; the tank
+         * came out, was emptied and went back, and 0x186 went 1 -> 0. Both transitions carry
+         * 0x2b1 = 256 and 0x2b2 with the same 1/0 - an event form of the same fact, which is
+         * why only 0x186 is published.
+         *
+         * NAMED FOR WHAT IT MEASURES, NOT FOR WHAT THE PANEL SAYS. The appliance's own wording
+         * covers "full OR removed", but an EMPTY tank pulled out of a running appliance for
+         * four minutes produced no frame, no sound and no indication at all - measured first,
+         * on a different day. So this reads as "full" in practice, and the class comment for
+         * that earlier session's negative result is kept in patches.md rather than pretended
+         * away here.
          */
+        config.components['tankfull'] = {
+            platform: 'binary_sensor',
+            unique_id: '$deviceid-tankfull',
+            name: 'Water tank full',
+            device_class: 'problem',
+            icon: 'mdi:cup-water',
+        } as ComponentInfo
+
+        this.addField(config, {
+            id: 0x186,
+            name: '',
+            comp: 'tankfull',
+            writable: false,
+            read_xform: (raw) => (raw ? 'ON' : 'OFF'),
+        })
 
         /*
          * The two mode-dependent entities get their own availability topic ON TOP OF the two

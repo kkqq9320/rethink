@@ -146,6 +146,13 @@ const STATE_TANKLIGHT_BRIGHT_100_HEX = '000004000000a702040a036150c80db5'
 const STATE_TIMER_59_HEX = '000004000000a702040a0386d03becf0'
 const STATE_TIMER_359_HEX = '000004000000a70204110a86e001678c90188cd0131f0b'
 
+/*
+ * The water tank, captured as a matched pair on 2026-07-31: a full tank going in, and the
+ * same tank emptied and put back. Both frames carry the 0x2b1/0x2b2 event form alongside.
+ */
+const STATE_TANK_FULL_HEX = '000004000000a70204c70e7f5030cd903d6181ac600100ac81a5ba'
+const STATE_TANK_CLEAR_HEX = '000004000000a70204e0086180ac600100ac80ed93'
+
 /* room humidity 61 %, and the temperature reading 54 (27.0 C under the inherited scale) */
 const STATE_HUMIDITY_61_HEX = '000004000000a702046d03cd903d12ae'
 const STATE_TEMPERATURE_54_HEX = '000004000000a702047b037f5036ecd1'
@@ -308,8 +315,8 @@ describe(MODEL_ID, () => {
             assert.equal(components[name]?.availability_mode, 'all')
         }
 
-        /* the water tank has no tag yet - see the profile. Guard against a silent invention. */
-        assert.ok(!components.watertank, 'no water tank entity until a frame identifies it')
+        assert.equal(components.tankfull?.platform, 'binary_sensor')
+        assert.equal(components.tankfull?.device_class, 'problem')
     })
 
     test('constructor asks for capabilities, and stops once they arrive', (t) => {
@@ -580,6 +587,21 @@ describe(MODEL_ID, () => {
         /* 6 h -> 359 minutes left is still more than 5.75 h */
         thinq.emit('data', buf(STATE_TIMER_359_HEX))
         assert.equal(ha.getProperty(DEVICE_ID, 'offtimer', 'state'), 6)
+    })
+
+    test('the water tank reports full and clears again', (t) => {
+        const { ha, thinq } = readyDevice(t)
+
+        /* the values dump had it clear */
+        assert.equal(ha.getProperty(DEVICE_ID, 'tankfull', 'state'), 'OFF')
+
+        thinq.emit('data', buf(STATE_TANK_FULL_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'tankfull', 'state'), 'ON')
+        /* the same frame carries the room readings, which must not be disturbed by it */
+        assert.equal(ha.getProperty(DEVICE_ID, 'humidifier', 'current_humidity'), 61)
+
+        thinq.emit('data', buf(STATE_TANK_CLEAR_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'tankfull', 'state'), 'OFF')
     })
 
     test('room humidity and temperature publish as measurements', (t) => {
