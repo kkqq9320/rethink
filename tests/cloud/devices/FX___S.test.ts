@@ -307,10 +307,12 @@ describe('FX___S commands', () => {
         assert.equal(thinq.outbox.length, 1)
     })
 
-    test('laundry care reproduces the captured frame', () => {
+    test('laundry care reproduces both captured frames', () => {
         const { thinq, dut } = setup()
-        dut.setProperty('laundry_care', '')
+        dut.setProperty('laundry_care', 'ON')
+        dut.setProperty('laundry_care', 'OFF')
         assert.equal(hex(thinq.outbox[0]), hex(buf('aa0df0e5000201ff015701b2bb')))
+        assert.equal(hex(thinq.outbox[1]), hex(buf('aa0df0e5000201ff015700b3bb')))
     })
 
     test('beep volume covers all five captured steps', () => {

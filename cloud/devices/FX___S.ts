@@ -4,6 +4,7 @@ import { type Connection } from '../homeassistant'
 import { type Metadata } from '../thinq'
 import { allowExtendedType } from '@/util/casting'
 import AABBDevice from './aabb_device'
+import log from '@/util/logging'
 
 // LG front-load washer sold in Korea. Retail model FX25VSR.AKOR2; it reports modelId "FX___S" (sw
 // 2.11.246), which is what we match on - the underscores are LG's family wildcard, the same shape as
@@ -100,6 +101,11 @@ const OFF_WRINKLE_CARE = 35
 const WRINKLE_CARE_ON = 0x80
 const OFF_TURBOSHOT = 33
 const TURBOSHOT_ON = 0x20
+// "Laundry care when the cycle ends". Toggling it from the app moves this bit, so key 0x57 is a setting
+// rather than a one-shot action - pressing it while the appliance sits on Complete simply makes it act
+// on the setting straight away, which is what it looked like the first time it was seen.
+const OFF_LAUNDRY_CARE = 46
+const LAUNDRY_CARE_ON = 0x08
 
 const PHASE_OFF = 0
 const PHASE_STANDBY = 1
@@ -265,6 +271,15 @@ const COURSE_BY_NAME = invert(COURSE)
 export default class Device extends AABBDevice {
     /** Last published remaining minutes, so the finish timestamp is only recomputed when it moves. */
     lastRemaining: number | undefined
+
+    /**
+     * Remote control is the gate for every command, not just some of them: with it switched off the
+     * appliance accepts nothing and says nothing about why. It can only be switched on at the appliance
+     * itself - which is the point of it - so there is no way to fix that from here, and refusing to
+     * send would be worse than sending. All this does is leave a line in the log explaining a command
+     * that appeared to do nothing.
+     */
+    remoteControl = false
 
     constructor(HA: Connection, thinq: Thinq2Device, meta: Metadata) {
         super(HA, thinq)
@@ -511,11 +526,11 @@ export default class Device extends AABBDevice {
                         icon: 'mdi:play-pause',
                     },
                     laundry_care: {
-                        platform: 'button',
+                        platform: 'switch',
                         unique_id: '$deviceid-laundry-care',
+                        state_topic: '$this/laundry_care',
                         command_topic: '$this/laundry_care/set',
-                        payload_press: '',
-                        name: 'Laundry care',
+                        name: 'Laundry care when done',
                         icon: 'mdi:tumble-dryer',
                     },
                 },
@@ -559,12 +574,14 @@ export default class Device extends AABBDevice {
         this.publishProperty('status_code', phase)
         this.publishProperty('running', ACTIVE_PHASES.has(phase) ? 'ON' : 'OFF')
         this.publishProperty('drum_active', flags & FLAG_DRUM_ACTIVE ? 'ON' : 'OFF')
-        this.publishProperty('remote_control', flags & FLAG_REMOTE_CONTROL ? 'ON' : 'OFF')
+        this.remoteControl = (flags & FLAG_REMOTE_CONTROL) !== 0
+        this.publishProperty('remote_control', this.remoteControl ? 'ON' : 'OFF')
         this.publishProperty('child_lock', flags & FLAG_CHILD_LOCK ? 'ON' : 'OFF')
         // device_class 'lock' is inverted by Home Assistant's convention: on means unlocked.
         this.publishProperty('door_lock', rec[OFF_DOOR_LOCK] ? 'OFF' : 'ON')
         this.publishProperty('wrinkle_care', rec[OFF_WRINKLE_CARE] & WRINKLE_CARE_ON ? 'ON' : 'OFF')
         this.publishProperty('turbowash', rec[OFF_TURBOSHOT] & TURBOSHOT_ON ? 'ON' : 'OFF')
+        this.publishProperty('laundry_care', rec[OFF_LAUNDRY_CARE] & LAUNDRY_CARE_ON ? 'ON' : 'OFF')
         this.publishProperty('cycles', rec[OFF_CYCLES])
         this.publishProperty('beep', BEEP[rec[OFF_BEEP]] ?? 'unknown')
         this.publishProperty('steam', rec[OFF_STEAM] & STEAM_ON ? 'ON' : 'OFF')
@@ -671,6 +688,10 @@ export default class Device extends AABBDevice {
     }
 
     setProperty(prop: string, mqttValue: string) {
+        if (!this.remoteControl) {
+            log('status', `${this.id}: ${prop} sent while remote control is off - the appliance will ignore it`)
+        }
+
         switch (prop) {
             case 'power':
                 return this.setField(KEY_POWER, mqttValue === 'ON' ? 1 : 0)
@@ -683,7 +704,7 @@ export default class Device extends AABBDevice {
                 this.setField(KEY_OPERATION, OP_RESUME)
                 return this.trigger()
             case 'laundry_care':
-                return this.setField(KEY_LAUNDRY_CARE, 1)
+                return this.setField(KEY_LAUNDRY_CARE, mqttValue === 'ON' ? 1 : 0)
             case 'turbowash':
                 return this.setField(KEY_TURBOWASH, mqttValue === 'ON' ? 1 : 0)
             case 'steam':
