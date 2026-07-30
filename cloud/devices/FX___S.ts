@@ -720,9 +720,12 @@ export default class Device extends AABBDevice {
         this.publishProperty('rinse_remaining', rec[OFF_RINSE])
 
         // The course byte is not consumed - it survives the cycle, the finished state and even powering
-        // off - so it is always worth publishing, except when it reads 0.
+        // off - so it is always worth publishing, except when the byte identifying it reads 0. For an
+        // extended course that is the second byte; no record has ever been seen taking the escape with a
+        // zero identifier, but the same reasoning applies and the alternative is publishing "#ext0".
         const course = rec[OFF_COURSE]
-        if (course !== COURSE_NONE) {
+        const identifier = course === COURSE_EXTENDED ? rec[OFF_COURSE_EXT] : course
+        if (identifier !== COURSE_NONE) {
             const label = this.courseLabel(course, rec[OFF_COURSE_EXT])
             this.registerCourse(label)
             this.publishProperty('course', label)

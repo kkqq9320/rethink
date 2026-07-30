@@ -1,0 +1,94 @@
+// Replay a capture file through a real device handler and print everything it would have published.
+//
+// LOCAL TOOL — not for upstream.
+//
+// Why it exists: unit tests only cover the cases a fixture happens to contain. Feeding a whole capture
+// through the handler covers every frame the appliance actually sent, and it caught a defect the FX___S
+// tests had missed - twelve records carrying a zero course byte, which were being registered as a
+// selectable "#0" course. Worth running after writing or changing any device profile.
+//
+// It also answers the question that matters before reading any new frame family: "frames sent" must stay
+// at 0 for a read-only replay. A handler that answers the appliance shows up here as a non-zero count.
+//
+// Usage:
+//   tsx tools/replay-capture.ts <capture.jsonl> [more.jsonl ...]
+//
+// The model is taken from the capture's own `status: online` line (the capture tool records the metadata
+// there), so no argument is needed. Handlers have to be listed below - this is deliberately explicit
+// rather than resolved out of ha_bridge, which does not export its registry.
+
+import * as fs from 'node:fs'
+import { setFilter } from '@/util/logging'
+import { MockHAConnection, MockThinq2Device } from '@/tests/helpers/mocks'
+import type { Metadata } from '@/cloud/thinq'
+import FX___S from '@/cloud/devices/FX___S'
+import PAC_910604_WW from '@/cloud/devices/PAC_910604_WW'
+import RAC_056905_WW from '@/cloud/devices/RAC_056905_WW'
+
+// Importing the test mocks silences device logging as a side effect; a replay is exactly when those
+// lines are wanted, so put them back.
+setFilter(() => true)
+
+const HANDLERS: Record<string, new (HA: never, thinq: never, meta: Metadata) => object> = {
+    FX___S,
+    PAC_910604_WW,
+    RAC_056905_WW,
+} as unknown as Record<string, new (HA: never, thinq: never, meta: Metadata) => object>
+
+const ID = 'replay'
+
+type Line = { t?: string; status?: string; meta?: Metadata; rx?: string; tx?: string }
+
+function replay(file: string) {
+    const lines: Line[] = fs
+        .readFileSync(file, 'utf8')
+        .split('\n')
+        .filter((l) => l.trim())
+        .map((l) => JSON.parse(l) as Line)
+
+    const meta = lines.find((l) => l.meta)?.meta
+    if (!meta) return console.log(`${file}: no metadata line - cannot tell which handler to use`)
+    const Handler = HANDLERS[meta.modelId]
+    if (!Handler) return console.log(`${file}: no handler listed for ${meta.modelId} (add it to this file)`)
+
+    const HA = new MockHAConnection()
+    const thinq = new MockThinq2Device(ID, meta)
+    let republishes = 0
+    const publishConfig = HA.publishConfig.bind(HA)
+    HA.publishConfig = (id, config) => {
+        republishes++
+        publishConfig(id, config)
+    }
+    new Handler(HA.asConnection() as never, thinq as never, meta)
+    // The constructor's own discovery publish is not a republish.
+    republishes = 0
+
+    let frames = 0
+    for (const line of lines) {
+        if (!line.rx) continue
+        frames++
+        thinq.emit('data', Buffer.from(line.rx, 'hex'))
+    }
+
+    const device = HA.devices[ID]
+    console.log(`\n=== ${file}`)
+    console.log(`    model ${meta.modelId} sw ${meta.swVersion} | ${frames} frames replayed`)
+    console.log(
+        `    frames the handler sent: ${thinq.outbox.length}${thinq.outbox.length ? ' <-- NOT a read-only replay' : ''}`,
+    )
+    thinq.outbox.forEach((b) => console.log(`      tx ${b.toString('hex')}`))
+    console.log(`    discovery republished: ${republishes}`)
+
+    for (const [name, component] of Object.entries(device.config?.components ?? {})) {
+        const options = (component as { options?: string[] }).options
+        if (options) console.log(`    ${name} options: ${options.join(' | ')}`)
+    }
+    console.log('    final published state:')
+    for (const [prop, value] of Object.entries(device.properties).sort()) {
+        console.log(`      ${prop.padEnd(24)} ${value}`)
+    }
+}
+
+const files = process.argv.slice(2)
+if (!files.length) console.log('usage: tsx tools/replay-capture.ts <capture.jsonl> [more.jsonl ...]')
+for (const file of files) replay(file)

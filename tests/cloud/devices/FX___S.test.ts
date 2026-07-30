@@ -559,4 +559,20 @@ describe('FX___S zero course byte', () => {
         // The rest of the record is still read: this frame really does say the appliance is off.
         assert.equal(get(HA, 'power'), 'OFF')
     })
+
+    test('an extended course with a zero identifier is not offered either', () => {
+        const { HA, thinq, dut } = setup()
+        feed(thinq, STANDBY)
+        const before = [...courseOptions(HA)]
+        // Synthesised, and never seen on the wire: a record taking the 0xFF escape with a zero
+        // identifier. It is here because it would have published "#ext0" for exactly the reason a zero
+        // course byte published "#0" - offsets 4 and 22 are the same field in two forms.
+        const rec = Buffer.alloc(66)
+        rec[20] = 1 // standby
+        rec[4] = 0xff // extended escape
+        rec[22] = 0 // ...with no identifier behind it
+        dut.processRecord(rec)
+        assert.deepEqual(courseOptions(HA), before)
+        assert.equal(get(HA, 'course'), 'AI Wash')
+    })
 })
