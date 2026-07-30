@@ -217,9 +217,12 @@ describe(MODEL_ID, () => {
 
         for (const name of ['fanspeed', 'airflow', 'autodry']) {
             assert.equal(components[name]?.platform, 'select', `${name} select`)
-            /* everyday controls, so no entity_category at all - HA files them under Controls */
-            assert.ok(!components[name]?.entity_category, `${name} is a control`)
         }
+        /* everyday controls, so no entity_category at all - HA files them under Controls */
+        assert.ok(!components.fanspeed?.entity_category, 'fan speed is a control')
+        assert.ok(!components.airflow?.entity_category, 'airflow is a control')
+        /* auto-dry sits under Diagnostic, at the owner's request */
+        assert.equal(components.autodry?.entity_category, 'diagnostic')
         assert.deepEqual(components.fanspeed.options, ['low', 'medium', 'high', 'turbo', 'auto'])
         assert.deepEqual(components.airflow.options, ['space', 'multi', 'focus', 'swing'])
         assert.deepEqual(components.autodry.options, ['off', '10 min', '30 min', '60 min', 'smart'])
@@ -235,9 +238,35 @@ describe(MODEL_ID, () => {
         assert.ok(!components.humidity?.entity_category, 'humidity is not diagnostic')
         assert.equal(components.humidity?.state_topic, components.humidifier.current_humidity_topic)
 
-        for (const name of ['autodry_remaining', 'error', 'temperature', 'humidity_display']) {
+        for (const name of ['autodry_remaining', 'error', 'humidity_display']) {
             assert.equal(components[name]?.platform, 'sensor', `${name} sensor`)
             assert.equal(components[name]?.entity_category, 'diagnostic', `${name} is diagnostic`)
+        }
+
+        /* a room reading, so it belongs beside the humidity under "Sensors" */
+        assert.equal(components.temperature?.platform, 'sensor')
+        assert.equal(components.temperature?.device_class, 'temperature')
+        assert.ok(!components.temperature?.entity_category, 'temperature is not diagnostic')
+
+        /* "is auto-dry running", derived from the remaining minutes */
+        assert.equal(components.autodry_running?.platform, 'binary_sensor')
+        assert.equal(components.autodry_running?.device_class, 'running')
+
+        /*
+         * The two mode-dependent entities carry their own availability topic PLUS both
+         * device-wide ones - a component's list replaces the device's rather than extending it.
+         */
+        for (const name of ['fanspeed', 'airflow']) {
+            assert.deepEqual(
+                components[name]?.availability,
+                [
+                    { topic: '$this/availability' },
+                    { topic: '$rethink/availability' },
+                    { topic: `$this/${name}-availability` },
+                ],
+                `${name} availability`,
+            )
+            assert.equal(components[name]?.availability_mode, 'all')
         }
 
         /* the water tank has no tag yet - see the profile. Guard against a silent invention. */
@@ -329,6 +358,57 @@ describe(MODEL_ID, () => {
             /* every mode change carries the fan the appliance remembers for that mode */
             assert.equal(ha.getProperty(DEVICE_ID, 'fanspeed', 'state'), fan, `${mode} fan`)
         }
+    })
+
+    test('auto-dry running is derived from the remaining minutes', (t) => {
+        const { ha, thinq } = readyDevice(t)
+
+        /* the values dump had 36 minutes left, so it is running - while the appliance reads OFF */
+        assert.equal(ha.devices[DEVICE_ID].properties['autodry_running'], 'ON')
+        assert.equal(ha.getProperty(DEVICE_ID, 'humidifier', 'state'), 'OFF')
+
+        /* switching on ends the run: the same frame carries 0x225 = 0 */
+        thinq.emit('data', buf(STATE_POWER_ON_HEX))
+        assert.equal(ha.devices[DEVICE_ID].properties['autodry_running'], 'OFF')
+
+        /* switching off with auto-dry armed starts it again, 50 minutes */
+        thinq.emit('data', buf(STATE_POWER_OFF_HEX))
+        assert.equal(ha.devices[DEVICE_ID].properties['autodry_running'], 'ON')
+        assert.equal(ha.getProperty(DEVICE_ID, 'autodry_remaining', 'state'), 50)
+    })
+
+    test('the fan controls go unavailable in the mode that drives the fan itself', (t) => {
+        const { ha, thinq } = readyDevice(t)
+        const availability = (name: string) => ha.devices[DEVICE_ID].properties[`${name}-availability`]
+
+        /* the values dump had mode 86 - both selectable */
+        assert.equal(availability('fanspeed'), 'online')
+        assert.equal(availability('airflow'), 'online')
+
+        /* 집중건조 (0x1f9 = 20): the app offers neither, so HA greys both out */
+        thinq.emit('data', buf(STATE_MODE_FOCUSED_DRY_HEX))
+        assert.equal(availability('fanspeed'), 'offline')
+        assert.equal(availability('airflow'), 'offline')
+
+        /* and back */
+        thinq.emit('data', buf(STATE_MODE_SMART_PLUS_HEX))
+        assert.equal(availability('fanspeed'), 'online')
+        assert.equal(availability('airflow'), 'online')
+
+        /* the mode itself still publishes normally through the same callback */
+        assert.equal(ha.getProperty(DEVICE_ID, 'humidifier', 'mode_state'), 'smart plus')
+    })
+
+    test('availability is published before the appliance has said anything', (t) => {
+        enableMockTimers(t)
+        const { ha } = makeDevice()
+
+        /*
+         * An MQTT entity whose availability topic has never been published reads as
+         * unavailable, so the constructor must not wait for the first mode frame.
+         */
+        assert.equal(ha.devices[DEVICE_ID].properties['fanspeed-availability'], 'online')
+        assert.equal(ha.devices[DEVICE_ID].properties['airflow-availability'], 'online')
     })
 
     test('an unlisted raw value publishes nothing', (t) => {

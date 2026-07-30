@@ -138,6 +138,22 @@ const AUTO_DRY: Array<[number, string]> = [
 const HUMIDITY_DISPLAY = ['while running', 'always']
 
 /*
+ * 집중건조 (focused dry, 0x1f9 = 20) drives the fan itself: while it is selected the app
+ * offers neither a fan speed nor an airflow aim (owner, 2026-07-31). The appliance still
+ * REPORTS both - selecting the mode was captured carrying 0x1fa = 6 with it - so this cannot
+ * be read off the frames; it is what the owner can reach in the app, which is the same
+ * distinction that settled PAC_910604_WW's fan mask ("a value the handler writes is not proof
+ * of a capability; check whether the user can select it").
+ *
+ * Both entities are published with their own availability topic and go unavailable in HA
+ * while this mode is on, which is what the app does. RAC_056905_WW's mode-dependent switches
+ * instead accept the click and bounce the value back; greying out says the same thing before
+ * the user clicks rather than after.
+ */
+const MODE_DRIVES_FAN_ITSELF = 20
+const MODE_DEPENDENT_ENTITIES = ['fanspeed', 'airflow']
+
+/*
  * Target humidity limits, from the capability reply: 0x2e5 = 30 and 0x2e6 = 70. This is the
  * same shape as the AC profiles' 0x2e1 / 0x2e2 setpoint range, where the declared range
  * matched the remote exactly, so the appliance's own word is taken here too.
@@ -222,6 +238,11 @@ export default class Device extends TLVDevice {
             name: 'mode',
             comp: 'humidifier',
             ...mapXforms(MODES),
+            read_callback: (val) => {
+                /* the fan controls follow the mode - see MODE_DRIVES_FAN_ITSELF */
+                this.updateModeAvailability()
+                return true
+            },
         })
 
         /*
@@ -277,8 +298,13 @@ export default class Device extends TLVDevice {
             entityCategory: undefined,
         })
 
+        /*
+         * Filed under Diagnostic at the owner's request (2026-07-31). It is a setting, so
+         * 'config' would be the conventional category; 'diagnostic' is what was asked for and
+         * the only thing it changes is which box of the HA device page it sits in.
+         */
         this.addMappedSelectField(config, 0x20e, 'autodry', 'Auto dry', 'mdi:hair-dryer', AUTO_DRY, {
-            entityCategory: undefined,
+            entityCategory: 'diagnostic',
         })
 
         this.addSwitchField(config, 0x2a2, 'uvnano', 'UVnano', 'mdi:bacteria')
@@ -321,11 +347,48 @@ export default class Device extends TLVDevice {
          * (50, 49, ... 35 observed live). PAC_910604_WW publishes the same tag as its AI-dry
          * remaining, also in minutes.
          */
-        this.addSensorField(config, 0x225, 'autodry_remaining', 'Auto dry remaining', 'mdi:timer-sand', {
-            device_class: 'duration',
-            unit_of_measurement: 'min',
-            state_class: 'measurement',
-        })
+        this.addSensorField(
+            config,
+            0x225,
+            'autodry_remaining',
+            'Auto dry remaining',
+            'mdi:timer-sand',
+            {
+                device_class: 'duration',
+                unit_of_measurement: 'min',
+                state_class: 'measurement',
+            },
+            undefined,
+            (val) => {
+                this.publishAutoDryRunning(Number(val))
+                return true
+            },
+        )
+
+        /*
+         * "Is auto-dry running right now?", derived from the remaining minutes rather than
+         * from a flag of its own, because no flag was found: 0x20e is the SETTING (off / 10 /
+         * 30 / 60 min / smart), not a run state, and it reads 253 whether the appliance is
+         * drying or not.
+         *
+         * 0x225 > 0 is the whole signal, and every observation agrees with it: it was 0
+         * throughout normal running, appeared as 50 in the very state frame that carried the
+         * power-off which started the run, then counted down 50, 49, ... 0. RAC_056905_WW
+         * publishes 0x20e as its auto-dry binary sensor, which would be wrong here - on this
+         * appliance that tag never returns to 0 on its own.
+         *
+         * Note this is normally ON while the appliance reads OFF: auto-dry is what the machine
+         * does AFTER it is switched off.
+         */
+        config.components['autodry_running'] = {
+            platform: 'binary_sensor',
+            unique_id: '$deviceid-autodry_running',
+            name: 'Auto dry running',
+            icon: 'mdi:hair-dryer',
+            device_class: 'running',
+            state_topic: '$this/autodry_running',
+            entity_category: 'diagnostic',
+        } as ComponentInfo
 
         /* Error code, 0 throughout - as in RAC_056905_WW / PAC_910604_WW. */
         this.addSensorField(config, 0x221, 'error', 'Error code', 'mdi:alert')
@@ -338,9 +401,10 @@ export default class Device extends TLVDevice {
          * 56, 54, 52, 50 over half an hour, which is 28.0, 27.0, 26.0, 25.0 C under the
          * inherited scale, and the owner judged 27-28 C plausible for the room at the time.
          *
-         * Published as a diagnostic sensor for that reason: it is a real reading, it is
-         * almost certainly the room temperature, and nothing in this profile depends on it.
-         * One reading against a room thermometer would settle it.
+         * Published without an entity_category at the owner's request (2026-07-31), so HA
+         * files it under "Sensors" with the humidity rather than under "Diagnostic": it is a
+         * room reading, whatever remains unsettled about its scale. Nothing in this profile
+         * depends on it, and one reading against a room thermometer would settle that.
          */
         this.addSensorField(
             config,
@@ -353,6 +417,8 @@ export default class Device extends TLVDevice {
                 unit_of_measurement: '°C',
                 state_class: 'measurement',
                 suggested_display_precision: 1,
+                /* a room measurement, not diagnostics - override addSensorField's default */
+                entity_category: undefined,
             },
             (raw) => raw / 2,
         )
@@ -387,7 +453,49 @@ export default class Device extends TLVDevice {
          * running and it will be one frame.
          */
 
+        /*
+         * The two mode-dependent entities get their own availability topic ON TOP OF the two
+         * device-wide ones. A component's `availability` REPLACES the device-level list rather
+         * than adding to it, so both device topics have to be repeated here or these two would
+         * stop following the device's own online/offline.
+         */
+        for (const name of MODE_DEPENDENT_ENTITIES) {
+            const comp = config.components[name] as unknown as Record<string, unknown>
+            comp.availability = [
+                { topic: '$this/availability' },
+                { topic: '$rethink/availability' },
+                { topic: `$this/${name}-availability` },
+            ]
+            comp.availability_mode = 'all'
+        }
+
         this.setConfig(config)
+
+        /*
+         * Publish the initial availability AFTER setConfig, and unconditionally: an MQTT
+         * entity whose availability topic has never been published reads as unavailable, so
+         * staying silent until the first mode frame would grey both entities out on every
+         * connect. No mode is known yet at this point, which updateModeAvailability() treats
+         * as available - the honest default, since the appliance has not said otherwise.
+         */
+        this.updateModeAvailability()
+    }
+
+    /*
+     * Grey out the fan controls in the modes that do not offer them - see
+     * MODE_DRIVES_FAN_ITSELF. Called from the mode field's read callback and once at startup.
+     */
+    updateModeAvailability() {
+        const mode = this.raw_clip_state[0x1f9]
+        const state = mode === MODE_DRIVES_FAN_ITSELF ? 'offline' : 'online'
+        for (const name of MODE_DEPENDENT_ENTITIES) {
+            this.HA.publishProperty(this.id, `${name}-availability`, state)
+        }
+    }
+
+    /* "Auto-dry is running", derived from the remaining minutes - see the binary sensor. */
+    publishAutoDryRunning(remainingMinutes: number) {
+        this.HA.publishProperty(this.id, 'autodry_running', remainingMinutes > 0 ? 'ON' : 'OFF')
     }
 
     /*
@@ -588,6 +696,8 @@ export default class Device extends TLVDevice {
         icon?: string,
         extra?: Record<string, unknown>,
         read_xform?: FieldDefinition['read_xform'],
+        /* must return true, or this sensor stops publishing - see FieldDefinition */
+        read_callback?: FieldDefinition['read_callback'],
     ) {
         config['components'][name] = {
             icon: icon ?? undefined,
@@ -604,6 +714,7 @@ export default class Device extends TLVDevice {
             comp: name,
             writable: false,
             read_xform: read_xform,
+            read_callback: read_callback,
         })
     }
 }
