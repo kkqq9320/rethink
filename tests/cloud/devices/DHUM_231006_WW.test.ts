@@ -127,6 +127,12 @@ const STATE_HUMIDITY_DISPLAY_ALWAYS_HEX = '000004000000a70204bf02cdc16d70'
 const APP_PRIV_WRITE_HUMIDITY_DISPLAY_RUNNING_HEX = '01020400000065fd0100050c00000000b161'
 const APP_PRIV_WRITE_HUMIDITY_DISPLAY_ALWAYS_HEX = '01020400000065fd0100050c00000001a140'
 
+/*
+ * 자동건조 중단, captured from the app on 2026-07-31: a write of the remaining-minutes tag
+ * to zero, after which the appliance reported 0x225: 29 -> 0.
+ */
+const APP_WRITE_AUTODRY_CANCEL_HEX = '010104000000650201000289403d4f'
+
 /* 물통 조명: 켬 / 끔 (0x21e), 색상 0x3e0 = 1 마린블루 .. 7 마젠타핑크, 밝기 0x185 */
 const STATE_TANKLIGHT_ON_HEX = '000004000000a70204f70287812cec'
 const STATE_TANKLIGHT_OFF_HEX = '000004000000a702040c028780bd9f'
@@ -400,6 +406,50 @@ describe(MODEL_ID, () => {
         thinq.emit('data', buf(STATE_POWER_OFF_HEX))
         assert.equal(ha.devices[DEVICE_ID].properties['autodry_running'], 'ON')
         assert.equal(ha.getProperty(DEVICE_ID, 'autodry_remaining', 'state'), 50)
+    })
+
+    test('the mode that locks the controls also refuses a target humidity write', (t) => {
+        const { ha, thinq } = readyDevice(t)
+
+        /* the values dump left the appliance at 55 % */
+        assert.equal(ha.getProperty(DEVICE_ID, 'humidifier', 'target_humidity_state'), 55)
+
+        thinq.emit('data', buf(STATE_MODE_FOCUSED_DRY_HEX))
+        thinq.resetRecorder()
+        ha.setProperty(DEVICE_ID, 'humidifier', 'target_humidity_command', '45')
+
+        /* the appliance would ACK it and do nothing, so nothing is sent... */
+        assert.equal(thinq.outbox.length, 0, 'no frame sent in the locked mode')
+        /* ...and HA is told again what the appliance actually holds */
+        assert.equal(ha.getProperty(DEVICE_ID, 'humidifier', 'target_humidity_state'), 55)
+
+        /* in any other mode it goes through */
+        thinq.emit('data', buf(STATE_MODE_SMART_PLUS_HEX))
+        ha.setProperty(DEVICE_ID, 'humidifier', 'target_humidity_command', '45')
+        assert.deepEqual(lastSentTLV(thinq), [{ t: 0x253, l: 1, v: 45 }])
+    })
+
+    test('the auto-dry cancel button sends the frame the app sends', (t) => {
+        const { ha, thinq } = readyDevice(t)
+        const components = ha.devices[DEVICE_ID].config!.components as Record<string, Record<string, unknown>>
+
+        assert.equal(components.autodry_cancel?.platform, 'button')
+
+        ha.emit('setProperty', DEVICE_ID, 'autodry_cancel', 'PRESS')
+        /*
+         * Compared as TLV, not as bytes: the app's own frame (APP_WRITE_AUTODRY_CANCEL_HEX)
+         * carries byte7 = 0 and everything rethink sends carries byte7 = 1, which is the
+         * sequence byte every profile in this repo already differs on.
+         */
+        assert.deepEqual(lastSentTLV(thinq), [{ t: 0x225, l: 0, v: 0 }])
+        assert.deepEqual(
+            TLV.parse(buf(APP_WRITE_AUTODRY_CANCEL_HEX).subarray(11, 13)),
+            lastSentTLV(thinq),
+            'same TLV as the app sent',
+        )
+
+        /* the setting itself is untouched: only the run stops */
+        assert.equal(ha.getProperty(DEVICE_ID, 'autodry', 'state'), 'smart')
     })
 
     test('the fan controls go unavailable in the mode that drives the fan itself', (t) => {

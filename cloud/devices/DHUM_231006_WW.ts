@@ -201,19 +201,27 @@ const TANK_LIGHT_BRIGHTNESS_OFFSET = 100
 const TANK_LIGHT_BRIGHTNESS_STEP = 20
 
 /*
- * 집중건조 (focused dry, 0x1f9 = 20) drives the fan itself: while it is selected the app
- * offers neither a fan speed nor an airflow aim (owner, 2026-07-31). The appliance still
- * REPORTS both - selecting the mode was captured carrying 0x1fa = 6 with it - so this cannot
- * be read off the frames; it is what the owner can reach in the app, which is the same
- * distinction that settled PAC_910604_WW's fan mask ("a value the handler writes is not proof
- * of a capability; check whether the user can select it").
+ * 집중건조 (focused dry, 0x1f9 = 20) runs the appliance its own way: while it is selected the
+ * app offers no fan speed, no airflow aim and no target humidity (owner, 2026-07-31).
  *
- * Both entities are published with their own availability topic and go unavailable in HA
- * while this mode is on, which is what the app does. RAC_056905_WW's mode-dependent switches
- * instead accept the click and bounce the value back; greying out says the same thing before
- * the user clicks rather than after.
+ * THE APPLIANCE AGREES, and that is measured rather than inferred. A fan write injected while
+ * this mode was on (0x1fa = 2) was ACKed and then ignored - no echo, and a values query 20 s
+ * later still read 6. In the same window an HA-originated 0x253 = 45 met exactly the same
+ * fate, and the owner confirms the app will not let them move it either. So on this appliance
+ * an ACK is not acceptance; the ECHO is. (Mode 22 behaves the same way - see above.)
+ *
+ * The airflow aim is the one of the three never tested with a write. It is treated like the
+ * other two because the app hides it in the same mode, which is the same "what can the user
+ * select" standard that settled PAC_910604_WW's fan mask.
+ *
+ * Fan and airflow are separate entities, so they publish their own availability topic and go
+ * unavailable in HA while this mode is on - the app's own greying-out, before the click
+ * rather than after. Target humidity cannot: it is an attribute of the humidifier entity, and
+ * making that unavailable would take power and mode with it. It refuses the write instead and
+ * republishes the appliance's value, which is how RAC_056905_WW's mode-dependent switches
+ * behave.
  */
-const MODE_DRIVES_FAN_ITSELF = 20
+const MODE_LOCKS_CONTROLS = 20
 const MODE_DEPENDENT_ENTITIES = ['fanspeed', 'airflow']
 
 /*
@@ -311,7 +319,7 @@ export default class Device extends TLVDevice {
             comp: 'humidifier',
             ...mapXforms(MODES),
             read_callback: (val) => {
-                /* the fan controls follow the mode - see MODE_DRIVES_FAN_ITSELF */
+                /* the fan controls follow the mode - see MODE_LOCKS_CONTROLS */
                 this.updateModeAvailability()
                 return true
             },
@@ -328,6 +336,16 @@ export default class Device extends TLVDevice {
             /* TLVDevice.setProperty() drops a write whose field has no write_xform, so even a
              * pass-through needs one; MQTT hands the value over as a string. */
             write_xform: (val) => Number(val),
+            write_callback: () => {
+                if (this.raw_clip_state[0x1f9] !== MODE_LOCKS_CONTROLS) return true
+                /*
+                 * The appliance would ACK this and do nothing - measured. Republish what it
+                 * actually holds so HA's slider snaps back instead of showing a value that
+                 * never took.
+                 */
+                this.processKeyValue(0x253, this.raw_clip_state[0x253])
+                return false
+            },
         })
 
         /*
@@ -461,6 +479,41 @@ export default class Device extends TLVDevice {
             state_topic: '$this/autodry_running',
             entity_category: 'diagnostic',
         } as ComponentInfo
+
+        /*
+         * Stopping a run in progress is a write of 0x225 = 0 - the remaining-minutes tag set
+         * to zero. Captured from the app on 2026-07-31: the write, an ACK, and then the
+         * appliance's own 0x225: 29 -> 0. PAC_910604_WW cancels its AI dry with the identical
+         * command, arrived at from its own capture.
+         *
+         * A BUTTON, not a switch, because there is no way to start a cycle on demand: the
+         * appliance begins one by itself when it is switched off with 0x20e set, and the owner
+         * confirms the app offers no restart. A switch would have an ON that goes nowhere.
+         * The auto-dry SETTING (0x20e) is untouched by this - it is the standing preference
+         * for the next power-off, and only the run stops.
+         *
+         * Registered straight into fields_by_ha because addField() would take fields_by_id
+         * [0x225] away from the remaining-minutes sensor. The callback sends the frame and
+         * returns false so nothing stamps a 0 into the local state - the appliance's own
+         * reply is what moves the sensor.
+         */
+        config.components['autodry_cancel'] = {
+            platform: 'button',
+            unique_id: '$deviceid-autodry_cancel',
+            command_topic: '$this/autodry_cancel/set',
+            name: 'Stop auto dry',
+            icon: 'mdi:hair-dryer-outline',
+            entity_category: 'diagnostic',
+        } as ComponentInfo
+        this.fields_by_ha['autodry_cancel'] = {
+            name: '',
+            comp: '',
+            write_xform: (val) => (val === 'PRESS' ? 0 : null),
+            write_callback: () => {
+                this.send([1, 1, 2, 1, 1], [{ t: 0x225, v: 0 }])
+                return false
+            },
+        }
 
         /* Error code, 0 throughout - as in RAC_056905_WW / PAC_910604_WW. */
         this.addSensorField(config, 0x221, 'error', 'Error code', 'mdi:alert')
@@ -635,11 +688,11 @@ export default class Device extends TLVDevice {
 
     /*
      * Grey out the fan controls in the modes that do not offer them - see
-     * MODE_DRIVES_FAN_ITSELF. Called from the mode field's read callback and once at startup.
+     * MODE_LOCKS_CONTROLS. Called from the mode field's read callback and once at startup.
      */
     updateModeAvailability() {
         const mode = this.raw_clip_state[0x1f9]
-        const state = mode === MODE_DRIVES_FAN_ITSELF ? 'offline' : 'online'
+        const state = mode === MODE_LOCKS_CONTROLS ? 'offline' : 'online'
         for (const name of MODE_DEPENDENT_ENTITIES) {
             this.HA.publishProperty(this.id, `${name}-availability`, state)
         }
