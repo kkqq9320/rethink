@@ -56,6 +56,13 @@ const SETTINGS_REPLY_POWER_OFF = buf(
     'aa5020e6000201ff01020000030300062e00000000000000000100000003002e000105000000000f0300000000200000000000340000000000000400000000000000000000000000000018000000acbb',
 )
 
+// Sent once immediately after the appliance reconnects: a single record with no previous one ahead of
+// it. Captured at 08:24:44 - the exact moment rethink was restarted to deploy this handler - while a
+// Rinse + Spin was in its spin stage.
+const RECONNECT_SNAPSHOT = buf(
+    'aaff200a0055008e8e000100eb00430000000004370000000000000000020019001e00370e0c1105000000100400000000000000900100340000000000000400000000000000000000000000000018000000ac12bb',
+)
+
 function setup() {
     const HA = new MockHAConnection()
     const thinq = new MockThinq2Device(DEVICE_ID, META)
@@ -138,6 +145,11 @@ describe('FX___S washer', () => {
         assert.equal(get(HA, 'status'), 'Complete')
         assert.equal(get(HA, 'status_code'), 42)
         assert.equal(get(HA, 'remaining_time'), 0)
+        // The 0x10 flag is still set here, so deriving `running` from it reported a finished wash as
+        // running - seen on the appliance after the first deploy.
+        assert.equal(get(HA, 'running'), 'OFF')
+        // ...and the course must still come through, since that byte is never consumed.
+        assert.equal(get(HA, 'course'), 'AI Wash')
     })
 
     test('decodes a different course, proving the phase codes are not course-specific', () => {
@@ -163,8 +175,10 @@ describe('FX___S washer', () => {
         // counter reset to Home Assistant's statistics).
         assert.equal(get(HA, 'cycles'), 16)
         assert.equal(get(HA, 'beep'), 'Very high')
-        // The cleared option bytes must not be written back over the selects.
-        assert.equal(get(HA, 'course'), 'AI Wash')
+        // The course byte survives being powered off, and this record was captured after a Rinse + Spin
+        // had been selected, so it correctly overrides the AI Wash published from the standby frame.
+        assert.equal(get(HA, 'course'), 'Rinse + Spin')
+        // The consumable option bytes were cleared though, and must not be written back over the select.
         assert.equal(get(HA, 'wash'), 'Normal')
     })
 
@@ -184,6 +198,21 @@ describe('FX___S washer', () => {
         feed(thinq, POWERED_OFF)
         assert.equal(get(HA, 'spin'), 'High')
         assert.ok(String(get(HA, 'options_raw') ?? '').startsWith('course=114'))
+    })
+
+    test('picks up the single-record snapshot sent on reconnect', () => {
+        const { HA, thinq } = setup()
+        feed(thinq, RECONNECT_SNAPSHOT)
+
+        // Without this the entities stay unknown from a restart until the appliance next changes state.
+        assert.equal(get(HA, 'status'), 'Spinning')
+        assert.equal(get(HA, 'status_code'), 14)
+        assert.equal(get(HA, 'running'), 'ON')
+        assert.equal(get(HA, 'course'), 'Rinse + Spin')
+        assert.equal(get(HA, 'remaining_time'), 2)
+        assert.equal(get(HA, 'total_time'), 25)
+        assert.equal(get(HA, 'cycles'), 16)
+        assert.equal(get(HA, 'beep'), 'Very high')
     })
 
     test('ignores frames that are not from the appliance', () => {

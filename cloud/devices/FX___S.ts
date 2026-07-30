@@ -5,7 +5,11 @@ import { type Metadata } from '../thinq'
 import { allowExtendedType } from '@/util/casting'
 import AABBDevice from './aabb_device'
 
-// LG front-load washer sold in Korea, self-reports modelId "FX___S" (sw 2.11.246).
+// LG front-load washer sold in Korea. Retail model FX25VSR.AKOR2; it reports modelId "FX___S" (sw
+// 2.11.246), which is what we match on - the underscores are LG's family wildcard, the same shape as
+// F_V8_Y___W.B_2QEUK and 2REF11EIDA__4, so sibling FX models may report the same id. Whether their
+// frame layout is identical has not been checked, and the diagnostic sensors below exist partly so a
+// mismatch shows up as an unnamed value rather than as silently wrong state.
 //
 // This model does NOT share a layout with any of the existing washer handlers: F3L2CYU__/T1789EFH_F
 // discriminate on buf[1]==0xEC with 25/27-byte records, the EU F_V*/Y_V* handlers parse a flat 80/53-byte
@@ -43,6 +47,10 @@ const FROM_DEVICE = 0x20
 const MSG_TUNNEL = 0x0a
 const MSG_SETTINGS_REPLY = 0xe6
 const INNER_STATE = 0xec
+// The same record without a preceding "previous" one, sent once immediately after the appliance
+// (re)connects - there is no prior state to diff against yet. Without it a restart leaves every entity
+// unknown until the appliance next changes state, which on an idle washer can be a very long time.
+const INNER_STATE_SINGLE = 0xeb
 
 const RECORD_LEN = 66
 // data = <record> <1 byte separator> <record>; the current state is the second one.
@@ -70,7 +78,11 @@ const OFF_CYCLES = 27
 const OFF_BEEP = 28
 const OFF_FLAGS = 36
 
-const FLAG_CYCLE_ACTIVE = 0x10 // set from start until the cycle ends
+// Bit 0x10 of the flags byte is set from the moment a cycle starts and stays set at PHASE_DONE, only
+// clearing at power off - it means "a cycle is loaded", not "a cycle is running". Deriving either the
+// running sensor or the option guard from it was a mistake caught on the appliance: it left "Running"
+// on for a finished wash and the selects unpublished for as long as the washer sat on Complete. The
+// phase is the authority for both; only the drum bit is read out of this byte.
 // Set only while the drum is actually turning. It clears on pause, but it ALSO clears and re-sets on its
 // own mid-cycle (measured twice, with no command in between and the remaining time still counting down),
 // so it must not be used to mean "paused" - that is PHASE_PAUSED and nothing else.
@@ -104,6 +116,10 @@ const STATUS_OPTIONS = [...new Set(Object.values(STATUS))].concat('Unknown')
 // 1 minute rather than reaching 0, and Laundry care leaves the previous cycle's values untouched - both
 // would otherwise show a permanent "1 minute left" in Home Assistant.
 const TIMED_PHASES = new Set([3, 37, 11, 40, 12, 14, PHASE_PAUSED])
+
+// Phases in which the appliance is actually working. Paused is deliberately excluded - `status` already
+// says Paused, and a "Running" sensor that stays on through a pause is no use in an automation.
+const ACTIVE_PHASES = new Set([3, 37, 11, 40, 12, 14, PHASE_CARE])
 
 // ---------------------------------------------------------------------------------------------------
 // Settings keys, all confirmed by single-variable writes made from the LG app.
@@ -366,10 +382,14 @@ export default class Device extends AABBDevice {
         const payload = extended ? buf.subarray(4) : buf.subarray(2)
 
         if (type === MSG_TUNNEL) {
-            if (payload.length < 10 || payload[6] !== INNER_STATE) return
+            if (payload.length < 10) return
             const data = payload.subarray(10)
-            if (data.length < CURRENT_RECORD_OFFSET + RECORD_LEN) return
-            this.processRecord(data.subarray(CURRENT_RECORD_OFFSET, CURRENT_RECORD_OFFSET + RECORD_LEN))
+            // 0xEC stacks the previous record ahead of the current one; 0xEB carries the current one
+            // alone. Same 66-byte layout either way.
+            const offset =
+                payload[6] === INNER_STATE ? CURRENT_RECORD_OFFSET : payload[6] === INNER_STATE_SINGLE ? 0 : -1
+            if (offset < 0 || data.length < offset + RECORD_LEN) return
+            this.processRecord(data.subarray(offset, offset + RECORD_LEN))
         } else if (type === MSG_SETTINGS_REPLY) {
             // 00 02 01 FF <n> [<key> <status>]*n 00 <record>
             if (payload.length < 5) return
@@ -386,7 +406,7 @@ export default class Device extends AABBDevice {
         this.publishProperty('power', phase === PHASE_OFF ? 'OFF' : 'ON')
         this.publishProperty('status', STATUS[phase] ?? 'Unknown')
         this.publishProperty('status_code', phase)
-        this.publishProperty('running', flags & FLAG_CYCLE_ACTIVE ? 'ON' : 'OFF')
+        this.publishProperty('running', ACTIVE_PHASES.has(phase) ? 'ON' : 'OFF')
         this.publishProperty('drum_active', flags & FLAG_DRUM_ACTIVE ? 'ON' : 'OFF')
         this.publishProperty('cycles', rec[OFF_CYCLES])
         this.publishProperty('beep', BEEP[rec[OFF_BEEP]] ?? 'Unknown')
@@ -399,14 +419,18 @@ export default class Device extends AABBDevice {
         this.publishProperty('total_time', phase === PHASE_OFF ? 0 : rec[OFF_TOTAL_H] * 60 + rec[OFF_TOTAL_M])
         this.publishProperty('rinse_remaining', rec[OFF_RINSE])
 
-        // Powering off zeroes the phase, the clock and the wash/water-temperature/rinse bytes (the
-        // course, spin, cycle count and beep volume all survive), and during a cycle the option bytes
-        // are being consumed rather than reporting the selection. In both cases republishing them would
-        // overwrite the selects with meaningless values; Home Assistant keeps the last value published.
-        if (phase === PHASE_OFF || flags & FLAG_CYCLE_ACTIVE) return
-
+        // The course byte is not consumed - it survives the cycle, the finished state and even powering
+        // off - so it is always worth publishing.
         const course = rec[OFF_COURSE]
         this.publishOption('course', course === COURSE_EXTENDED ? COURSE_EXT[rec[OFF_COURSE_EXT]] : COURSE[course])
+
+        // The rest are consumed as the appliance works through them and read 0 from the first stage
+        // onwards, so they only report the selection while it sits at standby. Anywhere else,
+        // republishing would overwrite the selects with meaningless values; Home Assistant keeps the
+        // last value published. Gating this on the 0x10 flag instead was wrong - it stays set after a
+        // cycle finishes, so the selects went unpublished for as long as the washer sat on Complete.
+        if (phase !== PHASE_STANDBY) return
+
         this.publishOption('wash', WASH[rec[OFF_WASH]])
         this.publishOption('water_temp', WATER_TEMP[rec[OFF_WATER_TEMP]])
         this.publishOption('rinse', RINSE.includes(rec[OFF_RINSE]) ? String(rec[OFF_RINSE]) : undefined)
