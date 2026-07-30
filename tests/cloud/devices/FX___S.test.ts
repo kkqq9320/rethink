@@ -422,3 +422,141 @@ describe('FX___S commands', () => {
         assert.equal(thinq.outbox.length, 0)
     })
 })
+
+// The appliance declaring its own dial. A real frame, byte-identical in all 234 occurrences across the
+// captures: ten (kind, id) pairs in dial order, with kind 0x00 on the two that need the 0xFF escape.
+const COURSE_TABLE = buf('aa1e204d0302160a0272025e022e00f500f60255021b02870237028652bb')
+
+// The same message type carrying the two extended courses' default settings, and a five-byte variant.
+// Both are real frames and both must be ignored here - only the 0x03 table is the dial.
+const EXT_DEFAULTS = buf(
+    'aa30204d0202160200f52e01071e03200321061f00350143003e0100f65401071e03200421081f00350143003e0132bb',
+)
+const SHORT_VARIANT = buf('aa0b204d010301020379bb')
+
+// The order the appliance declares, which is the order of the dial itself.
+const DIAL = [
+    'AI Wash',
+    'Wool / Delicates',
+    'Normal',
+    'Normal 1',
+    'Towels 1',
+    'Tub Clean',
+    'Bedding',
+    'Quick Steam Sanitize',
+    'Rinse + Spin',
+    'Quick Tub Rinse',
+]
+
+const courseOptions = (HA: MockHAConnection) =>
+    (HA.devices[DEVICE_ID].config!.components.course as { options?: string[] }).options!
+
+describe('FX___S course table', () => {
+    test('the declared dial matches the one swept by hand, in the same order', () => {
+        const { HA, thinq } = setup()
+        feed(thinq, COURSE_TABLE)
+        assert.deepEqual(courseOptions(HA), DIAL)
+    })
+
+    test('the two extended courses are the ones the appliance marks with kind 0x00', () => {
+        const { HA, thinq, dut } = setup()
+        feed(thinq, COURSE_TABLE)
+        // Selecting one has to take the escape path, which is what kind 0x00 is being read as.
+        feed(thinq, TOWELS_1_IDLE)
+        thinq.resetRecorder()
+        dut.setProperty('course', 'Normal 1')
+        // key 0x0A = 0xFF (escape) followed by key 0x0B = 0xF5, the real identifier. The byte-for-byte
+        // comparison against the app's own extended-course frame is the Towels 1 test above.
+        assert.ok(hex(thinq.outbox[0]).includes('0AFF0BF5'))
+        assert.ok(courseOptions(HA).includes('Normal 1'))
+    })
+
+    test('a declared course nobody has named is offered under its number, and none are withdrawn', () => {
+        const { HA, thinq } = setup()
+        // Synthesised, not captured: a hypothetical sibling model declaring one course we have a name
+        // for and two we do not. Only the framing is real - incoming checksums are not verified.
+        feed(thinq, buf('aa10204d03021603022e029900aa00bb'))
+        assert.deepEqual(courseOptions(HA), [
+            'Normal',
+            '#153',
+            '#ext170',
+            // Everything already offered keeps its place behind the declaration.
+            'Bedding',
+            'Rinse + Spin',
+            'Tub Clean',
+            'Wool / Delicates',
+            'AI Wash',
+            'Quick Tub Rinse',
+            'Quick Steam Sanitize',
+            'Normal 1',
+            'Towels 1',
+        ])
+    })
+
+    test('an unnamed declared course can actually be selected', () => {
+        const { thinq, dut } = setup()
+        feed(thinq, buf('aa10204d03021603022e029900aa00bb'))
+        dut.setProperty('course', '#153')
+        // Ordinary one-pair course write, 0x99 = 153. The trailing 0x67 is the documented checksum,
+        // (sum & 0xff) ^ 0x55 over the frame with the checksum byte still zero.
+        assert.equal(hex(thinq.outbox[0]), hex(buf('aa0df0e5000201ff010a9967bb')))
+    })
+
+    test('the other two variants of the message leave the select alone', () => {
+        const { HA, thinq } = setup()
+        const before = [...courseOptions(HA)]
+        feed(thinq, EXT_DEFAULTS)
+        feed(thinq, SHORT_VARIANT)
+        assert.deepEqual(courseOptions(HA), before)
+    })
+
+    test('a count that disagrees with the frame length is ignored', () => {
+        const { HA, thinq } = setup()
+        const before = [...courseOptions(HA)]
+        // Claims ten pairs and carries two. Reading it anyway would put garbage in the select.
+        feed(thinq, buf('aa10204d0302160a022e029900aa00bb'))
+        assert.deepEqual(courseOptions(HA), before)
+    })
+
+    test('discovery is republished once however often the declaration repeats', () => {
+        const { HA, thinq } = setup()
+        let publishes = 0
+        const original = HA.publishConfig.bind(HA)
+        HA.publishConfig = (id, config) => {
+            publishes++
+            original(id, config)
+        }
+        // The appliance sends it every 1.5 s for about half a minute at a time.
+        for (let i = 0; i < 20; i++) feed(thinq, COURSE_TABLE)
+        assert.equal(publishes, 1)
+        assert.deepEqual(courseOptions(HA), DIAL)
+    })
+})
+
+// The stale reconnect snapshot from 12:32:02 - a real frame, and the one that made this test necessary.
+// The appliance is off and reports course 0, which is not a dial position: it used to be registered as a
+// selectable "#0". Also the frame patches.md cites for 0xEB carrying an out-of-date power state.
+const ZERO_COURSE_SNAPSHOT = buf(
+    'aaff200a005500a0a7000100eb004300000000000000000000000000000000000000000000010000000000100400000000000000000000300000000000000400000000000000000000000000000018000000c467bb',
+)
+
+describe('FX___S zero course byte', () => {
+    test('a course byte of 0 is not offered as a course', () => {
+        const { HA, thinq } = setup()
+        const before = [...courseOptions(HA)]
+        feed(thinq, ZERO_COURSE_SNAPSHOT)
+        assert.deepEqual(courseOptions(HA), before)
+        assert.ok(!courseOptions(HA).includes('#0'))
+    })
+
+    test('it leaves the last real course standing rather than overwriting it', () => {
+        const { HA, thinq } = setup()
+        feed(thinq, STANDBY)
+        assert.equal(get(HA, 'course'), 'AI Wash')
+        feed(thinq, ZERO_COURSE_SNAPSHOT)
+        assert.equal(get(HA, 'course'), 'AI Wash')
+        assert.equal(get(HA, 'current_course'), 'AI Wash')
+        // The rest of the record is still read: this frame really does say the appliance is off.
+        assert.equal(get(HA, 'power'), 'OFF')
+    })
+})

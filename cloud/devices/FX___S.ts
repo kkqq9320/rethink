@@ -27,6 +27,9 @@ import log from '@/util/logging'
 //   extended:  20 <type> <len16> <payload...>          len16 == buf.length + 4
 //
 // Message types seen from the appliance: 0x0A (tunnel, see below), 0xE6 (reply to a settings write),
+// 0x4D (the appliance declaring its own course table, see processCourseTable), 0xD8 (one byte that
+// follows the power state, sent unprompted - not used: it leads the state record by 16 s in one
+// measured transition and trails it by 31 s in another, so it buys nothing reliably), and
 // 0xC3/0x00/0x19/0x72/0x7F (short acks and handshake bytes, not decoded).
 //
 // TUNNEL (0x0A). payload = 00 <id16> 00 01 <flag> <inner> <innerlen16> 00 <data>
@@ -51,6 +54,27 @@ const INNER_STATE = 0xec
 // (re)connects - there is no prior state to diff against yet. Without it a restart leaves every entity
 // unknown until the appliance next changes state, which on an idle washer can be a very long time.
 const INNER_STATE_SINGLE = 0xeb
+
+// The appliance's own declaration of what sits on its dial. It arrives unprompted, which had to be
+// established before reading it: washer-poweron-test.jsonl contains three outgoing frames in total, all
+// of them settings writes from here - no query of ours, and none of the LG cloud's course-browsing
+// traffic either - yet 167 of these arrived across its five connections. One burst elsewhere does
+// follow the app browsing courses, which makes it look like a reply; the zero-outgoing captures are
+// what settle it. Even if a query would also produce it, there is no reason to send one.
+const MSG_COURSE_TABLE = 0x4d
+// Three variants share this message type and the first byte tells them apart. 0x03 is the dial;
+// 0x02 carries the two extended courses' default settings (decoded - it is where the record's
+// base-course byte was confirmed - but deliberately unused, see setExtendedCourse); 0x01 is a
+// five-byte frame that has not been decoded.
+const TABLE_COURSE_LIST = 0x03
+// Bytes 1 and 2 read 02 16 on both four-byte-header variants and nothing explains them, so they are
+// required exactly as observed. A frame that differs there may be some other table, and reading one of
+// those as the dial would invent courses.
+const TABLE_HEADER = [0x02, 0x16]
+// Marks the entries reached through the 0xFF escape. It partitions the ten declared courses exactly as
+// the escape requirement does: the two 0x00 entries are Normal 1 and Towels 1, the two that were found
+// by hand to need it.
+const TABLE_KIND_EXTENDED = 0x00
 
 const RECORD_LEN = 66
 // data = <record> <1 byte separator> <record>; the current state is the second one.
@@ -160,6 +184,12 @@ const OP_PAUSE = 0x02
 const OP_RESUME = 0x03
 
 const COURSE_EXTENDED = 0xff
+// Not a dial position. Twelve captured records carry 0 here and every one of them has the appliance
+// powered off, while most powered-off records keep reporting the real course - so this is the appliance
+// reporting nothing, not a course, and the dial it declares for itself contains no course 0. Treating it
+// as one put a selectable "#0" in the course select. Found by replaying the captures through the handler;
+// the unit tests had not caught it because no fixture happened to carry a zero course.
+const COURSE_NONE = 0
 
 // ---------------------------------------------------------------------------------------------------
 // Which controls a course actually lets you touch, and with which values.
@@ -207,6 +237,10 @@ const COURSE_LIMITS: Record<string, CourseLimits> = {
 //
 // A course that is not listed here leaves the select untouched and shows up in `current_course` as its
 // raw number, so a dial position that has not been swept is visible rather than silently missing.
+//
+// This is a table of NAMES, not of what exists. Which courses exist, in which order, and which need the
+// escape is something the appliance declares for itself (processCourseTable); the declaration cannot
+// supply names, because it only carries numbers.
 const COURSE: Record<number, string> = {
     0x72: 'AI Wash', // 인공지능세탁, 36 min
     0x5e: 'Wool / Delicates', // 울/섬세, 53 min
@@ -218,9 +252,11 @@ const COURSE: Record<number, string> = {
     0x86: 'Quick Tub Rinse', // 급속통헹굼, 12 min
 }
 
-// Reached through the 0xFF escape, with the real identifier in the second key. These two are read-only:
-// selecting one needs a write carrying both keys at once, and the only capture of that shape also
-// carried all eight option keys, so the two-key form on its own has never been seen on the wire.
+// Reached through the 0xFF escape, with the real identifier in the second key. Selecting one needs a
+// write carrying both keys at once; the only capture of that shape also carried all eight option keys,
+// so that is the form `setExtendedCourse` reproduces rather than a guessed two-key frame - the two-key
+// form on its own has never been seen on the wire. (These were briefly treated as read-only, on the
+// grounds that no such write had been captured. It had been: the app selecting Towels 1.)
 const COURSE_EXT: Record<number, string> = {
     0xf5: 'Normal 1', // 표준1, 68 min
     0xf6: 'Towels 1', // 타월1, 82 min
@@ -273,11 +309,14 @@ export default class Device extends AABBDevice {
     lastRemaining: number | undefined
 
     /**
-     * Remote control is the gate for every command, not just some of them: with it switched off the
-     * appliance accepts nothing and says nothing about why. It can only be switched on at the appliance
-     * itself - which is the point of it - so there is no way to fix that from here, and refusing to
-     * send would be worse than sending. All this does is leave a line in the log explaining a command
-     * that appeared to do nothing.
+     * Remote control gates STARTING the machine, not writing settings to it. Settings writes are
+     * accepted with it switched off - a hundred and six of them applied that way across the captures,
+     * which is the whole course and option sweep - and the owner confirms the app's "send to washer"
+     * works without it, after which start has to be pressed on the appliance.
+     *
+     * It can only be switched on at the appliance itself, which is the point of it, so there is no way
+     * to fix that from here and refusing to send would be worse than sending. All this does is leave a
+     * line in the log for the two commands it really does block.
      */
     remoteControl = false
 
@@ -285,10 +324,11 @@ export default class Device extends AABBDevice {
     lastRecord: Buffer | undefined
 
     /**
-     * Courses the select currently offers. Ten were named by sweeping the dial, but a dial position
-     * that was missed - or a course on a sibling model reporting the same modelId - would otherwise be
-     * unselectable forever. An unrecognised one is added here under its number and the discovery config
-     * is republished, so it becomes selectable without waiting for the table to be updated.
+     * Courses the select currently offers. Seeded from the named table, then grown from two sources:
+     * the appliance's own declaration of its dial (processCourseTable), and any course seen in a state
+     * record. Either way an unrecognised one is added under its number, so a dial position that was
+     * never swept - or a sibling model's extra course - is selectable without waiting for the table to
+     * be updated.
      *
      * Nothing is ever removed. A course that has been seen once stays on the list: dropping it would
      * break any automation referring to it, and courses do not disappear from a dial.
@@ -447,10 +487,9 @@ export default class Device extends AABBDevice {
                         command_topic: '$this/course/set',
                         name: 'Course',
                         icon: 'mdi:playlist-check',
-                        // Extended courses are readable but cannot be written back (selecting one needs
-                        // key 0x0B and no such write has been captured), so they are listed to keep the
-                        // state valid; picking one is a no-op until that write is observed.
-                        options: [...Object.values(COURSE), ...Object.values(COURSE_EXT)],
+                        // Grows as the appliance declares its dial or reports a course we have no name
+                        // for; see courseOptions. Republished by setCourseOptions when it does.
+                        options: [...this.courseOptions],
                     },
                     wash: {
                         platform: 'select',
@@ -593,7 +632,50 @@ export default class Device extends AABBDevice {
             const start = 5 + payload[4] * 2 + 1
             if (payload.length < start + RECORD_LEN) return
             this.processRecord(payload.subarray(start, start + RECORD_LEN))
+        } else if (type === MSG_COURSE_TABLE) {
+            this.processCourseTable(payload)
         }
+    }
+
+    /**
+     * The appliance declares its own dial: every course on it, in dial order, each marked as needing the
+     * 0xFF escape or not. All ten it declares matched the ten found by sweeping the dial by hand, in the
+     * same order, and the two it marks are exactly the two that need the escape - so the hand-built
+     * table and the appliance's own account of itself agree completely.
+     *
+     * What this contributes is EXISTENCE, which the handler previously only had by hardcoding it. It can
+     * only grow the list, never replace it, because the declaration is late (26-109 s after the
+     * appliance connects) and in four measured connection windows it never arrived at all. So the named
+     * table still seeds the select and this improves on it when it turns up.
+     *
+     * Names are not in here - the appliance sends numbers - so an undeclared name stays offered and an
+     * unnamed declaration is offered under its number.
+     */
+    processCourseTable(payload: Buffer) {
+        if (payload.length < 4 || payload[0] !== TABLE_COURSE_LIST) return
+        if (payload[1] !== TABLE_HEADER[0] || payload[2] !== TABLE_HEADER[1]) return
+        const count = payload[3]
+        // The declared count and the frame length must agree exactly. This is the only real guard: a
+        // sibling model laying the table out differently has to fall through to the named table rather
+        // than have whatever it sent read as course numbers.
+        if (payload.length !== 4 + count * 2) return
+
+        const declared: string[] = []
+        for (let i = 0; i < count; i++) {
+            const kind = payload[4 + i * 2]
+            const id = payload[5 + i * 2]
+            // Named through the same path as a course read from a state record, so one course cannot end
+            // up under two different labels depending on which frame it arrived in.
+            declared.push(this.courseLabel(kind === TABLE_KIND_EXTENDED ? COURSE_EXTENDED : id, id))
+        }
+
+        // Declared order is dial order, which is the more useful one to offer. Anything already on the
+        // list that was not declared keeps its place after it rather than being dropped.
+        const merged = [...declared, ...this.courseOptions.filter((course) => !declared.includes(course))]
+        if (merged.length === this.courseOptions.length && merged.every((c, i) => c === this.courseOptions[i])) return
+
+        log('status', `${this.id}: the appliance declares ${count} courses: ${declared.join(', ')}`)
+        this.setCourseOptions(merged)
     }
 
     processRecord(rec: Buffer) {
@@ -638,14 +720,16 @@ export default class Device extends AABBDevice {
         this.publishProperty('rinse_remaining', rec[OFF_RINSE])
 
         // The course byte is not consumed - it survives the cycle, the finished state and even powering
-        // off - so it is always worth publishing.
+        // off - so it is always worth publishing, except when it reads 0.
         const course = rec[OFF_COURSE]
-        const label = this.courseLabel(course, rec[OFF_COURSE_EXT])
-        this.registerCourse(label)
-        this.publishProperty('course', label)
-        this.publishProperty('current_course', label)
-        // Depends only on which course is selected, so it is published in every phase, not just standby.
-        this.publishLimits(course, rec[OFF_COURSE_EXT])
+        if (course !== COURSE_NONE) {
+            const label = this.courseLabel(course, rec[OFF_COURSE_EXT])
+            this.registerCourse(label)
+            this.publishProperty('course', label)
+            this.publishProperty('current_course', label)
+            // Depends only on which course is selected, so it is published in every phase, not just standby.
+            this.publishLimits(course, rec[OFF_COURSE_EXT])
+        }
 
         // The rest are consumed as the appliance works through them and read 0 from the first stage
         // onwards, so they only report the selection while it sits at standby. Anywhere else,
@@ -678,10 +762,18 @@ export default class Device extends AABBDevice {
     /** Add a course to the select and republish discovery, the once, when it is first seen. */
     registerCourse(label: string) {
         if (this.courseOptions.includes(label)) return
-        this.courseOptions.push(label)
+        this.setCourseOptions([...this.courseOptions, label])
+    }
+
+    /**
+     * Put a new option list on the course select and republish discovery. Callers only ever grow the
+     * list: withdrawing an option would break any automation naming it, and courses do not leave a dial.
+     */
+    setCourseOptions(options: string[]) {
+        this.courseOptions = options
         const course = this.config?.components?.course as { options?: string[] } | undefined
         if (!course) return
-        course.options = [...this.courseOptions]
+        course.options = [...options]
         this.publishConfig()
     }
 
