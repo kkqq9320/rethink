@@ -69,6 +69,12 @@ const REMOTE_CONTROL_ON = buf(
     'aaff200a00980094f8000100ec008600030302067200000000000000002400240032007201001b0000000210040000000020000010000034000000000000040000000000000000000000000000001800000000030302067200000000000000002400240032007201001b000000021004000000002000001001003400000000000004000000000000000000000000000000180000009852bb',
 )
 
+// Towels 1 selected and idle, with the options the app had at the moment it sent the extended-course
+// write that this fixture is paired with in the test below.
+const TOWELS_1_IDLE = buf(
+    'aaff200a00980085b0000100ec008600030502045500000000000000007c007c0006005501000a000000020f04000000000000000000003400000000000004000000000000000000000000000000180000000003000408ff0000000000000000520052000700540100f6000000040f04000000002010000000003400000000000004000000000000000000000000000000180000000cc4bb',
+)
+
 function setup() {
     const HA = new MockHAConnection()
     const thinq = new MockThinq2Device(DEVICE_ID, META)
@@ -305,6 +311,24 @@ describe('FX___S commands', () => {
         const { thinq, dut } = setup()
         dut.setProperty('pause', '')
         assert.equal(thinq.outbox.length, 1)
+    })
+
+    test('selecting an extended course rebuilds the frame the app itself sent', () => {
+        const { thinq, dut } = setup()
+        feed(thinq, TOWELS_1_IDLE)
+        thinq.resetRecorder()
+        dut.setProperty('course', 'Towels 1')
+
+        // Byte for byte the frame the LG app sent when it selected this course - the escape value needs
+        // the real identifier and all eight option keys alongside it, and this is the only shape of that
+        // write ever captured, so it is reproduced rather than guessed at.
+        assert.equal(hex(thinq.outbox[0]), hex(buf('aa20f0e5000201ff0a0aff0bf61e03200421081f0035013e0143007f00002cbb')))
+    })
+
+    test('an extended course does nothing until a record has been seen', () => {
+        const { thinq, dut } = setup()
+        dut.setProperty('course', 'Towels 1')
+        assert.equal(thinq.outbox.length, 0)
     })
 
     test('laundry care reproduces both captured frames', () => {

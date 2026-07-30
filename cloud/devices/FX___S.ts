@@ -281,6 +281,9 @@ export default class Device extends AABBDevice {
      */
     remoteControl = false
 
+    /** Last state record seen, so an extended-course write can carry the options along with it. */
+    lastRecord: Buffer | undefined
+
     constructor(HA: Connection, thinq: Thinq2Device, meta: Metadata) {
         super(HA, thinq)
         this.setConfig(
@@ -566,6 +569,7 @@ export default class Device extends AABBDevice {
     }
 
     processRecord(rec: Buffer) {
+        this.lastRecord = rec
         const phase = rec[OFF_PHASE]
         const flags = rec[OFF_FLAGS]
 
@@ -681,6 +685,50 @@ export default class Device extends AABBDevice {
         this.send(Buffer.from([0xf0, 0xe5, 0x00, 0x02, 0x01, 0xff, 0x01, key, value]))
     }
 
+    /**
+     * Extended courses cannot be selected with the course key alone - the escape value needs the real
+     * identifier alongside it, in one frame. The only capture of that shape is the app selecting Towels
+     * 1, and it carried all eight option keys as well, so that is what is reproduced here rather than a
+     * guessed two-pair frame. The options come from the last record, which is what the app was sending
+     * too: its own idea of the current selection.
+     */
+    setExtendedCourse(id: number) {
+        const rec = this.lastRecord
+        if (!rec) return
+        this.send(
+            Buffer.from([
+                0xf0,
+                0xe5,
+                0x00,
+                0x02,
+                0x01,
+                0xff,
+                0x0a,
+                KEY_COURSE,
+                COURSE_EXTENDED,
+                KEY_COURSE_EXT,
+                id,
+                KEY_WASH,
+                rec[OFF_WASH],
+                KEY_RINSE,
+                rec[OFF_RINSE],
+                KEY_SPIN,
+                rec[OFF_SPIN],
+                KEY_WATER_TEMP,
+                rec[OFF_WATER_TEMP],
+                KEY_TURBOWASH,
+                rec[OFF_TURBOSHOT] & TURBOSHOT_ON ? 1 : 0,
+                KEY_STEAM,
+                rec[OFF_STEAM] & STEAM_ON ? 1 : 0,
+                0x43,
+                0x00,
+                0x7f,
+                0x00,
+                0x00,
+            ]),
+        )
+    }
+
     // Sent by the app immediately after an operation write, but only when the drum is actually about to
     // turn - a pause never carries it.
     trigger() {
@@ -727,8 +775,11 @@ export default class Device extends AABBDevice {
         if (!select) return
         const [key, byName] = select
         const value = byName[mqttValue]
-        // Selecting an extended course needs a second key (0x0B) and none has been captured being
-        // written, so those are read-only for now.
-        if (value !== undefined) this.setField(key, value)
+        if (value !== undefined) return this.setField(key, value)
+
+        if (prop === 'course') {
+            const ext = Object.entries(COURSE_EXT).find(([, name]) => name === mqttValue)
+            if (ext) this.setExtendedCourse(Number(ext[0]))
+        }
     }
 }
