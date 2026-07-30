@@ -551,6 +551,23 @@ export default class Device extends AABBDevice {
         )
     }
 
+    /**
+     * Switching the appliance off at the panel makes it drop its connection, so rethink drops the
+     * device and every entity would go unavailable - which reads as "the washer has fallen off the
+     * network" when it has simply been switched off, and hides the perfectly good state we already
+     * hold. If the last thing it told us was that it was off, keep that on screen instead.
+     *
+     * The cost is deliberate: a washer that is switched off and then loses power or Wi-Fi keeps
+     * reading "off" rather than going unavailable, because from here the two are indistinguishable.
+     * A drop from any other state is still an unexpected one and is reported. rethink's own LWT
+     * (`$rethink/availability`, combined with `availability_mode: 'all'`) still takes every entity
+     * unavailable if the server itself goes away, so this only suppresses the per-device signal.
+     */
+    override drop() {
+        if (this.lastRecord?.[OFF_PHASE] === PHASE_OFF) return
+        super.drop()
+    }
+
     processAABB(buf: Buffer) {
         if (buf[0] !== FROM_DEVICE || buf.length < 4) return
 

@@ -305,6 +305,24 @@ describe('FX___S washer', () => {
         assert.equal(hex(thinq.outbox[0]), hex(buf('aa0df0e5000201ff010a63a9bb')))
     })
 
+    test('stays available when the appliance drops after being switched off', () => {
+        const { HA, thinq, dut } = setup()
+        feed(thinq, POWERED_OFF)
+        dut.drop() // what the bridge calls when the appliance disconnects
+
+        // Switching it off at the panel drops the connection; going unavailable would throw away a
+        // state we know is correct and read as a network fault.
+        assert.equal(HA.devices[DEVICE_ID].availability, 'online')
+        assert.equal(get(HA, 'status'), 'off')
+    })
+
+    test('goes unavailable when it drops from any other state', () => {
+        const { HA, thinq, dut } = setup()
+        feed(thinq, STANDBY)
+        dut.drop()
+        assert.equal(HA.devices[DEVICE_ID].availability, 'offline')
+    })
+
     test('ignores frames that are not from the appliance', () => {
         const { HA, thinq } = setup()
         feed(thinq, buf('aa09f0241001018cbb')) // our own start command echoed back
