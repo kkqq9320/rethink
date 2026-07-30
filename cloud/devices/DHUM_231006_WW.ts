@@ -1,0 +1,622 @@
+import TLVDevice, { FieldDefinition } from './tlv_device'
+import { Device as Thinq2Device } from '../thinq2/device'
+import { ComponentInfo, DeviceDiscovery, type Connection } from '../homeassistant'
+import { type Metadata } from '../thinq'
+import { allowExtendedType } from '@/util/casting'
+import * as TLV from '@/util/tlv'
+import HADevice from './base'
+
+/**
+ * LG dehumidifier
+ * ThinQ model DHUM_231006_WW (swVersion 1663, deviceType 403, platform thinq2)
+ *
+ * First deviceType 403 profile in the project. Everything below was measured on one live
+ * appliance: its owner drove it from the LG ThinQ app, one setting at a time, naming each
+ * action, while the frames were recorded through rethink's management /device socket. The
+ * appliance confirms every write with a state frame carrying the same tag ~0.5 s later, so
+ * each label rests on a matched (write, echo, human name) triple rather than on a guess.
+ *
+ * QUIRK, same as PAC_910604_WW: state frames are marked 0xa7 at buf[6], not 0x87, so the
+ * base class' processData() would drop all of them. processData() below widens the marker
+ * test and delegates the rest, following PAC_910604_WW / POT_056905_WW.
+ *
+ * The capability reply (queryCaps(), TLV 0x1f5 = 1) and the values dump (query(),
+ * TLV 0x1f5 = 2) were both obtained from the live appliance before this profile existed, by
+ * injecting the exact frames TLVDevice sends. That matters: isCapsResponse() and
+ * isValuesResponse() below are the two predicates whose failure mode is a silent 15-second
+ * retry loop against the appliance forever, and both are measured here, not assumed.
+ *
+ * DELIBERATELY NOT MAPPED - all of these are seen in the frames and none has a label:
+ *   0x232 / 0x233   move together, seen 861/1, 0/12, 0/24, 0/28, 24/19. PAC_910604_WW
+ *                   leaves the same pair unmapped.
+ *   0x173 = 5641235, 0x174 = 1376511   constant over the whole session, 3-byte counters
+ *   0x185 = 120, 0x3b9 = 4, 0x3ec, 0x350, 0x374, 0x2af   constant
+ *   0x21c, 0x226, 0x324, 0x21e, 0x33a, 0x2ac, 0x186, 0x3e0, 0x3ea   zero throughout
+ *   0x360           tracks 0x1f7 exactly in both observed power transitions (1 while on,
+ *                   0 while off). Two observations cannot separate "second power flag" from
+ *                   "something that merely agreed twice", so it publishes nothing.
+ *   0x3eb           the app writes 0x3eb = 0 about a second after each power-off, twice out
+ *                   of two. Unnamed, and this profile never sends it.
+ *   mode 22         the appliance's own (0x2d7, 0x2d8, 0x2d9) triple table in state frames
+ *                   lists a fifth mode value, 22, that the app does not offer. Writing
+ *                   0x1f9 = 22 to the live appliance was ACKed and its remembered fan was
+ *                   applied, but the appliance never reported 0x1f9 = 22 back, and the
+ *                   capability reply's mode list does not contain it (see MODES below).
+ *                   Not exposed: unnamed, unselectable, and unconfirmed as a mode.
+ *   the 0xa8 family (97 bytes, buf[7] = 0x66/0x67) and the 190-byte 0x87/0xfd/0x03 frames
+ *                   share this appliance's envelope but their payloads are NOT TLV - parsing
+ *                   them as TLV yields nonsense (tag 0x0 repeated, values of 16777215).
+ *                   processData() below does not accept them.
+ */
+
+/* HA's MQTT humidifier: on/off + target humidity + a mode list. */
+type HumidifierComponent = ComponentInfo & {
+    platform: 'humidifier'
+    device_class?: 'humidifier' | 'dehumidifier'
+    min_humidity?: number
+    max_humidity?: number
+    modes?: string[]
+}
+type DehumDiscovery = DeviceDiscovery & { components: { humidifier: HumidifierComponent } }
+
+/*
+ * Operating modes, TLV 0x1f9. Non-contiguous, so this is a value map and not an offset into
+ * a list. Each pairing is one app selection and the appliance's own echo of it:
+ *
+ *   86  0x56  스마트플러스   'smart plus'    the mode the appliance was found in
+ *   19  0x13  저소음제습     'quiet'         low-noise dehumidify
+ *   85  0x55  쾌속의류       'fast laundry'  fast clothes drying
+ *   20  0x14  집중건조       'focused dry'
+ *
+ * The capability reply lists exactly these four as 0x2d7 entries (86, 19, 85, 20) - the
+ * appliance's own declaration, agreeing with what the owner can select in the app.
+ *
+ * NOTE for anyone tempted to read the mode list out of 0x2c1 the way the AC profiles do:
+ * it cannot work here. This appliance's caps reply carries 0x2c1 = 0x180000, i.e. bits 19
+ * and 20 - modes 19 and 20 only. Modes 85 and 86 do not fit in a 32-bit mask over wire
+ * values, so on this model the 0x2d7 list is the complete one and the bitmask is not.
+ */
+const MODES: Array<[number, string]> = [
+    [86, 'smart plus'],
+    [19, 'quiet'],
+    [85, 'fast laundry'],
+    [20, 'focused dry'],
+]
+
+/*
+ * Fan speed, TLV 0x1fa. Swept 약 -> 중 -> 강 -> 터보 -> 약 -> 강 -> 자동 and every step
+ * echoed; the sweep returning to values it had already visited is what makes it
+ * self-checking. 3 and 5 were never offered by the app and are absent here.
+ *
+ * Independently confirmed by the appliance: the capability reply's 0x2c2 = 0x751d4 has bits
+ * 2, 4, 6, 7 and 8 set - exactly these five values - which is the same "selectable fan
+ * levels" mask the AC profiles use. (The mask's high bits 12, 14, 16, 17, 18 are unexplained
+ * here as they are there.)
+ */
+const FAN_SPEEDS: Array<[number, string]> = [
+    [2, 'low'],
+    [4, 'medium'],
+    [6, 'high'],
+    [7, 'turbo'],
+    [8, 'auto'],
+]
+
+/*
+ * Airflow aim, TLV 0x189. Contiguous 0..3, swept in app order 공간 / 다용도 / 포커스 /
+ * 상하회전 with all four echoed.
+ *
+ * DO NOT port this tag from the AC profiles. RAC_056905_WW reads 0x189 as the indoor-unit
+ * thermo-on flag; on this appliance it is a four-way airflow selector that the app writes.
+ * Two things say so: the four writes and their four echoes above, and the fact that a mode
+ * change carries a new 0x189 with it (selecting 쾌속의류 brought 0x189 = 3, 스마트플러스
+ * brought 0x189 = 1) - a per-mode remembered aim, which a run flag would not have.
+ */
+const AIRFLOW = ['space', 'multi', 'focus', 'swing']
+
+/*
+ * Auto-dry of the appliance's own interior, TLV 0x20e. Non-contiguous, and 253 is not a
+ * duration but the appliance's "smart" setting:
+ *
+ *     0  사용 안함    'off'
+ *     2  10분         '10 min'
+ *     3  30분         '30 min'
+ *     4  60분         '60 min'
+ *   253  스마트 건조  'smart'
+ *
+ * 1 was never offered by the app and is deliberately absent: an unlisted raw value reads
+ * back as undefined and is discarded rather than shown as a wrong duration.
+ */
+const AUTO_DRY: Array<[number, string]> = [
+    [0, 'off'],
+    [2, '10 min'],
+    [3, '30 min'],
+    [4, '60 min'],
+    [253, 'smart'],
+]
+
+/* Panel humidity display, TLV 0x337. Read-only, see the sensor's comment. */
+const HUMIDITY_DISPLAY = ['while running', 'always']
+
+/*
+ * Target humidity limits, from the capability reply: 0x2e5 = 30 and 0x2e6 = 70. This is the
+ * same shape as the AC profiles' 0x2e1 / 0x2e2 setpoint range, where the declared range
+ * matched the remote exactly, so the appliance's own word is taken here too.
+ *
+ * ONLY 50 AND 55 WERE EXERCISED on the appliance (one step down, one step up, both echoed),
+ * so the ends are the appliance's declaration and not a measurement. Both observed values
+ * are multiples of 5 and the caps reply also carries 0x2f6 = 5, which looks like the step -
+ * but HA's MQTT humidifier has no step for target humidity, and nothing here rounds a write.
+ * An unsupported value can only cost one echo: whatever the appliance does with it, its next
+ * state frame publishes the truth.
+ */
+const HUMIDITY_MIN = 30
+const HUMIDITY_MAX = 70
+
+type SwitchOptions = {
+    /* raw TLV value written for 'ON' (default 1) */
+    onValue?: number
+    /* raw TLV value written for 'OFF' (default 0) */
+    offValue?: number
+    entityCategory?: string
+}
+
+/*
+ * HA files an entity by its entity_category: 'config' under "Configuration", 'diagnostic'
+ * under "Diagnostic", and NO KEY AT ALL under "Controls". Spreadable so that "the caller
+ * asked for Controls" and "the caller said nothing" stay distinguishable - copied from
+ * PAC_910604_WW, where the same reasoning is written out at length.
+ */
+function entityCategoryOf(options: { entityCategory?: string }): { entity_category?: string } {
+    if (!('entityCategory' in options)) return { entity_category: 'config' }
+    if (options.entityCategory === undefined) return {}
+    return { entity_category: options.entityCategory }
+}
+
+export default class Device extends TLVDevice {
+    readonly deviceConfig: DehumDiscovery
+
+    constructor(HA: Connection, thinq: Thinq2Device, meta: Metadata) {
+        super(HA, thinq)
+
+        /*
+         * The whole configuration is built up front, as in PAC_910604_WW: nothing here is
+         * gated on capability bits, so every entity exists from the first connect even
+         * though the capability reply arrives later.
+         */
+        const config: DehumDiscovery = allowExtendedType({
+            ...HADevice.config(meta, { name: 'LG Dehumidifier' }),
+            components: {
+                humidifier: {
+                    platform: 'humidifier',
+                    unique_id: '$deviceid-humidifier',
+                    name: null,
+                    device_class: 'dehumidifier',
+                    min_humidity: HUMIDITY_MIN,
+                    max_humidity: HUMIDITY_MAX,
+                    modes: MODES.map(([, label]) => label),
+                } satisfies HumidifierComponent,
+            },
+        })
+        this.deviceConfig = config
+
+        /*
+         * Power, TLV 0x1f7. A BARE write is correct here and no write_attach is needed - the
+         * app was captured sending 0x1f7 = 0 and 0x1f7 = 1 on their own, with nothing
+         * attached, and the appliance obeyed both. (RAC_056905_WW and PAC_910604_WW attach
+         * mode / fan / setpoint to a power-on because a bare 0x1f7 was never observed on
+         * those appliances; that reason does not apply to this one.)
+         *
+         * Switching the appliance OFF while auto-dry is armed starts the auto-dry run rather
+         * than stopping the appliance dead - see the remaining-minutes sensor below.
+         */
+        this.addField(config, {
+            id: 0x1f7,
+            name: '',
+            comp: 'humidifier',
+            write_xform: (val) => (val === 'ON' ? 1 : 0),
+            read_xform: (raw) => (raw ? 'ON' : 'OFF'),
+        })
+
+        this.addField(config, {
+            id: 0x1f9,
+            name: 'mode',
+            comp: 'humidifier',
+            ...mapXforms(MODES),
+        })
+
+        /*
+         * Target humidity, TLV 0x253, a plain percentage - written 50 and 55 by the app and
+         * echoed unchanged, so no scaling.
+         */
+        this.addField(config, {
+            id: 0x253,
+            name: 'target_humidity',
+            comp: 'humidifier',
+            /* TLVDevice.setProperty() drops a write whose field has no write_xform, so even a
+             * pass-through needs one; MQTT hands the value over as a string. */
+            write_xform: (val) => Number(val),
+        })
+
+        /*
+         * Indoor relative humidity, TLV 0x336: a plain integer percentage, no scaling. The
+         * owner read 63 % off the app while the frames carried 0x336 = 63. It drifts by one
+         * over tens of seconds (60..63 across the session), which is a room measurement
+         * behaving like one. PAC_910604_WW reads the same tag the same way.
+         */
+        this.addField(config, {
+            id: 0x336,
+            name: 'current_humidity',
+            comp: 'humidifier',
+            state_topic: 'topic',
+            writable: false,
+        })
+
+        /*
+         * ...and again as a sensor of its own, sharing the humidifier's topic rather than
+         * registering 0x336 twice: TLVDevice.fields_by_id holds one definition per tag, so a
+         * second addField() for the same tag would silently replace the first. A humidity
+         * reading is worth having as an entity that can be graphed and used in automations,
+         * not only as an attribute of the humidifier.
+         */
+        config.components['humidity'] = {
+            platform: 'sensor',
+            unique_id: '$deviceid-humidity',
+            name: 'Humidity',
+            state_topic: '$this/humidifier-current_humidity',
+            device_class: 'humidity',
+            unit_of_measurement: '%',
+            state_class: 'measurement',
+            suggested_display_precision: 0,
+        } as ComponentInfo
+
+        this.addMappedSelectField(config, 0x1fa, 'fanspeed', 'Fan speed', 'mdi:fan', FAN_SPEEDS, {
+            entityCategory: undefined,
+        })
+
+        this.addSelectField(config, 0x189, 'airflow', 'Airflow', 'mdi:air-conditioner', AIRFLOW, {
+            entityCategory: undefined,
+        })
+
+        this.addMappedSelectField(config, 0x20e, 'autodry', 'Auto dry', 'mdi:hair-dryer', AUTO_DRY, {
+            entityCategory: undefined,
+        })
+
+        this.addSwitchField(config, 0x2a2, 'uvnano', 'UVnano', 'mdi:bacteria')
+        this.addSwitchField(config, 0x3a9, 'childlock', 'Child lock', 'mdi:lock')
+
+        /*
+         * Both of these are INVERTED, and both were measured that way on this appliance: the
+         * owner turned 제품 버튼음 (beep) off and the app wrote 0x3a0 = 1, then on and it
+         * wrote 0. Same for 제품 상태 표시부 (the panel light) on 0x21f. PAC_910604_WW
+         * measured the identical polarity on both tags independently, which is reassuring but
+         * is not why they are written this way here.
+         */
+        this.addSwitchField(config, 0x3a0, 'beep', 'Beep Sound', 'mdi:volume-high', { onValue: 0, offValue: 1 })
+        this.addSwitchField(config, 0x21f, 'display', 'Display Light', 'mdi:led-on', { onValue: 0, offValue: 1 })
+
+        /*
+         * Turn-off reservation, TLV 0x21b, stored in MINUTES. The owner set 1 through 8 hours
+         * in the app and the writes were 60, 120, 180, 240, 300, 360, 420 and 480.
+         *
+         * The value read back is NOT the value written: the appliance echoed 59, 119, 179,
+         * 239, 299, 359, 419 and 479, i.e. it starts counting down immediately. So this
+         * number decreases on its own while the reservation runs, and the read transform
+         * rounds UP - 479 minutes left is still more than 7.75 h, so it shows 8 h. Switching
+         * the appliance off cleared it to 0 in the same state frame that carried 0x1f7 = 0.
+         *
+         * `max` is 8 because 8 h is the longest the owner was offered and the highest value
+         * ever seen on the wire. If this appliance's app allows more, raise it - the ceiling
+         * is a measurement of the sweep, not a declaration by the appliance.
+         *
+         * RAC_056905_WW reads 0x21b as its turn-off timer too. 0x21c - RAC's turn-ON timer -
+         * stayed 0 here throughout, so no turn-on entity is published: the appliance was
+         * never seen using it, and a reservation set while running can only mean off.
+         */
+        this.addTimerField(config, 0x21b, 'offtimer', 'Turn-off reservation', 'mdi:timer-stop', 8)
+
+        /*
+         * Auto-dry remaining minutes, TLV 0x225. Confirmed twice over: the owner reported the
+         * appliance displaying 50분 when auto-dry started, and 0x225 = 50 appears in the same
+         * state frame as the power-off that started it, then counts down one per minute
+         * (50, 49, ... 35 observed live). PAC_910604_WW publishes the same tag as its AI-dry
+         * remaining, also in minutes.
+         */
+        this.addSensorField(config, 0x225, 'autodry_remaining', 'Auto dry remaining', 'mdi:timer-sand', {
+            device_class: 'duration',
+            unit_of_measurement: 'min',
+            state_class: 'measurement',
+        })
+
+        /* Error code, 0 throughout - as in RAC_056905_WW / PAC_910604_WW. */
+        this.addSensorField(config, 0x221, 'error', 'Error code', 'mdi:alert')
+
+        /*
+         * Temperature, TLV 0x1fd. SCALE INHERITED, NOT MEASURED HERE - stated plainly rather
+         * than left looking like a reading. The AC profiles read this tag as degrees x 2 and
+         * that is verified on them; on this appliance THE APP SHOWS NO TEMPERATURE AT ALL, so
+         * there is no display to check the wire against. What is known: the raw value moved
+         * 56, 54, 52, 50 over half an hour, which is 28.0, 27.0, 26.0, 25.0 C under the
+         * inherited scale, and the owner judged 27-28 C plausible for the room at the time.
+         *
+         * Published as a diagnostic sensor for that reason: it is a real reading, it is
+         * almost certainly the room temperature, and nothing in this profile depends on it.
+         * One reading against a room thermometer would settle it.
+         */
+        this.addSensorField(
+            config,
+            0x1fd,
+            'temperature',
+            'Temperature',
+            undefined,
+            {
+                device_class: 'temperature',
+                unit_of_measurement: '°C',
+                state_class: 'measurement',
+                suggested_display_precision: 1,
+            },
+            (raw) => raw / 2,
+        )
+
+        /*
+         * Whether the appliance's own panel shows the humidity all the time or only while
+         * running (습도 센서: 항상 표시 / 운전중에만 표시), TLV 0x337.
+         *
+         * READ-ONLY, and a sensor rather than a select because HA's MQTT select requires a
+         * command topic. Every other writable tag in this profile has a captured app TLV
+         * write behind it; this one has none. The app changes it over the other channel - two
+         * 0x65/0xfd frames went out 2 s before each 0x337 echo - and this profile has no
+         * write path there. PAC_910604_WW found that a TLV write of 0x337 does take effect on
+         * that appliance, so a probe could promote this to a select; it has not been tried
+         * here, and an untried write is not a feature.
+         */
+        this.addSensorField(
+            config,
+            0x337,
+            'humidity_display',
+            'Panel humidity display',
+            'mdi:eye',
+            { entity_category: 'diagnostic' },
+            (raw) => HUMIDITY_DISPLAY[raw],
+        )
+
+        /*
+         * NOT HERE YET: the water tank. A dehumidifier's most useful binary sensor is "tank
+         * full", and no tag for it has been identified - the tank was never pulled or filled
+         * while frames were being recorded, and inferring it from a tag that happened to be 0
+         * is exactly the mistake this project keeps re-learning. Pull the tank with a capture
+         * running and it will be one frame.
+         */
+
+        this.setConfig(config)
+    }
+
+    /*
+     * Frame markers seen from this appliance at buf[6]:
+     *   0xa7  every state frame (buf[7] = 0x02, buf[8] = 0x04) AND the capability reply
+     *         (buf[8] = 0x01) - 63 of them in the session
+     *   0x87  the 13-byte empty-payload acknowledgement that follows each write
+     *         (buf[7] = 0x01, buf[8] = 0x10), and the 190-byte buf[7] = 0xfd frames
+     *   0xa8  the 97-byte telemetry family - NOT TLV, see the class comment
+     *
+     * The branch below is the base class' state-frame branch with the marker widened to
+     * accept 0xa7, so it is a strict superset; the delegation at the end therefore only ever
+     * hands the base class frames it would have ignored anyway, and nothing is processed
+     * twice. 0x87 is still accepted, so a firmware that behaves like every other model keeps
+     * working.
+     */
+    processData(buf: Buffer) {
+        if (
+            buf[2] === 0x04 &&
+            buf[3] === 0x00 &&
+            buf[4] === 0x00 &&
+            buf[5] === 0x00 &&
+            (buf[6] === 0x87 || buf[6] === 0xa7) &&
+            buf[7] === 0x02 &&
+            (buf[8] === 0x01 || buf[8] === 0x04) &&
+            buf[10] === buf.length - 13
+        ) {
+            this.processTLV(TLV.parse(buf.subarray(11, buf.length - 2)))
+            return
+        }
+
+        super.processData(buf)
+    }
+
+    /*
+     * Measured, not assumed. queryCaps()'s frame (TLV 0x1f5 = 1) was injected into the live
+     * appliance before this profile existed and it answered with a 134-byte, 41-TLV reply
+     * marked 0xa7 with buf[8] = 0x01, carrying 0x2da = 3518. So keying on 0x2da matches
+     * RAC_056905_WW, POT_056905_WW and PAC_910604_WW and is right for this model too.
+     *
+     * This predicate failing is not a cosmetic problem: TLVDevice's constructor re-sends the
+     * capability query every 15 s until it returns true, and only then starts the values
+     * query. Hence the live probe.
+     *
+     * The same reply is where MODES, FAN_SPEEDS, HUMIDITY_MIN and HUMIDITY_MAX get their
+     * independent confirmation - see those constants.
+     */
+    isCapsResponse(tlvArray: TLV.TLV[]) {
+        /* eeprom checksum */
+        return tlvArray.some(({ t }) => t === 0x2da)
+    }
+
+    /*
+     * Also measured: query()'s frame (TLV 0x1f5 = 2) was injected and the appliance answered
+     * with its 125-byte, 47-TLV comprehensive dump, 0x1f7 among the tags. The capability
+     * reply does NOT carry 0x1f7, so the two predicates cannot be confused for one another.
+     */
+    isValuesResponse(tlvArray: TLV.TLV[]) {
+        return tlvArray.length >= 10 && tlvArray.some(({ t }) => t === 0x1f7)
+    }
+
+    /*
+     * No setMaskingInfo() call, unlike PAC_910604_WW. This appliance already reports every
+     * tag this profile maps as an asynchronous single-attribute state frame - that is how all
+     * of them were labelled, over a 25-minute recording that includes long idle stretches -
+     * so the masking write would buy nothing, and it is a write to the appliance that was
+     * never observed being made to THIS model. TLVDevice.start()'s 15-minute values query
+     * stays as the backstop for anything that does not notify.
+     */
+
+    /* --- helpers ---------------------------------------------------------------------
+     * Deliberately re-implemented rather than imported: the equivalents in RAC_056905_WW and
+     * PAC_910604_WW are private methods of those profiles, and the three share no base class
+     * below TLVDevice.
+     */
+
+    addSwitchField(
+        config: DeviceDiscovery,
+        id: number,
+        name: string,
+        desc: string,
+        icon: string,
+        options: SwitchOptions = {},
+    ) {
+        const onValue = options.onValue ?? 1
+        const offValue = options.offValue ?? 0
+
+        config['components'][name] = {
+            platform: 'switch',
+            unique_id: '$deviceid-' + name,
+            name: desc,
+            icon: icon,
+            ...entityCategoryOf(options),
+        } as ComponentInfo
+
+        this.addField(config, {
+            id: id,
+            name: '',
+            comp: name,
+            write_xform: (val) => (val === 'ON' ? onValue : offValue),
+            read_xform: (raw) => (raw === onValue ? 'ON' : 'OFF'),
+        })
+    }
+
+    /* Contiguous raw values: `options[raw - rawBase]`. A raw outside the list is discarded. */
+    addSelectField(
+        config: DeviceDiscovery,
+        id: number,
+        name: string,
+        desc: string,
+        icon: string,
+        options: string[],
+        selectOptions: { entityCategory?: string } = {},
+        rawBase: number = 0,
+    ) {
+        config['components'][name] = {
+            platform: 'select',
+            unique_id: '$deviceid-' + name,
+            name: desc,
+            icon: icon,
+            options: options,
+            ...entityCategoryOf(selectOptions),
+        } as ComponentInfo
+
+        this.addField(config, {
+            id: id,
+            name: '',
+            comp: name,
+            read_xform: (raw) => options[raw - rawBase],
+            write_xform: (val) => {
+                const index = options.indexOf(val)
+                /* null cancels the write rather than sending a bogus value */
+                if (index < 0) return null
+                return index + rawBase
+            },
+        })
+    }
+
+    /*
+     * Non-contiguous raw values, which is the normal case on this appliance: modes are
+     * 19/20/85/86, fan speeds 2/4/6/7/8, auto-dry 0/2/3/4/253. An offset into a list cannot
+     * express any of those without inventing entries for values the appliance never sends.
+     */
+    addMappedSelectField(
+        config: DeviceDiscovery,
+        id: number,
+        name: string,
+        desc: string,
+        icon: string,
+        map: Array<[number, string]>,
+        selectOptions: { entityCategory?: string } = {},
+    ) {
+        config['components'][name] = {
+            platform: 'select',
+            unique_id: '$deviceid-' + name,
+            name: desc,
+            icon: icon,
+            options: map.map(([, label]) => label),
+            ...entityCategoryOf(selectOptions),
+        } as ComponentInfo
+
+        this.addField(config, { id: id, name: '', comp: name, ...mapXforms(map) })
+    }
+
+    /*
+     * A countdown reservation, published as an HA number in hours while the appliance stores
+     * minutes. Same shape as RAC_056905_WW's and PAC_910604_WW's.
+     */
+    addTimerField(config: DeviceDiscovery, id: number, name: string, desc: string, icon: string, max: number) {
+        config['components'][name] = {
+            platform: 'number',
+            unique_id: '$deviceid-' + name,
+            name: desc,
+            icon: icon,
+            device_class: 'duration',
+            unit_of_measurement: 'h',
+            min: 0,
+            max: max,
+            step: 0.25,
+            mode: 'slider',
+        } as ComponentInfo
+
+        this.addField(config, {
+            id: id,
+            name: '',
+            comp: name,
+            /* round UP: 479 minutes left is still more than 7.75 h, so show 8 */
+            read_xform: (raw) => Math.ceil(raw / 60 / 0.25) * 0.25,
+            write_xform: (val) => Math.round(Number(val) * 60),
+        })
+    }
+
+    addSensorField(
+        config: DeviceDiscovery,
+        id: number,
+        name: string,
+        desc: string,
+        icon?: string,
+        extra?: Record<string, unknown>,
+        read_xform?: FieldDefinition['read_xform'],
+    ) {
+        config['components'][name] = {
+            icon: icon ?? undefined,
+            platform: 'sensor',
+            unique_id: '$deviceid-' + name,
+            name: desc,
+            entity_category: 'diagnostic',
+            ...extra,
+        } as ComponentInfo
+
+        this.addField(config, {
+            id: id,
+            name: '',
+            comp: name,
+            writable: false,
+            read_xform: read_xform,
+        })
+    }
+}
+
+/*
+ * Read/write transforms for a (raw value, label) map. An unlisted raw returns undefined, which
+ * TLVDevice.processKeyValue() discards - so an unknown value publishes nothing instead of
+ * being forced onto the nearest label. An unlisted label returns null, which cancels the
+ * write.
+ */
+function mapXforms(map: Array<[number, string]>): Pick<FieldDefinition, 'read_xform' | 'write_xform'> {
+    return {
+        read_xform: (raw) => map.find(([value]) => value === raw)?.[1],
+        write_xform: (val) => map.find(([, label]) => label === val)?.[0] ?? null,
+    }
+}

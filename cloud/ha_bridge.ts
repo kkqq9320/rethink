@@ -19,6 +19,7 @@ import RV13U6AM8W_D_US_WIFI from './devices/RV13U6AM8W_D_US_WIFI'
 import F3L2CYU__ from './devices/F3L2CYU__'
 import RV13B6BSD_D_US_WIFI from './devices/RV13B6BSD_D_US_WIFI'
 import FX___S from './devices/FX___S'
+import DHUM_231006_WW from './devices/DHUM_231006_WW'
 import { Device as T1Device } from './thinq1/device'
 import { Device as T2Device } from './thinq2/device'
 import { type Connection } from './homeassistant'
@@ -57,6 +58,7 @@ const t2deviceTypes: Record<string, T2Factory> = {
     ['F3L2CYU__']: F3L2CYU__, // LG front-load washer
     ['RV13B6BSD_D_US_WIFI']: RV13B6BSD_D_US_WIFI, // LG electric dryer
     FX___S, // LG front-load washer sold in Korea (deviceType 201, tunnelled 0xEC state frames)
+    DHUM_231006_WW, // LG dehumidifier sold in Korea (deviceType 403, TLV state frames marked 0xa7)
 }
 
 class Bridge {
