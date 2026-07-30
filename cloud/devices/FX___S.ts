@@ -54,6 +54,11 @@ const INNER_STATE_SINGLE = 0xeb
 // Sent about every 1.5 s, and only while the appliance is powered on.
 const INNER_HEARTBEAT = 0x03
 
+// How stale the state is allowed to get before asking for it again. Long enough that a quiet appliance
+// is polled twice a minute rather than six times, short enough that switching it on at the panel shows
+// up while the owner is still standing in front of it.
+const REFRESH_AFTER = 30_000
+
 const RECORD_LEN = 66
 // data = <record> <1 byte separator> <record>; the current state is the second one.
 const CURRENT_RECORD_OFFSET = RECORD_LEN + 1
@@ -300,6 +305,9 @@ export default class Device extends AABBDevice {
     /** When the last state query was sent, so a stream of heartbeats cannot turn into a stream of them. */
     lastQuery = 0
 
+    /** When a record last arrived, which is what "stale" is measured against. */
+    lastRecordAt = 0
+
     constructor(HA: Connection, thinq: Thinq2Device, meta: Metadata) {
         super(HA, thinq)
         this.setConfig(
@@ -443,7 +451,6 @@ export default class Device extends AABBDevice {
                         state_topic: '$this/cycles',
                         name: 'Cycles',
                         icon: 'mdi:counter',
-                        state_class: 'total_increasing',
                         entity_category: 'diagnostic',
                     },
                     course: {
@@ -584,12 +591,14 @@ export default class Device extends AABBDevice {
             if (payload.length < 10) return
 
             // Powering the appliance on does not make it report anything: measured, the heartbeat
-            // resumed at once but no state frame followed for eighty seconds, so Home Assistant kept
-            // showing it as off. Heartbeats only flow while it is powered on, so one arriving while our
-            // last record says otherwise means we are stale, and asking is the only way to find out.
+            // resumed at once and no state frame followed for eighty seconds, so Home Assistant went on
+            // showing it as off. Nothing in the heartbeat says which it is - the same shapes appear in
+            // windows that are provably on and provably off - so the only reliable answer is to ask
+            // whenever what we hold has gone stale. Heartbeats are the cue simply because they stop
+            // when the appliance goes quiet, which is when there is nothing to refresh.
             if (payload[6] === INNER_HEARTBEAT) {
-                const stale = !this.lastRecord || this.lastRecord[OFF_PHASE] === PHASE_OFF
-                if (stale && Date.now() - this.lastQuery > 10_000) this.query()
+                const now = Date.now()
+                if (now - this.lastRecordAt > REFRESH_AFTER && now - this.lastQuery > REFRESH_AFTER) this.query()
                 return
             }
 
@@ -611,6 +620,7 @@ export default class Device extends AABBDevice {
 
     processRecord(rec: Buffer) {
         this.lastRecord = rec
+        this.lastRecordAt = Date.now()
         const phase = rec[OFF_PHASE]
         const flags = rec[OFF_FLAGS]
 
@@ -627,7 +637,7 @@ export default class Device extends AABBDevice {
         this.publishProperty('wrinkle_care', rec[OFF_WRINKLE_CARE] & WRINKLE_CARE_ON ? 'ON' : 'OFF')
         this.publishProperty('turbowash', rec[OFF_TURBOSHOT] & TURBOSHOT_ON ? 'ON' : 'OFF')
         this.publishProperty('laundry_care', rec[OFF_LAUNDRY_CARE] & LAUNDRY_CARE_ON ? 'ON' : 'OFF')
-        this.publishProperty('cycles', rec[OFF_CYCLES])
+        this.publishProperty('cycles', String(rec[OFF_CYCLES]))
         this.publishProperty('beep', BEEP[rec[OFF_BEEP]] ?? 'unknown')
         this.publishProperty('steam', rec[OFF_STEAM] & STEAM_ON ? 'ON' : 'OFF')
 
@@ -790,8 +800,11 @@ export default class Device extends AABBDevice {
     }
 
     setProperty(prop: string, mqttValue: string) {
-        if (!this.remoteControl) {
-            log('status', `${this.id}: ${prop} sent while remote control is off - the appliance will ignore it`)
+        // Settings writes are accepted with remote control off - measured, a hundred of them applied
+        // that way, and the owner confirms the app's "send to washer" works without it. What needs it
+        // is starting the machine remotely, so the warning is limited to that.
+        if (!this.remoteControl && (prop === 'start' || prop === 'resume')) {
+            log('status', `${this.id}: ${prop} sent while remote control is off - press start on the appliance instead`)
         }
 
         switch (prop) {

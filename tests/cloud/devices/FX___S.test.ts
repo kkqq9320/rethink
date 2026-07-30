@@ -113,7 +113,7 @@ describe('FX___S washer', () => {
         assert.equal(get(HA, 'rinse'), '2')
         assert.equal(get(HA, 'spin'), 'high')
         assert.equal(get(HA, 'beep'), 'very_high')
-        assert.equal(get(HA, 'cycles'), 15) // the LG cloud reported 15 the same morning
+        assert.equal(get(HA, 'cycles'), '15') // the LG cloud reported 15 the same morning
         assert.equal(get(HA, 'total_time'), 36) // the course estimate, useful before pressing start
     })
 
@@ -187,7 +187,7 @@ describe('FX___S washer', () => {
         // Powering off clears the phase, the clock and wash/temperature/rinse, but NOT these two -
         // they stay correct and must keep being published (a 16 -> 0 -> 16 cycle count would read as a
         // counter reset to Home Assistant's statistics).
-        assert.equal(get(HA, 'cycles'), 16)
+        assert.equal(get(HA, 'cycles'), '16')
         assert.equal(get(HA, 'beep'), 'very_high')
         // The course byte survives being powered off, and this record was captured after a Rinse + Spin
         // had been selected, so it correctly overrides the AI Wash published from the standby frame.
@@ -225,7 +225,7 @@ describe('FX___S washer', () => {
         assert.equal(get(HA, 'course'), 'Rinse + Spin')
         assert.equal(get(HA, 'remaining_time'), 2)
         assert.equal(get(HA, 'total_time'), 25)
-        assert.equal(get(HA, 'cycles'), 16)
+        assert.equal(get(HA, 'cycles'), '16')
         assert.equal(get(HA, 'beep'), 'very_high')
     })
 
@@ -295,30 +295,27 @@ describe('FX___S washer', () => {
         assert.equal(hex(thinq.outbox[0]), hex(buf(QUERY)))
     })
 
-    test('asks for state when a heartbeat contradicts what we last saw', () => {
-        const { thinq } = setup()
+    test('asks again once the state it holds has gone stale', () => {
+        const { thinq, dut } = setup()
         feed(thinq, POWERED_OFF)
         thinq.resetRecorder()
 
-        // Heartbeats only flow while the appliance is powered on, so one arriving after an off record
-        // means the record is stale - switching it on at the panel announces nothing, measured at
-        // eighty seconds of silence before any state frame followed.
         const HEARTBEAT = buf('aaff200a001800840e000101030006100b0b0110019ab7bb')
+
+        // Fresh record: a heartbeat is no reason to ask for anything.
+        feed(thinq, HEARTBEAT)
+        assert.equal(thinq.outbox.length, 0)
+
+        // Nothing in a heartbeat says whether the appliance is on - the same shapes appear in windows
+        // that are provably both - so staleness is measured in time, not inferred from the frame.
+        dut.lastRecordAt -= 31_000
         feed(thinq, HEARTBEAT)
         assert.equal(hex(thinq.outbox[0]), hex(buf(QUERY)))
 
-        // ...but not once per heartbeat, which arrive every second and a half.
+        // ...and not once per heartbeat, which arrive every second and a half.
         thinq.resetRecorder()
         feed(thinq, HEARTBEAT)
         feed(thinq, HEARTBEAT)
-        assert.equal(thinq.outbox.length, 0)
-    })
-
-    test('does not ask again while the record already says it is on', () => {
-        const { thinq, dut } = setup()
-        feed(thinq, STANDBY)
-        thinq.resetRecorder()
-        feed(thinq, buf('aaff200a001800840e000101030006100b0b0110019ab7bb'))
         assert.equal(thinq.outbox.length, 0)
     })
 
