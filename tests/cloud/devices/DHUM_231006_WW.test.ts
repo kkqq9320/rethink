@@ -162,6 +162,20 @@ const STATE_TEMPERATURE_54_HEX = '000004000000a702047b037f5036ecd1'
  * parse as TLV without throwing - that is exactly why they are here. Their payloads are not
  * TLV: reading them as such yields tag 0x0 repeated and values like 16777215.
  */
+/*
+ * Two real telemetry records, five minutes apart on 2026-07-31: the first while the owner had
+ * the target humidity at 30 % and the compressor was running, the second after they raised it
+ * to 70 % and heard it stop. @86 is 24 in one and 0 in the other.
+ */
+const TELEMETRY_COMPRESSOR_ON_HEX =
+    '000004000000a8661001540a0324101d01142d06000000000101010000fd0100010100006c0000010000068c' +
+    '00000000000000320002e404000034a4044c044202bc303b00fa0001b700000000000000000caa000501183b' +
+    '0026265da4e0cbdfc8'
+const TELEMETRY_COMPRESSOR_OFF_HEX =
+    '000004000000a8661001540a0324101701562d08000000000101010000fd0100010100006a0000010000068c' +
+    '00000000000000280002e336000034a4029e029402582e3b00e6000000000000000000000004620000010000' +
+    '0000007987e3db0bd6'
+
 const TELEMETRY_A8_HEX =
     '000004000000a8661001540a0324106701563708000000000101010000fd0100010100000700000000' +
     '000078000000000000080a0002e00a000013d4029e029e0258363e00fa000000000000000000000004' +
@@ -893,15 +907,52 @@ describe(MODEL_ID, () => {
         assert.equal(ha.getProperty(DEVICE_ID, 'tanklight', 'brightness_state'), 40, 'unchanged')
     })
 
-    test('frames that are not TLV are ignored', (t) => {
+    test('the compressor is read out of the telemetry record', (t) => {
+        const { ha, thinq } = readyDevice(t)
+        const components = ha.devices[DEVICE_ID].config!.components as Record<string, Record<string, unknown>>
+
+        assert.equal(components.compressor?.platform, 'binary_sensor')
+        assert.equal(components.compressor?.device_class, 'running')
+
+        thinq.emit('data', buf(TELEMETRY_COMPRESSOR_ON_HEX))
+        assert.equal(ha.devices[DEVICE_ID].properties['compressor'], 'ON')
+
+        thinq.emit('data', buf(TELEMETRY_COMPRESSOR_OFF_HEX))
+        assert.equal(ha.devices[DEVICE_ID].properties['compressor'], 'OFF')
+    })
+
+    test('a telemetry record of another subtype is left alone', (t) => {
+        const { ha, thinq } = readyDevice(t)
+
+        thinq.emit('data', buf(TELEMETRY_COMPRESSOR_ON_HEX))
+        assert.equal(ha.devices[DEVICE_ID].properties['compressor'], 'ON')
+
+        /*
+         * A 0x67 subtype carries a different layout, so its byte 86 means something else. It
+         * must not move the sensor.
+         */
+        const other = buf(TELEMETRY_COMPRESSOR_OFF_HEX)
+        other[7] = 0x67
+        thinq.emit('data', other)
+        assert.equal(ha.devices[DEVICE_ID].properties['compressor'], 'ON', 'unchanged')
+    })
+
+    test('frames that are not TLV publish nothing but the compressor', (t) => {
         const { ha, thinq } = readyDevice(t)
         const before = { ...ha.devices[DEVICE_ID].properties }
 
-        /* both parse as TLV without throwing, and both would publish nonsense if accepted */
+        /*
+         * Both parse as TLV without throwing and would publish nonsense if that parse were
+         * trusted. The telemetry record contributes exactly one byte, read at a fixed offset.
+         */
         thinq.emit('data', buf(TELEMETRY_A8_HEX))
         thinq.emit('data', buf(PRIVATE_87FD_HEX))
 
-        assert.deepEqual(ha.devices[DEVICE_ID].properties, before, 'no property changed')
+        const after = { ...ha.devices[DEVICE_ID].properties }
+        assert.equal(typeof after['compressor'], 'string', 'the compressor was published')
+        delete after['compressor']
+        delete before['compressor']
+        assert.deepEqual(after, before, 'nothing else changed')
     })
 
     test('a state frame marked 0x87 is still accepted', (t) => {

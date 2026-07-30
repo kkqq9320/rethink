@@ -46,8 +46,9 @@ import HADevice from './base'
  *                   Not exposed: unnamed, unselectable, and unconfirmed as a mode.
  *   the 0xa8 family (97 bytes, buf[7] = 0x66/0x67) and the 190-byte 0x87/0xfd/0x03 frames
  *                   share this appliance's envelope but their payloads are NOT TLV - parsing
- *                   them as TLV yields nonsense (tag 0x0 repeated, values of 16777215).
- *                   processData() below does not accept them.
+ *                   them as TLV yields nonsense (tag 0x0 repeated, values of 16777215). One
+ *                   byte of the 0x66/0x10 subtype is read at a fixed offset (the compressor,
+ *                   see COMPRESSOR_RUNNING_OFFSET); the rest stays undecoded.
  *
  * Three tags LEFT that list on 2026-07-31 and are now the water tank's light: 0x21e, 0x3e0
  * and 0x185 sat at 0, 0 and 120 for an entire session purely because nobody had touched the
@@ -258,6 +259,34 @@ const MODE_DEPENDENT_ENTITIES = ['fanspeed', 'airflow']
  */
 const HUMIDITY_MIN = 30
 const HUMIDITY_MAX = 70
+
+/*
+ * The compressor, which this appliance does NOT report as a TLV. It is a byte in the 97-byte
+ * 0xa8 telemetry record, exactly as PAC_910604_WW's is - though at a different offset, because
+ * an offset from another model transfers no better than a tag does.
+ *
+ * FOUND BY A LABELLED EXPERIMENT, then checked against everything on file. The owner set the
+ * target humidity to 30 % (room was far above it, so the compressor had to run) and then to
+ * 70 % (target already met, and they heard it stop). Comparing the two windows leaves seven
+ * offsets that are constant within each and differ between them; the 42 telemetry frames
+ * recorded across the day then sort them out:
+ *
+ *   @86  0 or 24 and NOTHING ELSE in all 42 frames - the group's only two-valued member
+ *   @87 @89 @90  0 exactly when @86 is 0, otherwise 38 / 50 / 57 / 59 - magnitudes from the
+ *                same group, most likely compressor Hz and friends. Not published.
+ *   @61 @63  changed between the two windows too, but the corpus kills them: they hold 88/88
+ *            both while running and while stopped. That is what a two-frame sample looks like
+ *            when it lies.
+ *   @66  drifts 54 -> 46 over hours and matches the temperature TLV. Not the compressor.
+ *
+ * Read as `!== 0` rather than `=== 24`: if some firmware reports a stage there, non-zero still
+ * means running.
+ *
+ * The record arrives every 5 minutes, so this sensor is coarse by nature - it says what the
+ * compressor was doing at the last report, not what it is doing this second.
+ */
+const COMPRESSOR_FRAME_LENGTH = 97
+const COMPRESSOR_RUNNING_OFFSET = 86
 
 type SwitchOptions = {
     /* raw TLV value written for 'ON' (default 1) */
@@ -724,6 +753,17 @@ export default class Device extends TLVDevice {
             read_xform: (raw) => (raw ? 'ON' : 'OFF'),
         })
 
+        /* Published from the 0xa8 telemetry rather than a tag - see COMPRESSOR_RUNNING_OFFSET. */
+        config.components['compressor'] = {
+            platform: 'binary_sensor',
+            unique_id: '$deviceid-compressor',
+            name: 'Compressor',
+            device_class: 'running',
+            icon: 'mdi:air-conditioner',
+            state_topic: '$this/compressor',
+            entity_category: 'diagnostic',
+        } as ComponentInfo
+
         /*
          * The two mode-dependent entities get their own availability topic ON TOP OF the two
          * device-wide ones. A component's `availability` REPLACES the device-level list rather
@@ -795,6 +835,26 @@ export default class Device extends TLVDevice {
             buf[10] === buf.length - 13
         ) {
             this.processTLV(TLV.parse(buf.subarray(11, buf.length - 2)))
+            return
+        }
+
+        /*
+         * The 97-byte telemetry record. Its payload is NOT TLV - parsing it as such yields
+         * nonsense - so it is read at a fixed offset, and only for the one subtype the offset
+         * was established on. The other 0xa8 subtypes (buf[7] = 0x67) carry a different layout
+         * and are deliberately left alone.
+         */
+        if (
+            buf[2] === 0x04 &&
+            buf[3] === 0x00 &&
+            buf[4] === 0x00 &&
+            buf[5] === 0x00 &&
+            buf[6] === 0xa8 &&
+            buf[7] === 0x66 &&
+            buf[8] === 0x10 &&
+            buf.length === COMPRESSOR_FRAME_LENGTH
+        ) {
+            this.HA.publishProperty(this.id, 'compressor', buf[COMPRESSOR_RUNNING_OFFSET] !== 0 ? 'ON' : 'OFF')
             return
         }
 
