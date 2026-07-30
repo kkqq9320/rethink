@@ -248,6 +248,8 @@ describe(MODEL_ID, () => {
         assert.equal(components.offtimer?.platform, 'number')
         assert.equal(components.offtimer?.unit_of_measurement, 'h')
         assert.equal(components.offtimer?.max, 8)
+        /* the app moves the reservation in whole hours */
+        assert.equal(components.offtimer?.step, 1)
 
         /* the room humidity is a measurement, not diagnostics, and shares the humidifier's topic */
         assert.equal(components.humidity?.platform, 'sensor')
@@ -647,12 +649,52 @@ describe(MODEL_ID, () => {
         ha.setProperty(DEVICE_ID, 'tanklight', 'brightness_command', '60')
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x185, l: 1, v: 160 }])
 
+        /* anything in between snaps to the app's 20 % step */
+        ha.setProperty(DEVICE_ID, 'tanklight', 'brightness_command', '55')
+        assert.deepEqual(lastSentTLV(thinq), [{ t: 0x185, l: 1, v: 160 }])
+        ha.setProperty(DEVICE_ID, 'tanklight', 'brightness_command', '71')
+        assert.deepEqual(lastSentTLV(thinq), [{ t: 0x185, l: 1, v: 180 }])
+        ha.setProperty(DEVICE_ID, 'tanklight', 'brightness_command', '250')
+        assert.deepEqual(lastSentTLV(thinq), [{ t: 0x185, l: 1, v: 200 }], 'clamped to 100 %')
+
+        /* 0 % is not a brightness the appliance has - it means "off" */
+        ha.setProperty(DEVICE_ID, 'tanklight', 'brightness_command', '0')
+        assert.deepEqual(lastSentTLV(thinq), [{ t: 0x21e, l: 0, v: 0 }], 'switches the light off')
+        ha.setProperty(DEVICE_ID, 'tanklight', 'brightness_command', '9')
+        assert.deepEqual(lastSentTLV(thinq), [{ t: 0x21e, l: 0, v: 0 }], 'rounds down to off')
+
         ha.setProperty(DEVICE_ID, 'tanklight', 'effect_command', 'lavender')
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x3e0, l: 0, v: 4 }])
 
         thinq.resetRecorder()
         ha.setProperty(DEVICE_ID, 'tanklight', 'effect_command', 'chartreuse')
         assert.equal(thinq.outbox.length, 0, 'a colour this appliance has no value for is not sent')
+    })
+
+    test('the colour is also published and accepted as RGB', (t) => {
+        const { ha, thinq } = readyDevice(t)
+
+        /* reading: the appliance sends an index, and both views follow it */
+        thinq.emit('data', buf(STATE_TANKLIGHT_COLOUR_MAGENTA_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'tanklight', 'effect_state'), 'magenta pink')
+        assert.equal(ha.devices[DEVICE_ID].properties['tanklight-rgb'], '255,0,170')
+
+        thinq.emit('data', buf(STATE_TANKLIGHT_COLOUR_MARINE_HEX))
+        assert.equal(ha.devices[DEVICE_ID].properties['tanklight-rgb'], '11,95,165')
+
+        /* writing: an exact preset goes through as itself */
+        ha.setProperty(DEVICE_ID, 'tanklight', 'rgb_command', '255,255,255')
+        assert.deepEqual(lastSentTLV(thinq), [{ t: 0x3e0, l: 0, v: 0 }], 'white')
+
+        /* and anything else snaps to the nearest of the eight the appliance has */
+        ha.setProperty(DEVICE_ID, 'tanklight', 'rgb_command', '250,10,160')
+        assert.deepEqual(lastSentTLV(thinq), [{ t: 0x3e0, l: 0, v: 7 }], 'nearest is magenta pink')
+        ha.setProperty(DEVICE_ID, 'tanklight', 'rgb_command', '120,200,230')
+        assert.deepEqual(lastSentTLV(thinq), [{ t: 0x3e0, l: 0, v: 5 }], 'nearest is sky')
+
+        thinq.resetRecorder()
+        ha.setProperty(DEVICE_ID, 'tanklight', 'rgb_command', 'not,a,colour')
+        assert.equal(thinq.outbox.length, 0, 'an unparsable RGB is dropped')
     })
 
     test('a brightness at or below the offset publishes nothing', (t) => {

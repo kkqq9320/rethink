@@ -167,18 +167,38 @@ const HUMIDITY_DISPLAY_PRIV_SUB = 0x01
  * these are eight named presets, not an RGB space, and an RGB entity would accept colours the
  * appliance cannot produce.
  */
-const TANK_LIGHT_COLOURS = [
-    'white',
-    'marine blue',
-    'lawn green',
-    'salmon pink',
-    'lavender',
-    'sky',
-    'sunlight',
-    'magenta pink',
+const TANK_LIGHT_COLOURS: Array<{ name: string; rgb: [number, number, number] }> = [
+    { name: 'white', rgb: [255, 255, 255] },
+    { name: 'marine blue', rgb: [11, 95, 165] },
+    { name: 'lawn green', rgb: [124, 252, 0] },
+    { name: 'salmon pink', rgb: [255, 145, 164] },
+    { name: 'lavender', rgb: [181, 126, 220] },
+    { name: 'sky', rgb: [135, 206, 235] },
+    { name: 'sunlight', rgb: [255, 217, 102] },
+    { name: 'magenta pink', rgb: [255, 0, 170] },
 ]
+
+/*
+ * THE RGB TRIPLES ARE CHOSEN, NOT MEASURED. The appliance sends a colour INDEX and nothing
+ * else - there is no RGB anywhere on the wire - so these are approximations of the app's own
+ * colour names, picked to look right in HA's colour picker. They exist because the owner
+ * asked for the colour to be visible in the UI rather than only as a word.
+ *
+ * Consequence, and it is a real one: HA lets the user pick any colour, and a write is snapped
+ * to whichever of these eight is nearest. The eight names stay available as the effect list,
+ * which is the exact control; the RGB is the friendly one.
+ */
+const TANK_LIGHT_COLOUR_NAMES = TANK_LIGHT_COLOURS.map((c) => c.name)
+
 /* HA brightness is published on a 1..100 scale; the appliance stores it offset by this. */
 const TANK_LIGHT_BRIGHTNESS_OFFSET = 100
+/*
+ * The app moves brightness in 20 % steps and that is all the appliance was ever seen holding
+ * (120, 140, 160, 180, 200). HA's MQTT light has no step of its own, so a write is snapped
+ * here instead; 0 is not a brightness the appliance has, so it is taken as "switch the light
+ * off", which is what the owner asked for.
+ */
+const TANK_LIGHT_BRIGHTNESS_STEP = 20
 
 /*
  * 집중건조 (focused dry, 0x1f9 = 20) drives the fan itself: while it is selected the app
@@ -510,7 +530,7 @@ export default class Device extends TLVDevice {
             icon: 'mdi:lightbulb',
             entity_category: 'config',
             brightness_scale: 100,
-            effect_list: TANK_LIGHT_COLOURS,
+            effect_list: TANK_LIGHT_COLOUR_NAMES,
         } as ComponentInfo
 
         this.addField(config, {
@@ -525,7 +545,15 @@ export default class Device extends TLVDevice {
             id: 0x185,
             name: 'brightness',
             comp: 'tanklight',
-            write_xform: (val) => Number(val) + TANK_LIGHT_BRIGHTNESS_OFFSET,
+            write_xform: (val) => {
+                const percent = Math.round(Number(val) / TANK_LIGHT_BRIGHTNESS_STEP) * TANK_LIGHT_BRIGHTNESS_STEP
+                if (percent <= 0) {
+                    /* 0 % is not a brightness this appliance has - switch the light off instead */
+                    this.setTankLightPower(false)
+                    return null
+                }
+                return Math.min(percent, 100) + TANK_LIGHT_BRIGHTNESS_OFFSET
+            },
             /*
              * Only 120..200 in steps of 20 were ever seen, and the offset makes anything at or
              * below it meaningless as a percentage, so such a reading is discarded rather than
@@ -540,10 +568,32 @@ export default class Device extends TLVDevice {
             id: 0x3e0,
             name: 'effect',
             comp: 'tanklight',
-            read_xform: (raw) => TANK_LIGHT_COLOURS[raw],
+            read_xform: (raw) => TANK_LIGHT_COLOURS[raw]?.name,
             write_xform: (val) => {
-                const index = TANK_LIGHT_COLOURS.indexOf(val)
+                const index = TANK_LIGHT_COLOUR_NAMES.indexOf(val)
                 return index < 0 ? null : index
+            },
+            read_callback: (label) => {
+                /* keep the RGB view in step with the name - see TANK_LIGHT_COLOURS */
+                const colour = TANK_LIGHT_COLOURS.find((c) => c.name === label)
+                if (colour) this.HA.publishProperty(this.id, 'tanklight-rgb', colour.rgb.join(','))
+                return true
+            },
+        })
+
+        /*
+         * The same colour again as RGB, so HA's colour picker shows it and can set it. No `id`:
+         * 0x3e0 already belongs to the effect field above and TLVDevice keeps one definition
+         * per tag, so this one carries no tag of its own and does its write by hand.
+         */
+        this.addField(config, {
+            name: 'rgb',
+            comp: 'tanklight',
+            write_xform: (val) => nearestTankLightColour(val),
+            write_callback: (index) => {
+                this.raw_clip_state[0x3e0] = index
+                this.send([1, 1, 2, 1, 1], [{ t: 0x3e0, v: index }])
+                return false
             },
         })
 
@@ -752,6 +802,12 @@ export default class Device extends TLVDevice {
      * So 00 ff is the prefix of the READ leg. Sending a write under it was never observed and
      * is not assumed to work.
      */
+    /* Used when a brightness of 0 arrives: HA means "off", and the appliance has a tag for it. */
+    setTankLightPower(on: boolean) {
+        this.raw_clip_state[0x21e] = on ? 1 : 0
+        this.send([1, 1, 2, 1, 1], [{ t: 0x21e, v: on ? 1 : 0 }])
+    }
+
     sendPrivWrite(cmd: number, cmd_sub: number, data: Buffer) {
         const length = data.length + 1
         let buf = Buffer.concat([
@@ -803,7 +859,8 @@ export default class Device extends TLVDevice {
             unit_of_measurement: 'h',
             min: 0,
             max: max,
-            step: 0.25,
+            /* the app moves this in whole hours - 1 .. 8 - and so does the entity */
+            step: 1,
             mode: 'slider',
         } as ComponentInfo
 
@@ -811,8 +868,8 @@ export default class Device extends TLVDevice {
             id: id,
             name: '',
             comp: name,
-            /* round UP: 479 minutes left is still more than 7.75 h, so show 8 */
-            read_xform: (raw) => Math.ceil(raw / 60 / 0.25) * 0.25,
+            /* round UP: 479 minutes left is still 8 hours' worth of reservation, not 7 */
+            read_xform: (raw) => Math.ceil(raw / 60),
             write_xform: (val) => Math.round(Number(val) * 60),
         })
     }
@@ -854,6 +911,27 @@ export default class Device extends TLVDevice {
  * being forced onto the nearest label. An unlisted label returns null, which cancels the
  * write.
  */
+/*
+ * "r,g,b" -> the index of the nearest of the eight presets, by plain squared distance in RGB.
+ * The appliance has no other colours, so a request for one it cannot make has to become the
+ * closest one it can rather than be dropped: HA's colour wheel would otherwise look broken.
+ */
+function nearestTankLightColour(value: string): number | null {
+    const parts = value.split(',').map((n) => Number(n))
+    if (parts.length !== 3 || parts.some((n) => !Number.isFinite(n))) return null
+
+    let best = 0
+    let bestDistance = Infinity
+    TANK_LIGHT_COLOURS.forEach((colour, index) => {
+        const distance = colour.rgb.reduce((sum, c, i) => sum + (c - parts[i]) ** 2, 0)
+        if (distance < bestDistance) {
+            bestDistance = distance
+            best = index
+        }
+    })
+    return best
+}
+
 function mapXforms(map: Array<[number, string]>): Pick<FieldDefinition, 'read_xform' | 'write_xform'> {
     return {
         read_xform: (raw) => map.find(([value]) => value === raw)?.[1],
