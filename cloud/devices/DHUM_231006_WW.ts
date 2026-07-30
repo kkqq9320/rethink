@@ -591,12 +591,31 @@ export default class Device extends TLVDevice {
             effect_list: TANK_LIGHT_COLOUR_NAMES,
         } as ComponentInfo
 
+        /*
+         * The light's own on/off, and the reason the appliance beeps twice for one HA action.
+         *
+         * MEASURED (2026-07-31): every light command from HA arrives as TWO MQTT publishes -
+         * the attribute AND an ON - because that is how HA's MQTT light works. Six light
+         * actions in one capture produced twelve write frames, six of them 0x21e = 1 sent to
+         * an appliance that was already on, each drawing its own ACK and its own beep. The LG
+         * app sends one frame and the appliance beeps once.
+         *
+         * So a write that would not change anything is dropped. This is narrow on purpose: it
+         * applies to this tag, where a redundant write is HA's own doing rather than the
+         * owner's, and raw_clip_state[0x21e] is the appliance's own last word rather than a
+         * guess. Turning the light on when it really is off still sends.
+         *
+         * It does not merge the two frames into one multi-TLV write, which would be the
+         * complete answer: that shape is what RAC_056905_WW's write_attach produces, but this
+         * appliance has never been sent one and an untested frame shape is not a fix.
+         */
         this.addField(config, {
             id: 0x21e,
             name: '',
             comp: 'tanklight',
             write_xform: (val) => (val === 'ON' ? 1 : 0),
             read_xform: (raw) => (raw ? 'ON' : 'OFF'),
+            write_callback: (val) => this.raw_clip_state[0x21e] !== val,
         })
 
         this.addField(config, {

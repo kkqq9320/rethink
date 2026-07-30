@@ -747,6 +747,30 @@ describe(MODEL_ID, () => {
         assert.equal(thinq.outbox.length, 0, 'an unparsable RGB is dropped')
     })
 
+    test('an ON for a light that is already on is not sent', (t) => {
+        const { ha, thinq } = readyDevice(t)
+
+        /*
+         * HA's MQTT light publishes the attribute AND an ON for every light command, so a
+         * brightness change used to reach the appliance as two frames - and it beeps at each.
+         */
+        thinq.emit('data', buf(STATE_TANKLIGHT_ON_HEX))
+        thinq.resetRecorder()
+
+        ha.setProperty(DEVICE_ID, 'tanklight', 'command', 'ON')
+        assert.equal(thinq.outbox.length, 0, 'nothing sent - the appliance is already on')
+
+        ha.setProperty(DEVICE_ID, 'tanklight', 'brightness_command', '40')
+        assert.equal(thinq.outbox.length, 1, 'the brightness itself still goes')
+        assert.deepEqual(lastSentTLV(thinq), [{ t: 0x185, l: 1, v: 140 }])
+
+        /* and turning it on when it really is off still sends */
+        thinq.emit('data', buf(STATE_TANKLIGHT_OFF_HEX))
+        thinq.resetRecorder()
+        ha.setProperty(DEVICE_ID, 'tanklight', 'command', 'ON')
+        assert.deepEqual(lastSentTLV(thinq), [{ t: 0x21e, l: 0, v: 1 }])
+    })
+
     test('a brightness at or below the offset publishes nothing', (t) => {
         const { ha, thinq } = readyDevice(t)
 
