@@ -24,6 +24,7 @@ import type { Metadata } from '@/cloud/thinq'
 import FX___S from '@/cloud/devices/FX___S'
 import PAC_910604_WW from '@/cloud/devices/PAC_910604_WW'
 import RAC_056905_WW from '@/cloud/devices/RAC_056905_WW'
+import DHUM_231006_WW from '@/cloud/devices/DHUM_231006_WW'
 
 // Importing the test mocks silences device logging as a side effect; a replay is exactly when those
 // lines are wanted, so put them back.
@@ -33,18 +34,41 @@ const HANDLERS: Record<string, new (HA: never, thinq: never, meta: Metadata) => 
     FX___S,
     PAC_910604_WW,
     RAC_056905_WW,
+    DHUM_231006_WW,
 } as unknown as Record<string, new (HA: never, thinq: never, meta: Metadata) => object>
 
 const ID = 'replay'
 
-type Line = { t?: string; status?: string; meta?: Metadata; rx?: string; tx?: string }
+/*
+ * Two capture schemas exist and both are on disk:
+ *   the older one, one line per frame:      {status, meta, rx|tx}
+ *   tools/rethink-capture.ts's:             {k:'wire', dir:'fromDevice'|'toDevice', hex}
+ *                                           {k:'marker', phase:'online', meta}
+ * normalise() flattens the second onto the first so the replay below only sees one shape.
+ */
+type Line = {
+    t?: string
+    status?: string
+    meta?: Metadata
+    rx?: string
+    tx?: string
+    k?: string
+    dir?: string
+    hex?: string
+    phase?: string
+}
+
+function normalise(line: Line): Line {
+    if (line.k !== 'wire') return line
+    return line.dir === 'toDevice' ? { tx: line.hex } : { rx: line.hex }
+}
 
 function replay(file: string) {
     const lines: Line[] = fs
         .readFileSync(file, 'utf8')
         .split('\n')
         .filter((l) => l.trim())
-        .map((l) => JSON.parse(l) as Line)
+        .map((l) => normalise(JSON.parse(l) as Line))
 
     const meta = lines.find((l) => l.meta)?.meta
     if (!meta) return console.log(`${file}: no metadata line - cannot tell which handler to use`)
@@ -92,3 +116,10 @@ function replay(file: string) {
 const files = process.argv.slice(2)
 if (!files.length) console.log('usage: tsx tools/replay-capture.ts <capture.jsonl> [more.jsonl ...]')
 for (const file of files) replay(file)
+
+/*
+ * A TLVDevice keeps a capability-retry interval and a refresh timer running, which hold the
+ * event loop open forever after the replay is finished. Nothing is pending at this point, so
+ * exit rather than hang.
+ */
+process.exit(0)
