@@ -285,38 +285,24 @@ describe('FX___S washer', () => {
         assert.equal(hex(thinq.outbox[0]), hex(buf('aa0df0e5000201ff010a63a9bb')))
     })
 
-    // The frame the LG app itself sends to read settings and state; the pair count is zero, so it
-    // writes nothing.
-    const QUERY = 'aa0bf0e5000201ff00d9bb'
+    test('adds a course it has no name for and makes it selectable', () => {
+        const { HA, thinq, dut } = setup()
+        // The current record starts at byte 83 of the frame, so its course byte is 87. 0x63 is not one
+        // of the ten positions the dial sweep found.
+        const unknown = Buffer.from(STANDBY)
+        unknown[87] = 0x63
+        feed(thinq, unknown)
 
-    test('asks for the current state as soon as it attaches', () => {
-        const { thinq, dut } = setup()
-        dut.start() // what the bridge calls when the appliance attaches
-        assert.equal(hex(thinq.outbox[0]), hex(buf(QUERY)))
-    })
+        assert.equal(get(HA, 'current_course'), '#99')
+        assert.ok(
+            (HA.devices[DEVICE_ID].config!.components.course as unknown as { options: string[] }).options.includes(
+                '#99',
+            ),
+        )
 
-    test('asks again once the state it holds has gone stale', () => {
-        const { thinq, dut } = setup()
-        feed(thinq, POWERED_OFF)
         thinq.resetRecorder()
-
-        const HEARTBEAT = buf('aaff200a001800840e000101030006100b0b0110019ab7bb')
-
-        // Fresh record: a heartbeat is no reason to ask for anything.
-        feed(thinq, HEARTBEAT)
-        assert.equal(thinq.outbox.length, 0)
-
-        // Nothing in a heartbeat says whether the appliance is on - the same shapes appear in windows
-        // that are provably both - so staleness is measured in time, not inferred from the frame.
-        dut.lastRecordAt -= 31_000
-        feed(thinq, HEARTBEAT)
-        assert.equal(hex(thinq.outbox[0]), hex(buf(QUERY)))
-
-        // ...and not once per heartbeat, which arrive every second and a half.
-        thinq.resetRecorder()
-        feed(thinq, HEARTBEAT)
-        feed(thinq, HEARTBEAT)
-        assert.equal(thinq.outbox.length, 0)
+        dut.setProperty('course', '#99')
+        assert.equal(hex(thinq.outbox[0]), hex(buf('aa0df0e5000201ff010a63a9bb')))
     })
 
     test('ignores frames that are not from the appliance', () => {

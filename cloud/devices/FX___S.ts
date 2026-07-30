@@ -51,13 +51,6 @@ const INNER_STATE = 0xec
 // (re)connects - there is no prior state to diff against yet. Without it a restart leaves every entity
 // unknown until the appliance next changes state, which on an idle washer can be a very long time.
 const INNER_STATE_SINGLE = 0xeb
-// Sent about every 1.5 s, and only while the appliance is powered on.
-const INNER_HEARTBEAT = 0x03
-
-// How stale the state is allowed to get before asking for it again. Long enough that a quiet appliance
-// is polled twice a minute rather than six times, short enough that switching it on at the panel shows
-// up while the owner is still standing in front of it.
-const REFRESH_AFTER = 30_000
 
 const RECORD_LEN = 66
 // data = <record> <1 byte separator> <record>; the current state is the second one.
@@ -301,12 +294,6 @@ export default class Device extends AABBDevice {
      * break any automation referring to it, and courses do not disappear from a dial.
      */
     courseOptions = [...Object.values(COURSE), ...Object.values(COURSE_EXT)]
-
-    /** When the last state query was sent, so a stream of heartbeats cannot turn into a stream of them. */
-    lastQuery = 0
-
-    /** When a record last arrived, which is what "stale" is measured against. */
-    lastRecordAt = 0
 
     constructor(HA: Connection, thinq: Thinq2Device, meta: Metadata) {
         super(HA, thinq)
@@ -564,20 +551,6 @@ export default class Device extends AABBDevice {
         )
     }
 
-    /**
-     * Ask for the current settings and state. The appliance answers with a 0xE6 carrying a full record.
-     * This is the read the LG app itself makes - byte for byte the frame it sends - and it writes
-     * nothing: the pair count is zero.
-     */
-    query() {
-        this.lastQuery = Date.now()
-        this.send(Buffer.from([0xf0, 0xe5, 0x00, 0x02, 0x01, 0xff, 0x00]))
-    }
-
-    start() {
-        this.query()
-    }
-
     processAABB(buf: Buffer) {
         if (buf[0] !== FROM_DEVICE || buf.length < 4) return
 
@@ -589,18 +562,6 @@ export default class Device extends AABBDevice {
 
         if (type === MSG_TUNNEL) {
             if (payload.length < 10) return
-
-            // Powering the appliance on does not make it report anything: measured, the heartbeat
-            // resumed at once and no state frame followed for eighty seconds, so Home Assistant went on
-            // showing it as off. Nothing in the heartbeat says which it is - the same shapes appear in
-            // windows that are provably on and provably off - so the only reliable answer is to ask
-            // whenever what we hold has gone stale. Heartbeats are the cue simply because they stop
-            // when the appliance goes quiet, which is when there is nothing to refresh.
-            if (payload[6] === INNER_HEARTBEAT) {
-                const now = Date.now()
-                if (now - this.lastRecordAt > REFRESH_AFTER && now - this.lastQuery > REFRESH_AFTER) this.query()
-                return
-            }
 
             const data = payload.subarray(10)
             // 0xEC stacks the previous record ahead of the current one; 0xEB carries the current one
@@ -620,7 +581,6 @@ export default class Device extends AABBDevice {
 
     processRecord(rec: Buffer) {
         this.lastRecord = rec
-        this.lastRecordAt = Date.now()
         const phase = rec[OFF_PHASE]
         const flags = rec[OFF_FLAGS]
 
