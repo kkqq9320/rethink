@@ -96,11 +96,11 @@ describe('FX___S washer', () => {
         assert.equal(get(HA, 'remaining_time'), 0) // not a timed phase
         assert.equal(get(HA, 'course'), 'AI Wash')
         assert.equal(get(HA, 'current_course'), 'AI Wash')
-        assert.equal(get(HA, 'wash'), 'Normal')
+        assert.equal(get(HA, 'wash'), 'normal')
         assert.equal(get(HA, 'water_temp'), '40')
         assert.equal(get(HA, 'rinse'), '2')
-        assert.equal(get(HA, 'spin'), 'High')
-        assert.equal(get(HA, 'beep'), 'Very high')
+        assert.equal(get(HA, 'spin'), 'high')
+        assert.equal(get(HA, 'beep'), 'very_high')
         assert.equal(get(HA, 'cycles'), 15) // the LG cloud reported 15 the same morning
         assert.equal(get(HA, 'total_time'), 36) // the course estimate, useful before pressing start
     })
@@ -135,7 +135,7 @@ describe('FX___S washer', () => {
 
         // The record's wash/water-temperature bytes have been consumed to 0 by this point; the selects
         // must still show what was selected.
-        assert.equal(get(HA, 'wash'), 'Normal')
+        assert.equal(get(HA, 'wash'), 'normal')
         assert.equal(get(HA, 'water_temp'), '40')
     })
 
@@ -160,6 +160,7 @@ describe('FX___S washer', () => {
         assert.equal(get(HA, 'status'), 'rinsing')
         assert.equal(get(HA, 'remaining_time'), 25)
         assert.equal(get(HA, 'rinse_remaining'), 1)
+        assert.equal(get(HA, 'current_course'), 'Rinse + Spin')
     })
 
     test('reports power off from an all-zero record', () => {
@@ -175,12 +176,12 @@ describe('FX___S washer', () => {
         // they stay correct and must keep being published (a 16 -> 0 -> 16 cycle count would read as a
         // counter reset to Home Assistant's statistics).
         assert.equal(get(HA, 'cycles'), 16)
-        assert.equal(get(HA, 'beep'), 'Very high')
+        assert.equal(get(HA, 'beep'), 'very_high')
         // The course byte survives being powered off, and this record was captured after a Rinse + Spin
         // had been selected, so it correctly overrides the AI Wash published from the standby frame.
         assert.equal(get(HA, 'course'), 'Rinse + Spin')
         // The consumable option bytes were cleared though, and must not be written back over the select.
-        assert.equal(get(HA, 'wash'), 'Normal')
+        assert.equal(get(HA, 'wash'), 'normal')
     })
 
     test('also reads state out of the short-framed settings reply', () => {
@@ -197,7 +198,7 @@ describe('FX___S washer', () => {
         // Rinse + Spin is a known course, but its Medium spin is published while `wash` (0x00 = Off)
         // and the rest stay as they were rather than being set to an option that does not exist.
         feed(thinq, POWERED_OFF)
-        assert.equal(get(HA, 'spin'), 'High')
+        assert.equal(get(HA, 'spin'), 'high')
         assert.ok(String(get(HA, 'options_raw') ?? '').startsWith('course=114'))
     })
 
@@ -213,7 +214,7 @@ describe('FX___S washer', () => {
         assert.equal(get(HA, 'remaining_time'), 2)
         assert.equal(get(HA, 'total_time'), 25)
         assert.equal(get(HA, 'cycles'), 16)
-        assert.equal(get(HA, 'beep'), 'Very high')
+        assert.equal(get(HA, 'beep'), 'very_high')
     })
 
     test('ignores frames that are not from the appliance', () => {
@@ -231,6 +232,7 @@ describe('FX___S commands', () => {
         ['pause', '', 'aa0df0e5000201ff010302c1bb', 'pause'],
         ['course', 'Tub Clean', 'aa0df0e5000201ff010a55bbbb', 'course = Tub Clean'],
         ['course', 'AI Wash', 'aa0df0e5000201ff010a725ebb', 'course = AI Wash'],
+        ['course', 'Normal', 'aa0df0e5000201ff010a2e92bb', 'course = Normal'],
     ]
 
     for (const [prop, value, expected, name] of cases) {
@@ -278,7 +280,7 @@ describe('FX___S commands', () => {
             'aa0df0e5000201ff011303f0bb',
             'aa0df0e5000201ff011304f3bb',
         ]
-        for (const name of ['Mute', 'Low', 'Medium', 'High', 'Very high']) {
+        for (const name of ['mute', 'low', 'medium', 'high', 'very_high']) {
             dut.setProperty('beep', name)
         }
         assert.deepEqual(
@@ -289,7 +291,7 @@ describe('FX___S commands', () => {
 
     test('rejects a value that is not in the option list', () => {
         const { thinq, dut } = setup()
-        dut.setProperty('spin', 'Warp speed')
+        dut.setProperty('spin', 'warp_speed')
         dut.setProperty('rinse', '9')
         assert.equal(thinq.outbox.length, 0)
     })

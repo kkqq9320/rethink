@@ -76,6 +76,10 @@ const OFF_PHASE_PREV = 21
 const OFF_CYCLES = 27
 const OFF_BEEP = 28
 const OFF_FLAGS = 36
+// Steam sits in its own byte rather than the flags one. Found by toggling steam on the Normal course
+// and watching this bit follow it; it also matches the Towels 1 selection, which switches steam on.
+const OFF_STEAM = 34
+const STEAM_ON = 0x10
 
 // Bit 0x10 of the flags byte is set from the moment a cycle starts and stays set at PHASE_DONE, only
 // clearing at power off - it means "a cycle is loaded", not "a cycle is running". Deriving either the
@@ -142,27 +146,65 @@ const OP_RESUME = 0x03
 
 const COURSE_EXTENDED = 0xff
 
-// Only the courses the owner actually ran are named. An unnamed one leaves the select untouched and
-// shows up in the `options_raw` diagnostic instead, where it can be identified and added here.
+// The whole dial, named by sweeping it one position at a time through a full revolution and writing the
+// names down in order. The alignment is self-checking: the sweep started and ended on the same position
+// and came back to the same value, and three of the courses had already been identified independently
+// (Towels 1 and Tub Clean from the app, Rinse + Spin from a cycle that was actually run) - all three
+// landed where the sweep said they would.
+//
+// A course that is not listed here leaves the select untouched and shows up in `current_course` as its
+// raw number, so a dial position that has not been swept is visible rather than silently missing.
 const COURSE: Record<number, string> = {
-    0x72: 'AI Wash',
-    0x55: 'Tub Clean',
-    0x37: 'Rinse + Spin',
-}
-const COURSE_EXT: Record<number, string> = {
-    0xf6: 'Towels 1',
+    0x72: 'AI Wash', // 인공지능세탁, 36 min
+    0x5e: 'Wool / Delicates', // 울/섬세, 53 min
+    0x2e: 'Normal', // 표준, 35 min
+    0x55: 'Tub Clean', // 통살균, 124 min
+    0x1b: 'Bedding', // 이불, 98 min
+    0x87: 'Quick Steam Sanitize', // 쾌속스팀살균, 64 min
+    0x37: 'Rinse + Spin', // 헹굼+탈수, 25 min
+    0x86: 'Quick Tub Rinse', // 급속통헹굼, 12 min
 }
 
-const WASH: Record<number, string> = { 0x00: 'Off', 0x03: 'Normal', 0x07: 'Soak' }
-// Corrected against the appliance's own display by selecting each of these from Home Assistant and
-// reading the panel: 0x03 shows 40 degrees and 0x05 shows 60, not the 40 that the capture session's
-// notes suggested. There is no 30-degree setting on this model. Whether 0x03 is literally "40" or "the
-// course default, which is 40 on AI Wash" is untested - it has only ever been observed on AI Wash.
-const WATER_TEMP: Record<number, string> = { 0x00: 'cool', 0x03: '40', 0x05: '60' }
-const SPIN: Record<number, string> = { 0x04: 'Medium', 0x06: 'High', 0x08: 'Dry fit' }
-const BEEP: Record<number, string> = { 0: 'Mute', 1: 'Low', 2: 'Medium', 3: 'High', 4: 'Very high' }
-// Rinse is the count itself; 1-4 were each written and read back unchanged.
-const RINSE = [1, 2, 3, 4]
+// Reached through the 0xFF escape, with the real identifier in the second key. These two are read-only:
+// selecting one needs a write carrying both keys at once, and the only capture of that shape also
+// carried all eight option keys, so the two-key form on its own has never been seen on the wire.
+const COURSE_EXT: Record<number, string> = {
+    0xf5: 'Normal 1', // 표준1, 68 min
+    0xf6: 'Towels 1', // 타월1, 82 min
+}
+
+// All four option scales were read off the panel by stepping each control through a full cycle on
+// several courses and writing the displayed names down in order, with the sweep returning to its
+// starting value so the alignment checks itself.
+//
+// Water temperature took two corrections. The capture session's notes had 0x05 as 40 degrees; it is 60.
+// Then 0x00 was taken for the cold setting; it is not - cold is 0x08, and 0x00 means the stage is not
+// used at all, which is why it appears exactly when the wash stage is set to none. There is a 30-degree
+// setting after all.
+const WATER_TEMP: Record<number, string> = { 0x00: 'none', 0x02: '30', 0x03: '40', 0x05: '60', 0x08: 'cold' }
+
+// 0x02 and 0x04 have never appeared on any course swept so far.
+const WASH: Record<number, string> = {
+    0x00: 'none',
+    0x01: 'light_soil',
+    0x03: 'normal',
+    0x05: 'intensive',
+    0x06: 'pre_wash',
+    0x07: 'soak',
+}
+
+// The gaps (0x03, 0x05, 0x07) are unused rather than unobserved - the dial steps straight over them.
+const SPIN: Record<number, string> = {
+    0x00: 'none',
+    0x01: 'delicate',
+    0x02: 'low',
+    0x04: 'medium',
+    0x06: 'high',
+    0x08: 'dry_fit',
+}
+const BEEP: Record<number, string> = { 0: 'mute', 1: 'low', 2: 'medium', 3: 'high', 4: 'very_high' }
+// Rinse is the count itself, and 0 means the stage is skipped. 0-5 were all stepped through.
+const RINSE = [0, 1, 2, 3, 4, 5]
 
 function invert(map: Record<number, string>): Record<string, number> {
     return Object.fromEntries(Object.entries(map).map(([k, v]) => [v, Number(k)]))
@@ -434,7 +476,8 @@ export default class Device extends AABBDevice {
         this.publishProperty('running', ACTIVE_PHASES.has(phase) ? 'ON' : 'OFF')
         this.publishProperty('drum_active', flags & FLAG_DRUM_ACTIVE ? 'ON' : 'OFF')
         this.publishProperty('cycles', rec[OFF_CYCLES])
-        this.publishProperty('beep', BEEP[rec[OFF_BEEP]] ?? 'Unknown')
+        this.publishProperty('beep', BEEP[rec[OFF_BEEP]] ?? 'unknown')
+        this.publishProperty('steam', rec[OFF_STEAM] & STEAM_ON ? 'ON' : 'OFF')
 
         // Only the wash clock counts down, so everything else would show a stale figure - and at the end
         // of a cycle the remaining-minutes byte sticks at 1 rather than reaching 0. The total is the
@@ -484,7 +527,7 @@ export default class Device extends AABBDevice {
         // `status_code`, and the thing to read when naming a new course.
         this.publishProperty(
             'options_raw',
-            `course=${course} ext=${rec[OFF_COURSE_EXT]} wash=${rec[OFF_WASH]} temp=${rec[OFF_WATER_TEMP]} rinse=${rec[OFF_RINSE]} spin=${rec[OFF_SPIN]}`,
+            `course=${course} ext=${rec[OFF_COURSE_EXT]} wash=${rec[OFF_WASH]} temp=${rec[OFF_WATER_TEMP]} rinse=${rec[OFF_RINSE]} spin=${rec[OFF_SPIN]} steam=${rec[OFF_STEAM]}`,
         )
     }
 
