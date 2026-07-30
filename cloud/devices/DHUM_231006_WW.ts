@@ -169,20 +169,25 @@ const HUMIDITY_DISPLAY_PRIV_SUB = 0x01
  */
 const TANK_LIGHT_COLOURS: Array<{ name: string; rgb: [number, number, number] }> = [
     { name: 'white', rgb: [255, 255, 255] },
-    { name: 'marine blue', rgb: [11, 95, 165] },
-    { name: 'lawn green', rgb: [124, 252, 0] },
-    { name: 'salmon pink', rgb: [255, 145, 164] },
-    { name: 'lavender', rgb: [181, 126, 220] },
-    { name: 'sky', rgb: [135, 206, 235] },
-    { name: 'sunlight', rgb: [255, 217, 102] },
-    { name: 'magenta pink', rgb: [255, 0, 170] },
+    { name: 'marine blue', rgb: [154, 173, 251] } /* #9aadfb */,
+    { name: 'lawn green', rgb: [215, 246, 142] } /* #d7f68e */,
+    { name: 'salmon pink', rgb: [255, 171, 171] } /* #ffabab */,
+    { name: 'lavender', rgb: [213, 185, 255] } /* #d5b9ff */,
+    { name: 'sky', rgb: [189, 238, 246] } /* #bdeef6 */,
+    { name: 'sunlight', rgb: [251, 240, 144] } /* #fbf090 */,
+    { name: 'magenta pink', rgb: [255, 189, 246] } /* #ffbdf6 */,
 ]
 
 /*
- * THE RGB TRIPLES ARE CHOSEN, NOT MEASURED. The appliance sends a colour INDEX and nothing
- * else - there is no RGB anywhere on the wire - so these are approximations of the app's own
- * colour names, picked to look right in HA's colour picker. They exist because the owner
- * asked for the colour to be visible in the UI rather than only as a word.
+ * THE RGB TRIPLES DO NOT COME OFF THE WIRE. The appliance sends a colour INDEX and nothing
+ * else. Seven of the eight are the hex codes the owner read out of the LG app on 2026-07-31,
+ * so they are what the app paints, not a guess; white is the one they did not quote and is
+ * left at plain #ffffff. They exist because the owner asked for the colour to be visible in
+ * HA rather than only as a word.
+ *
+ * Note how pale they all are - #9aadfb for "marine blue", #ffbdf6 for "magenta pink". An
+ * earlier version of this table guessed at saturated versions of the same names and was
+ * wrong about every one of them. Colour names are not colours.
  *
  * Consequence, and it is a real one: HA lets the user pick any colour, and a write is snapped
  * to whichever of these eight is nearest. The eight names stay available as the effect list,

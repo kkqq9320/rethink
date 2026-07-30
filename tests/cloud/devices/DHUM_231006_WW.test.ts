@@ -727,19 +727,19 @@ describe(MODEL_ID, () => {
         /* reading: the appliance sends an index, and both views follow it */
         thinq.emit('data', buf(STATE_TANKLIGHT_COLOUR_MAGENTA_HEX))
         assert.equal(ha.getProperty(DEVICE_ID, 'tanklight', 'effect_state'), 'magenta pink')
-        assert.equal(ha.devices[DEVICE_ID].properties['tanklight-rgb'], '255,0,170')
+        assert.equal(ha.devices[DEVICE_ID].properties['tanklight-rgb'], '255,189,246')
 
         thinq.emit('data', buf(STATE_TANKLIGHT_COLOUR_MARINE_HEX))
-        assert.equal(ha.devices[DEVICE_ID].properties['tanklight-rgb'], '11,95,165')
+        assert.equal(ha.devices[DEVICE_ID].properties['tanklight-rgb'], '154,173,251')
 
         /* writing: an exact preset goes through as itself */
         ha.setProperty(DEVICE_ID, 'tanklight', 'rgb_command', '255,255,255')
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x3e0, l: 0, v: 0 }], 'white')
 
         /* and anything else snaps to the nearest of the eight the appliance has */
-        ha.setProperty(DEVICE_ID, 'tanklight', 'rgb_command', '250,10,160')
+        ha.setProperty(DEVICE_ID, 'tanklight', 'rgb_command', '255,190,240')
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x3e0, l: 0, v: 7 }], 'nearest is magenta pink')
-        ha.setProperty(DEVICE_ID, 'tanklight', 'rgb_command', '120,200,230')
+        ha.setProperty(DEVICE_ID, 'tanklight', 'rgb_command', '180,235,250')
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x3e0, l: 0, v: 5 }], 'nearest is sky')
 
         thinq.resetRecorder()
