@@ -21,15 +21,18 @@
 // Usage:
 //   tsx tools/tlv-write-probe.ts --tag 0x1f9 --value 22 --reference 01010400000065020100037e505681c8 \
 //       [--restore 86] [--settle 20] [--seconds 60] [--confirm-write] <mgmt-host[:port]> <uuid> <out.jsonl>
+//
+// --tag/--value (and --restore) may be repeated to put SEVERAL TLVs in ONE frame:
+//   --tag 0x3e0 --value 4 --tag 0x21e --value 1   ->  one frame carrying both
 
 import WebSocket from 'ws'
 import * as fs from 'node:fs'
 import * as TLV from '@/util/tlv'
 import crc16 from '@/util/crc16'
 
-let tag: number | undefined
-let value: number | undefined
-let restore: number | undefined
+const tags: number[] = []
+const values: number[] = []
+const restores: number[] = []
 let reference: string | undefined
 let settle = 20
 let seconds = 60
@@ -38,9 +41,9 @@ const positionals: string[] = []
 const argv = process.argv.slice(2)
 for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
-    if (a === '--tag') tag = Number(argv[++i])
-    else if (a === '--value') value = Number(argv[++i])
-    else if (a === '--restore') restore = Number(argv[++i])
+    if (a === '--tag') tags.push(Number(argv[++i]))
+    else if (a === '--value') values.push(Number(argv[++i]))
+    else if (a === '--restore') restores.push(Number(argv[++i]))
     else if (a === '--reference') reference = argv[++i]
     else if (a === '--settle') settle = Number(argv[++i])
     else if (a === '--seconds') seconds = Number(argv[++i])
@@ -48,7 +51,7 @@ for (let i = 0; i < argv.length; i++) {
     else positionals.push(a)
 }
 const [hostArg, deviceId, outArg] = positionals
-if (tag === undefined || value === undefined || !hostArg || !deviceId || !outArg) {
+if (!tags.length || tags.length !== values.length || !hostArg || !deviceId || !outArg) {
     console.error(
         'Usage: tsx tools/tlv-write-probe.ts --tag 0xNNN --value N [--restore N] [--reference <hex>]\n' +
             '           [--settle 20] [--seconds 60] [--confirm-write] <mgmt-host[:port]> <uuid> <out.jsonl>',
@@ -61,8 +64,14 @@ if (tag === undefined || value === undefined || !hostArg || !deviceId || !outArg
 const PREFIX = [0x01, 0x01]
 const ENVELOPE = [0x04, 0x00, 0x00, 0x00, 0x65, 0x02, 0x01, 0x00]
 
-function buildWrite(t: number, v: number): Buffer {
-    const tlv = TLV.build([{ t, v }])
+/*
+ * One frame, however many TLVs. --tag/--value may be repeated, which is how the "does this
+ * appliance accept a multi-TLV write at all?" question gets asked: RAC_056905_WW's
+ * write_attach produces that shape routinely, but a given appliance may never have been sent
+ * one.
+ */
+function buildWrite(pairs: Array<{ t: number; v: number }>): Buffer {
+    const tlv = TLV.build(pairs)
     const body = ENVELOPE.concat([tlv.length], tlv)
     const crc = crc16(body)
     return Buffer.from(PREFIX.concat(body, [crc >> 8, crc & 0xff]))
@@ -76,7 +85,7 @@ if (reference) {
         console.error(`reference must be a single-TLV write frame; it decodes to ${refTlv.length} TLVs`)
         process.exit(1)
     }
-    const rebuilt = buildWrite(refTlv[0].t, refTlv[0].v)
+    const rebuilt = buildWrite([{ t: refTlv[0].t, v: refTlv[0].v }])
     const ok = rebuilt.toString('hex') === ref.toString('hex')
     console.error(
         `reference : ${ref.toString('hex')}  (0x${refTlv[0].t.toString(16)}=${refTlv[0].v})\n` +
@@ -90,10 +99,12 @@ if (reference) {
     console.error('WARNING: no --reference given, so the encoder path is unverified for this appliance.')
 }
 
-const frame = buildWrite(tag, value)
-console.error(`frame to send: ${frame.toString('hex')}   (0x${tag.toString(16)} = ${value})`)
-if (restore !== undefined) {
-    console.error(`restore frame: ${buildWrite(tag, restore).toString('hex')}   (0x${tag.toString(16)} = ${restore})`)
+const describe = (vals: number[]) => tags.map((t, i) => `0x${t.toString(16)}=${vals[i]}`).join(' ')
+const frame = buildWrite(tags.map((t, i) => ({ t, v: values[i] })))
+console.error(`frame to send: ${frame.toString('hex')}   (${describe(values)}, ${tags.length} TLV)`)
+if (restores.length === tags.length) {
+    const restoreFrame = buildWrite(tags.map((t, i) => ({ t, v: restores[i] })))
+    console.error(`restore frame: ${restoreFrame.toString('hex')}   (${describe(restores)})`)
 }
 if (!confirmed) {
     console.error('\n--confirm-write not given: nothing was sent. Re-run with --confirm-write to transmit.')
@@ -104,7 +115,7 @@ if (!confirmed) {
 const host = hostArg.includes(':') ? hostArg : `${hostArg}:44401`
 const stream = fs.createWriteStream(outArg, { flags: 'a' })
 const emit = (event: object) => stream.write(JSON.stringify({ ts: Date.now(), ...event }) + '\n')
-emit({ k: 'session', v: 1, deviceId, tool: 'tlv-write-probe/0.1', tag, value, restore, reference })
+emit({ k: 'session', v: 1, deviceId, tool: 'tlv-write-probe/0.2', tags, values, restores, reference })
 
 const ws = new WebSocket(`ws://${host}/device?id=${encodeURIComponent(deviceId)}`)
 
@@ -118,7 +129,10 @@ function send(buf: Buffer, label: string) {
 ws.on('open', () => {
     emit({ k: 'marker', phase: 'connected' })
     setTimeout(() => send(frame, 'probe'), 1500)
-    if (restore !== undefined) setTimeout(() => send(buildWrite(tag!, restore!), 'restore'), 1500 + settle * 1000)
+    if (restores.length === tags.length) {
+        const restoreFrame = buildWrite(tags.map((t, i) => ({ t, v: restores[i] })))
+        setTimeout(() => send(restoreFrame, 'restore'), 1500 + settle * 1000)
+    }
     setTimeout(() => {
         emit({ k: 'marker', phase: 'stopped' })
         stream.end(() => process.exit(0))

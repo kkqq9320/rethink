@@ -208,6 +208,14 @@ function readyDevice(t: import('node:test').TestContext) {
     return { ha, thinq, dev }
 }
 
+/**
+ * Writes are collected for WRITE_COALESCE_MS before they go out as one frame, so a test that
+ * sets a property has to let that window pass before looking at the outbox.
+ */
+function flushWrites(t: import('node:test').TestContext) {
+    tickMockTimers(t, 200)
+}
+
 /** The TLVs of the last frame the profile sent to the appliance. */
 function lastSentTLV(thinq: MockThinq2Device) {
     const frame = thinq.outbox[thinq.outbox.length - 1]
@@ -426,6 +434,7 @@ describe(MODEL_ID, () => {
         /* in any other mode it goes through */
         thinq.emit('data', buf(STATE_MODE_SMART_PLUS_HEX))
         ha.setProperty(DEVICE_ID, 'humidifier', 'target_humidity_command', '45')
+        flushWrites(t)
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x253, l: 1, v: 45 }])
     })
 
@@ -436,6 +445,7 @@ describe(MODEL_ID, () => {
         assert.equal(components.autodry_cancel?.platform, 'button')
 
         ha.emit('setProperty', DEVICE_ID, 'autodry_cancel', 'PRESS')
+        flushWrites(t)
         /*
          * Compared as TLV, not as bytes: the app's own frame (APP_WRITE_AUTODRY_CANCEL_HEX)
          * carries byte7 = 0 and everything rethink sends carries byte7 = 1, which is the
@@ -588,40 +598,59 @@ describe(MODEL_ID, () => {
 
         /* power: a BARE 0x1f7, which is what the LG app was captured sending */
         ha.setProperty(DEVICE_ID, 'humidifier', 'command', 'ON')
+        flushWrites(t)
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x1f7, l: 0, v: 1 }])
         ha.setProperty(DEVICE_ID, 'humidifier', 'command', 'OFF')
+        flushWrites(t)
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x1f7, l: 0, v: 0 }])
 
         ha.setProperty(DEVICE_ID, 'humidifier', 'mode_command', 'quiet')
+
+        flushWrites(t)
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x1f9, l: 1, v: 19 }])
         ha.setProperty(DEVICE_ID, 'humidifier', 'mode_command', 'fast laundry')
+        flushWrites(t)
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x1f9, l: 1, v: 85 }])
 
         ha.setProperty(DEVICE_ID, 'humidifier', 'target_humidity_command', '50')
+
+        flushWrites(t)
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x253, l: 1, v: 50 }])
 
         ha.setProperty(DEVICE_ID, 'fanspeed', 'command', 'turbo')
+
+        flushWrites(t)
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x1fa, l: 0, v: 7 }])
 
         ha.setProperty(DEVICE_ID, 'airflow', 'command', 'focus')
+
+        flushWrites(t)
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x189, l: 0, v: 2 }])
 
         ha.setProperty(DEVICE_ID, 'autodry', 'command', 'smart')
+
+        flushWrites(t)
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x20e, l: 1, v: 253 }])
 
         /* inverted: HA 'OFF' writes 1 */
         ha.setProperty(DEVICE_ID, 'beep', 'command', 'OFF')
+        flushWrites(t)
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x3a0, l: 0, v: 1 }])
         ha.setProperty(DEVICE_ID, 'display', 'command', 'ON')
+        flushWrites(t)
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x21f, l: 0, v: 0 }])
 
         ha.setProperty(DEVICE_ID, 'uvnano', 'command', 'ON')
+
+        flushWrites(t)
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x2a2, l: 0, v: 1 }])
         ha.setProperty(DEVICE_ID, 'childlock', 'command', 'ON')
+        flushWrites(t)
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x3a9, l: 0, v: 1 }])
 
         /* hours in HA, minutes on the wire */
         ha.setProperty(DEVICE_ID, 'offtimer', 'command', '8')
+        flushWrites(t)
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x21b, l: 2, v: 480 }])
     })
 
@@ -629,6 +658,8 @@ describe(MODEL_ID, () => {
         const { ha, thinq } = readyDevice(t)
 
         ha.setProperty(DEVICE_ID, 'fanspeed', 'command', 'very high')
+
+        flushWrites(t)
         assert.equal(thinq.outbox.length, 0, 'nothing sent for a label this appliance has no value for')
     })
 
@@ -636,6 +667,8 @@ describe(MODEL_ID, () => {
         const { ha, thinq } = readyDevice(t)
 
         ha.setProperty(DEVICE_ID, 'humidity_display', 'command', 'while running')
+
+        flushWrites(t)
         assert.equal(thinq.outbox.length, 1, 'exactly one frame - no TLV write follows the private one')
         assert.equal(
             hex(thinq.outbox[0]),
@@ -645,6 +678,7 @@ describe(MODEL_ID, () => {
 
         thinq.resetRecorder()
         ha.setProperty(DEVICE_ID, 'humidity_display', 'command', 'always')
+        flushWrites(t)
         assert.equal(hex(thinq.outbox[0]), APP_PRIV_WRITE_HUMIDITY_DISPLAY_ALWAYS_HEX.toUpperCase())
 
         /* and the entity only moves when the appliance says so */
@@ -691,33 +725,45 @@ describe(MODEL_ID, () => {
         const { ha, thinq } = readyDevice(t)
 
         ha.setProperty(DEVICE_ID, 'tanklight', 'command', 'ON')
+
+        flushWrites(t)
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x21e, l: 0, v: 1 }])
         ha.setProperty(DEVICE_ID, 'tanklight', 'command', 'OFF')
+        flushWrites(t)
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x21e, l: 0, v: 0 }])
 
         /* HA sends a percentage; the appliance wants 100 + percent */
         ha.setProperty(DEVICE_ID, 'tanklight', 'brightness_command', '60')
+        flushWrites(t)
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x185, l: 1, v: 160 }])
 
         /* anything in between snaps to the app's 20 % step */
         ha.setProperty(DEVICE_ID, 'tanklight', 'brightness_command', '55')
+        flushWrites(t)
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x185, l: 1, v: 160 }])
         ha.setProperty(DEVICE_ID, 'tanklight', 'brightness_command', '71')
+        flushWrites(t)
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x185, l: 1, v: 180 }])
         ha.setProperty(DEVICE_ID, 'tanklight', 'brightness_command', '250')
+        flushWrites(t)
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x185, l: 1, v: 200 }], 'clamped to 100 %')
 
         /* 0 % is not a brightness the appliance has - it means "off" */
         ha.setProperty(DEVICE_ID, 'tanklight', 'brightness_command', '0')
+        flushWrites(t)
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x21e, l: 0, v: 0 }], 'switches the light off')
         ha.setProperty(DEVICE_ID, 'tanklight', 'brightness_command', '9')
+        flushWrites(t)
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x21e, l: 0, v: 0 }], 'rounds down to off')
 
         ha.setProperty(DEVICE_ID, 'tanklight', 'effect_command', 'lavender')
+
+        flushWrites(t)
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x3e0, l: 0, v: 4 }])
 
         thinq.resetRecorder()
         ha.setProperty(DEVICE_ID, 'tanklight', 'effect_command', 'chartreuse')
+        flushWrites(t)
         assert.equal(thinq.outbox.length, 0, 'a colour this appliance has no value for is not sent')
     })
 
@@ -734,16 +780,20 @@ describe(MODEL_ID, () => {
 
         /* writing: an exact preset goes through as itself */
         ha.setProperty(DEVICE_ID, 'tanklight', 'rgb_command', '255,255,255')
+        flushWrites(t)
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x3e0, l: 0, v: 0 }], 'white')
 
         /* and anything else snaps to the nearest of the eight the appliance has */
         ha.setProperty(DEVICE_ID, 'tanklight', 'rgb_command', '255,190,240')
+        flushWrites(t)
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x3e0, l: 0, v: 7 }], 'nearest is magenta pink')
         ha.setProperty(DEVICE_ID, 'tanklight', 'rgb_command', '180,235,250')
+        flushWrites(t)
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x3e0, l: 0, v: 5 }], 'nearest is sky')
 
         thinq.resetRecorder()
         ha.setProperty(DEVICE_ID, 'tanklight', 'rgb_command', 'not,a,colour')
+        flushWrites(t)
         assert.equal(thinq.outbox.length, 0, 'an unparsable RGB is dropped')
     })
 
@@ -758,9 +808,13 @@ describe(MODEL_ID, () => {
         thinq.resetRecorder()
 
         ha.setProperty(DEVICE_ID, 'tanklight', 'command', 'ON')
+
+        flushWrites(t)
         assert.equal(thinq.outbox.length, 0, 'nothing sent - the appliance is already on')
 
         ha.setProperty(DEVICE_ID, 'tanklight', 'brightness_command', '40')
+
+        flushWrites(t)
         assert.equal(thinq.outbox.length, 1, 'the brightness itself still goes')
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x185, l: 1, v: 140 }])
 
@@ -768,7 +822,42 @@ describe(MODEL_ID, () => {
         thinq.emit('data', buf(STATE_TANKLIGHT_OFF_HEX))
         thinq.resetRecorder()
         ha.setProperty(DEVICE_ID, 'tanklight', 'command', 'ON')
+        flushWrites(t)
         assert.deepEqual(lastSentTLV(thinq), [{ t: 0x21e, l: 0, v: 1 }])
+    })
+
+    test('a burst of writes goes out as one frame', (t) => {
+        const { ha, thinq } = readyDevice(t)
+        thinq.emit('data', buf(STATE_TANKLIGHT_OFF_HEX))
+        thinq.resetRecorder()
+
+        /* what HA sends for one "turn the light on at 40 %" - two publishes, same instant */
+        ha.setProperty(DEVICE_ID, 'tanklight', 'command', 'ON')
+        ha.setProperty(DEVICE_ID, 'tanklight', 'brightness_command', '40')
+        assert.equal(thinq.outbox.length, 0, 'nothing has gone out yet')
+
+        flushWrites(t)
+        assert.equal(thinq.outbox.length, 1, 'one frame, so the appliance chimes once')
+        assert.deepEqual(lastSentTLV(thinq), [
+            { t: 0x21e, l: 0, v: 1 },
+            { t: 0x185, l: 1, v: 140 },
+        ])
+
+        /* a later write is simply the next frame */
+        thinq.resetRecorder()
+        ha.setProperty(DEVICE_ID, 'tanklight', 'effect_command', 'sky')
+        flushWrites(t)
+        assert.deepEqual(lastSentTLV(thinq), [{ t: 0x3e0, l: 0, v: 5 }])
+    })
+
+    test('a tag written twice in one window keeps the last value', (t) => {
+        const { ha, thinq } = readyDevice(t)
+
+        ha.setProperty(DEVICE_ID, 'fanspeed', 'command', 'low')
+        ha.setProperty(DEVICE_ID, 'fanspeed', 'command', 'turbo')
+        flushWrites(t)
+        assert.equal(thinq.outbox.length, 1)
+        assert.deepEqual(lastSentTLV(thinq), [{ t: 0x1fa, l: 0, v: 7 }])
     })
 
     test('a brightness at or below the offset publishes nothing', (t) => {

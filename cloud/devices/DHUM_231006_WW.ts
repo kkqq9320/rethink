@@ -206,6 +206,21 @@ const TANK_LIGHT_BRIGHTNESS_OFFSET = 100
 const TANK_LIGHT_BRIGHTNESS_STEP = 20
 
 /*
+ * How long a write waits for company before it goes out, in ms.
+ *
+ * HA's MQTT light publishes a light command as an ON plus its attributes - separate topics,
+ * separate writes, arriving inside the same tenth of a second - and this appliance chimes at
+ * every frame it accepts. Six light actions in one capture produced twelve frames and the
+ * owner heard "띵디딩" where the LG app chimes once.
+ *
+ * MEASURED FIRST, then implemented: a single frame carrying 0x3e0 and 0x185 together was
+ * injected into the live appliance and answered with ONE ack and ONE state frame carrying
+ * both changes. So the burst is collected and sent as one frame. Anything arriving later than
+ * this window is simply the next frame.
+ */
+const WRITE_COALESCE_MS = 150
+
+/*
  * 집중건조 (focused dry, 0x1f9 = 20) runs the appliance its own way: while it is selected the
  * app offers no fan speed, no airflow aim and no target humidity (owner, 2026-07-31).
  *
@@ -879,6 +894,42 @@ export default class Device extends TLVDevice {
      * So 00 ff is the prefix of the READ leg. Sending a write under it was never observed and
      * is not assumed to work.
      */
+    /* TLVs waiting to go out as one frame - see WRITE_COALESCE_MS. */
+    pendingWrite: TLV.TLV[] = []
+    writeFlushTimer: ReturnType<typeof setTimeout> | undefined
+
+    /*
+     * Only WRITES are collected: the header the base class uses for its capability and values
+     * queries is different, and those must not be delayed or merged into anything. A tag
+     * written twice inside one window keeps the last value, which is what the sender meant.
+     */
+    send(header: number[], tlv: TLV.TLV[]) {
+        const isWrite = header[2] === 2 && header[3] === 1 && header[4] === 1
+        if (!isWrite) return super.send(header, tlv)
+
+        for (const entry of tlv) {
+            const existing = this.pendingWrite.findIndex((p) => p.t === entry.t)
+            if (existing >= 0) this.pendingWrite[existing] = entry
+            else this.pendingWrite.push(entry)
+        }
+
+        if (this.writeFlushTimer !== undefined) return
+        this.writeFlushTimer = setTimeout(() => {
+            this.writeFlushTimer = undefined
+            const batch = this.pendingWrite
+            this.pendingWrite = []
+            if (batch.length) super.send([1, 1, 2, 1, 1], batch)
+        }, WRITE_COALESCE_MS)
+    }
+
+    drop() {
+        if (this.writeFlushTimer !== undefined) {
+            clearTimeout(this.writeFlushTimer)
+            this.writeFlushTimer = undefined
+        }
+        super.drop()
+    }
+
     /* Used when a brightness of 0 arrives: HA means "off", and the appliance has a tag for it. */
     setTankLightPower(on: boolean) {
         this.raw_clip_state[0x21e] = on ? 1 : 0
