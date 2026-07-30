@@ -4,6 +4,7 @@ import { ComponentInfo, DeviceDiscovery, type Connection } from '../homeassistan
 import { type Metadata } from '../thinq'
 import { allowExtendedType } from '@/util/casting'
 import * as TLV from '@/util/tlv'
+import crc16 from '@/util/crc16'
 import HADevice from './base'
 
 /**
@@ -30,8 +31,8 @@ import HADevice from './base'
  *   0x232 / 0x233   move together, seen 861/1, 0/12, 0/24, 0/28, 24/19. PAC_910604_WW
  *                   leaves the same pair unmapped.
  *   0x173 = 5641235, 0x174 = 1376511   constant over the whole session, 3-byte counters
- *   0x185 = 120, 0x3b9 = 4, 0x3ec, 0x350, 0x374, 0x2af   constant
- *   0x21c, 0x226, 0x324, 0x21e, 0x33a, 0x2ac, 0x186, 0x3e0, 0x3ea   zero throughout
+ *   0x3b9 = 4, 0x3ec, 0x350, 0x374, 0x2af   constant
+ *   0x21c, 0x226, 0x324, 0x33a, 0x2ac, 0x186, 0x3ea   zero throughout
  *   0x360           tracks 0x1f7 exactly in both observed power transitions (1 while on,
  *                   0 while off). Two observations cannot separate "second power flag" from
  *                   "something that merely agreed twice", so it publishes nothing.
@@ -47,6 +48,11 @@ import HADevice from './base'
  *                   share this appliance's envelope but their payloads are NOT TLV - parsing
  *                   them as TLV yields nonsense (tag 0x0 repeated, values of 16777215).
  *                   processData() below does not accept them.
+ *
+ * Three tags LEFT that list on 2026-07-31 and are now the water tank's light: 0x21e, 0x3e0
+ * and 0x185 sat at 0, 0 and 120 for an entire session purely because nobody had touched the
+ * light. "Constant" and "unused" are not the same thing - worth remembering about the rest
+ * of the list above.
  */
 
 /* HA's MQTT humidifier: on/off + target humidity + a mode list. */
@@ -134,8 +140,45 @@ const AUTO_DRY: Array<[number, string]> = [
     [253, 'smart'],
 ]
 
-/* Panel humidity display, TLV 0x337. Read-only, see the sensor's comment. */
+/* Panel humidity display, TLV 0x337 - written over the private channel, see the select. */
 const HUMIDITY_DISPLAY = ['while running', 'always']
+/*
+ * The private command behind it, measured on this appliance (2026-07-31): the app sends
+ * cmd 0x0c, cmd_sub 0x01, with a 4-byte big-endian payload of 0 or 1, the appliance ACKs
+ * (0x87/0xfd/0x10 carrying 0xfe 0x0c), and only then reports the new 0x337 in a state frame.
+ * PAC_910604_WW documents the identical command from its own capture.
+ */
+const HUMIDITY_DISPLAY_PRIV_CMD = 0x0c
+const HUMIDITY_DISPLAY_PRIV_SUB = 0x01
+
+/*
+ * The water tank's light, swept by the owner one step at a time (2026-07-31). Three separate
+ * tags, all three of which this profile previously carried in its "constant, unlabelled" list:
+ *
+ *   0x21e  on/off        0 / 1
+ *   0x3e0  colour        0..7, in the order the app lists them
+ *   0x185  brightness    RAW = 100 + percent: 120, 140, 160, 180, 200 for 20/40/60/80/100 %
+ *
+ * The colour names are the app's own (화이트 / 마린블루 / 론그린 / 셀먼핑크 / 라벤더 / 스카이 /
+ * 썬라이트 / 마젠타핑크). 0 = white is not from a write - the appliance was already reporting
+ * 0x3e0 = 0 while the light showed white before the sweep touched the colour at all.
+ *
+ * Published as an HA light with the colours as its effect list, which is the honest shape:
+ * these are eight named presets, not an RGB space, and an RGB entity would accept colours the
+ * appliance cannot produce.
+ */
+const TANK_LIGHT_COLOURS = [
+    'white',
+    'marine blue',
+    'lawn green',
+    'salmon pink',
+    'lavender',
+    'sky',
+    'sunlight',
+    'magenta pink',
+]
+/* HA brightness is published on a 1..100 scale; the appliance stores it offset by this. */
+const TANK_LIGHT_BRIGHTNESS_OFFSET = 100
 
 /*
  * 집중건조 (focused dry, 0x1f9 = 20) drives the fan itself: while it is selected the app
@@ -174,6 +217,15 @@ type SwitchOptions = {
     /* raw TLV value written for 'OFF' (default 0) */
     offValue?: number
     entityCategory?: string
+}
+
+type SelectOptions = {
+    entityCategory?: string
+    /*
+     * Runs instead of the default TLV write when it returns false - which is how the one
+     * setting that is written over the private channel is handled. See the humidity display.
+     */
+    writeCallback?: FieldDefinition['write_callback']
 }
 
 /*
@@ -427,30 +479,80 @@ export default class Device extends TLVDevice {
          * Whether the appliance's own panel shows the humidity all the time or only while
          * running (습도 센서: 항상 표시 / 운전중에만 표시), TLV 0x337.
          *
-         * READ-ONLY, and a sensor rather than a select because HA's MQTT select requires a
-         * command topic. Every other writable tag in this profile has a captured app TLV
-         * write behind it; this one has none. The app changes it over the other channel - two
-         * 0x65/0xfd frames went out 2 s before each 0x337 echo - and this profile has no
-         * write path there. PAC_910604_WW found that a TLV write of 0x337 does take effect on
-         * that appliance, so a probe could promote this to a select; it has not been tried
-         * here, and an untried write is not a feature.
+         * WRITABLE, but NOT with a TLV write: this tag has no TLV write anywhere in any
+         * capture. The app changes it over the private command channel, and the owner
+         * reproduced both directions while recording so the exact frames are on file - see
+         * HUMIDITY_DISPLAY_PRIV_CMD. The write callback below therefore sends the private
+         * command and returns false, which stops TLVDevice from also sending a TLV write that
+         * was never observed working. The appliance's own 0x337 state frame is what updates
+         * the entity, so nothing here fakes the new value either.
          */
-        this.addSensorField(
-            config,
-            0x337,
-            'humidity_display',
-            'Panel humidity display',
-            'mdi:eye',
-            { entity_category: 'diagnostic' },
-            (raw) => HUMIDITY_DISPLAY[raw],
-        )
+        this.addSelectField(config, 0x337, 'humidity_display', 'Panel humidity display', 'mdi:eye', HUMIDITY_DISPLAY, {
+            entityCategory: 'diagnostic',
+            writeCallback: (val) => {
+                this.sendPrivWrite(HUMIDITY_DISPLAY_PRIV_CMD, HUMIDITY_DISPLAY_PRIV_SUB, Buffer.from([0, 0, 0, val]))
+                /* false: the private command IS the write - do not follow it with a TLV one */
+                return false
+            },
+        })
 
         /*
-         * NOT HERE YET: the water tank. A dehumidifier's most useful binary sensor is "tank
-         * full", and no tag for it has been identified - the tank was never pulled or filled
-         * while frames were being recorded, and inferring it from a tag that happened to be 0
-         * is exactly the mistake this project keeps re-learning. Pull the tank with a capture
-         * running and it will be one frame.
+         * The water tank's light - on/off, brightness and eight named colours. See
+         * TANK_LIGHT_COLOURS for how each value was established.
+         *
+         * entity_category 'config' at the owner's request: it is a preference about the
+         * appliance rather than an everyday control.
+         */
+        config.components['tanklight'] = {
+            platform: 'light',
+            unique_id: '$deviceid-tanklight',
+            name: 'Tank light',
+            icon: 'mdi:lightbulb',
+            entity_category: 'config',
+            brightness_scale: 100,
+            effect_list: TANK_LIGHT_COLOURS,
+        } as ComponentInfo
+
+        this.addField(config, {
+            id: 0x21e,
+            name: '',
+            comp: 'tanklight',
+            write_xform: (val) => (val === 'ON' ? 1 : 0),
+            read_xform: (raw) => (raw ? 'ON' : 'OFF'),
+        })
+
+        this.addField(config, {
+            id: 0x185,
+            name: 'brightness',
+            comp: 'tanklight',
+            write_xform: (val) => Number(val) + TANK_LIGHT_BRIGHTNESS_OFFSET,
+            /*
+             * Only 120..200 in steps of 20 were ever seen, and the offset makes anything at or
+             * below it meaningless as a percentage, so such a reading is discarded rather than
+             * published as 0 %. Nothing rounds a write to the app's 20 % steps: if the
+             * appliance refuses an in-between value its next state frame says so, and rounding
+             * would hide that.
+             */
+            read_xform: (raw) => (raw > TANK_LIGHT_BRIGHTNESS_OFFSET ? raw - TANK_LIGHT_BRIGHTNESS_OFFSET : undefined),
+        })
+
+        this.addField(config, {
+            id: 0x3e0,
+            name: 'effect',
+            comp: 'tanklight',
+            read_xform: (raw) => TANK_LIGHT_COLOURS[raw],
+            write_xform: (val) => {
+                const index = TANK_LIGHT_COLOURS.indexOf(val)
+                return index < 0 ? null : index
+            },
+        })
+
+        /*
+         * STILL NOT HERE: whether the tank is full or removed. Pulling the tank out of a
+         * running appliance for four minutes produced no state frame at all, no sound and no
+         * panel indication (2026-07-31, dehum-watertank-20260730.jsonl), so there is nothing
+         * to map yet. The next thing to try is a tank filled to its line, which trips the
+         * float switch the appliance does react to.
          */
 
         /*
@@ -608,7 +710,7 @@ export default class Device extends TLVDevice {
         desc: string,
         icon: string,
         options: string[],
-        selectOptions: { entityCategory?: string } = {},
+        selectOptions: SelectOptions = {},
         rawBase: number = 0,
     ) {
         config['components'][name] = {
@@ -631,7 +733,34 @@ export default class Device extends TLVDevice {
                 if (index < 0) return null
                 return index + rawBase
             },
+            write_callback: selectOptions.writeCallback,
         })
+    }
+
+    /*
+     * A private-channel write, for the one setting that has no TLV write.
+     *
+     * TLVDevice.sendPrivCommand() is not used because its first two bytes are hardcoded to
+     * 00 ff, and that is not what the app sends for a WRITE. Measured on this appliance, all
+     * four legs of one setting change:
+     *
+     *   01 02 ... 65 fd 01 | 0005 | 0c 00000000    the write        <- what this method sends
+     *   02 02 ... 87 fd 10 | 0005 | fe 0c 000000   the ACK
+     *   00 ff ... 65 fd 02 | 0005 | 0c 00000000    a read-back the app then does
+     *   02 ff ... 65 fd 03 | 0005 | 0c 00000000    its answer
+     *
+     * So 00 ff is the prefix of the READ leg. Sending a write under it was never observed and
+     * is not assumed to work.
+     */
+    sendPrivWrite(cmd: number, cmd_sub: number, data: Buffer) {
+        const length = data.length + 1
+        let buf = Buffer.concat([
+            Buffer.from([0x01, 0x02, 0x04, 0x00, 0x00, 0x00, 0x65, 0xfd, cmd_sub, length >> 8, length & 0xff, cmd]),
+            data,
+        ])
+        const crc = crc16(buf.subarray(2))
+        buf = Buffer.concat([buf, Buffer.from([crc >> 8, crc & 0xff])])
+        this.thinq.send_packet(buf)
     }
 
     /*
@@ -646,7 +775,7 @@ export default class Device extends TLVDevice {
         desc: string,
         icon: string,
         map: Array<[number, string]>,
-        selectOptions: { entityCategory?: string } = {},
+        selectOptions: SelectOptions = {},
     ) {
         config['components'][name] = {
             platform: 'select',

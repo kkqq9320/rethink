@@ -118,6 +118,24 @@ const STATE_DISPLAY_ON_HEX = '000004000000a70204ba0287c02313'
 const STATE_HUMIDITY_DISPLAY_RUNNING_HEX = '000004000000a70204bd02cdc09039'
 const STATE_HUMIDITY_DISPLAY_ALWAYS_HEX = '000004000000a70204bf02cdc16d70'
 
+/*
+ * The two private-channel writes the LG app sent for that setting, captured byte for byte
+ * (2026-07-31): cmd 0x0c, cmd_sub 0x01, 4-byte payload. sendPrivWrite() has to reproduce
+ * these exactly - including the 01 02 prefix, which is NOT the 00 ff that
+ * TLVDevice.sendPrivCommand() hardcodes.
+ */
+const APP_PRIV_WRITE_HUMIDITY_DISPLAY_RUNNING_HEX = '01020400000065fd0100050c00000000b161'
+const APP_PRIV_WRITE_HUMIDITY_DISPLAY_ALWAYS_HEX = '01020400000065fd0100050c00000001a140'
+
+/* 물통 조명: 켬 / 끔 (0x21e), 색상 0x3e0 = 1 마린블루 .. 7 마젠타핑크, 밝기 0x185 */
+const STATE_TANKLIGHT_ON_HEX = '000004000000a70204f70287812cec'
+const STATE_TANKLIGHT_OFF_HEX = '000004000000a702040c028780bd9f'
+const STATE_TANKLIGHT_COLOUR_MARINE_HEX = '000004000000a70204f902f8010759'
+const STATE_TANKLIGHT_COLOUR_MAGENTA_HEX = '000004000000a702040402f807c154'
+/* 40 % and 100 %: the appliance stores 100 + percent */
+const STATE_TANKLIGHT_BRIGHT_40_HEX = '000004000000a70204050361508c600c'
+const STATE_TANKLIGHT_BRIGHT_100_HEX = '000004000000a702040a036150c80db5'
+
 /* 예약 1시간 -> the appliance echoes 59, already counting down. And 6 시간 -> 359. */
 const STATE_TIMER_59_HEX = '000004000000a702040a0386d03becf0'
 const STATE_TIMER_359_HEX = '000004000000a70204110a86e001678c90188cd0131f0b'
@@ -238,10 +256,15 @@ describe(MODEL_ID, () => {
         assert.ok(!components.humidity?.entity_category, 'humidity is not diagnostic')
         assert.equal(components.humidity?.state_topic, components.humidifier.current_humidity_topic)
 
-        for (const name of ['autodry_remaining', 'error', 'humidity_display']) {
+        for (const name of ['autodry_remaining', 'error']) {
             assert.equal(components[name]?.platform, 'sensor', `${name} sensor`)
             assert.equal(components[name]?.entity_category, 'diagnostic', `${name} is diagnostic`)
         }
+
+        /* writable, but over the private channel - see the write test */
+        assert.equal(components.humidity_display?.platform, 'select')
+        assert.equal(components.humidity_display?.entity_category, 'diagnostic')
+        assert.deepEqual(components.humidity_display?.options, ['while running', 'always'])
 
         /* a room reading, so it belongs beside the humidity under "Sensors" */
         assert.equal(components.temperature?.platform, 'sensor')
@@ -557,12 +580,90 @@ describe(MODEL_ID, () => {
         assert.equal(thinq.outbox.length, 0, 'nothing sent for a label this appliance has no value for')
     })
 
-    test('the panel humidity display is read-only', (t) => {
-        const { ha } = readyDevice(t)
+    test('the panel humidity display is written over the private channel, not with a TLV', (t) => {
+        const { ha, thinq } = readyDevice(t)
+
+        ha.setProperty(DEVICE_ID, 'humidity_display', 'command', 'while running')
+        assert.equal(thinq.outbox.length, 1, 'exactly one frame - no TLV write follows the private one')
+        assert.equal(
+            hex(thinq.outbox[0]),
+            APP_PRIV_WRITE_HUMIDITY_DISPLAY_RUNNING_HEX.toUpperCase(),
+            'byte-for-byte the frame the LG app sent',
+        )
+
+        thinq.resetRecorder()
+        ha.setProperty(DEVICE_ID, 'humidity_display', 'command', 'always')
+        assert.equal(hex(thinq.outbox[0]), APP_PRIV_WRITE_HUMIDITY_DISPLAY_ALWAYS_HEX.toUpperCase())
+
+        /* and the entity only moves when the appliance says so */
+        thinq.emit('data', buf(STATE_HUMIDITY_DISPLAY_RUNNING_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'humidity_display', 'state'), 'while running')
+    })
+
+    test('the tank light reads on/off, brightness and colour', (t) => {
+        const { ha, thinq } = readyDevice(t)
         const components = ha.devices[DEVICE_ID].config!.components as Record<string, Record<string, unknown>>
 
-        /* the app changes it over the other channel; a TLV write of 0x337 is unattested here */
-        assert.ok(!components.humidity_display.command_topic, 'no command topic')
+        assert.equal(components.tanklight?.platform, 'light')
+        assert.equal(components.tanklight?.entity_category, 'config')
+        assert.equal(components.tanklight?.brightness_scale, 100)
+        assert.deepEqual(components.tanklight?.effect_list, [
+            'white',
+            'marine blue',
+            'lawn green',
+            'salmon pink',
+            'lavender',
+            'sky',
+            'sunlight',
+            'magenta pink',
+        ])
+
+        thinq.emit('data', buf(STATE_TANKLIGHT_ON_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'tanklight', 'state'), 'ON')
+        thinq.emit('data', buf(STATE_TANKLIGHT_OFF_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'tanklight', 'state'), 'OFF')
+
+        thinq.emit('data', buf(STATE_TANKLIGHT_COLOUR_MARINE_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'tanklight', 'effect_state'), 'marine blue')
+        thinq.emit('data', buf(STATE_TANKLIGHT_COLOUR_MAGENTA_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'tanklight', 'effect_state'), 'magenta pink')
+
+        /* raw 140 is 40 %, raw 200 is 100 % */
+        thinq.emit('data', buf(STATE_TANKLIGHT_BRIGHT_40_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'tanklight', 'brightness_state'), 40)
+        thinq.emit('data', buf(STATE_TANKLIGHT_BRIGHT_100_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'tanklight', 'brightness_state'), 100)
+    })
+
+    test('the tank light writes on/off, brightness and colour', (t) => {
+        const { ha, thinq } = readyDevice(t)
+
+        ha.setProperty(DEVICE_ID, 'tanklight', 'command', 'ON')
+        assert.deepEqual(lastSentTLV(thinq), [{ t: 0x21e, l: 0, v: 1 }])
+        ha.setProperty(DEVICE_ID, 'tanklight', 'command', 'OFF')
+        assert.deepEqual(lastSentTLV(thinq), [{ t: 0x21e, l: 0, v: 0 }])
+
+        /* HA sends a percentage; the appliance wants 100 + percent */
+        ha.setProperty(DEVICE_ID, 'tanklight', 'brightness_command', '60')
+        assert.deepEqual(lastSentTLV(thinq), [{ t: 0x185, l: 1, v: 160 }])
+
+        ha.setProperty(DEVICE_ID, 'tanklight', 'effect_command', 'lavender')
+        assert.deepEqual(lastSentTLV(thinq), [{ t: 0x3e0, l: 0, v: 4 }])
+
+        thinq.resetRecorder()
+        ha.setProperty(DEVICE_ID, 'tanklight', 'effect_command', 'chartreuse')
+        assert.equal(thinq.outbox.length, 0, 'a colour this appliance has no value for is not sent')
+    })
+
+    test('a brightness at or below the offset publishes nothing', (t) => {
+        const { ha, thinq } = readyDevice(t)
+
+        thinq.emit('data', buf(STATE_TANKLIGHT_BRIGHT_40_HEX))
+        assert.equal(ha.getProperty(DEVICE_ID, 'tanklight', 'brightness_state'), 40)
+
+        /* SYNTHETIC: raw 100 would be 0 %, which no capture contains and HA cannot use */
+        thinq.emit('data', buf(synthState([{ t: 0x185, v: 100 }])))
+        assert.equal(ha.getProperty(DEVICE_ID, 'tanklight', 'brightness_state'), 40, 'unchanged')
     })
 
     test('frames that are not TLV are ignored', (t) => {
