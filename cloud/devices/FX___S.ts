@@ -81,16 +81,25 @@ const OFF_FLAGS = 36
 const OFF_STEAM = 34
 const STEAM_ON = 0x10
 
-// Bit 0x10 of the flags byte is set from the moment a cycle starts and stays set at PHASE_DONE, only
-// clearing at power off - it means "a cycle is loaded", not "a cycle is running". Deriving either the
-// running sensor or the option guard from it was a mistake caught on the appliance: it left "Running"
-// on for a finished wash and the selects unpublished for as long as the washer sat on Complete. The
-// phase is the authority for both; only the drum bit is read out of this byte.
-//
+// Bit 0x10 was originally read as "a cycle is loaded", because it was set for the whole of a wash and
+// stayed set after it finished. It is remote control: the owner had switched remote control on in order
+// to start that wash from the app, and left it on. Toggling it by hand on the panel moves this bit and
+// nothing else, and the door lock follows a few seconds later.
+const FLAG_REMOTE_CONTROL = 0x10
+const FLAG_CHILD_LOCK = 0x20
 // Set only while the drum is actually turning. It clears on pause, but it ALSO clears and re-sets on its
 // own mid-cycle (measured twice, with no command in between and the remaining time still counting down),
 // so it must not be used to mean "paused" - that is PHASE_PAUSED and nothing else.
 const FLAG_DRUM_ACTIVE = 0x80
+
+// One byte each, found by toggling them on the panel one at a time with a pause in between - the run
+// that finally separated them from each other after an earlier attempt did all of it inside 20 seconds
+// and left five interleaved signals that could not be told apart.
+const OFF_DOOR_LOCK = 37 // whole byte: 1 while locked. Follows remote control on its own.
+const OFF_WRINKLE_CARE = 35
+const WRINKLE_CARE_ON = 0x80
+const OFF_TURBOSHOT = 33
+const TURBOSHOT_ON = 0x20
 
 const PHASE_OFF = 0
 const PHASE_STANDBY = 1
@@ -297,6 +306,34 @@ export default class Device extends AABBDevice {
                         state_topic: '$this/running',
                         name: 'Running',
                         device_class: 'running',
+                    },
+                    remote_control: {
+                        platform: 'binary_sensor',
+                        unique_id: '$deviceid-remote-control',
+                        state_topic: '$this/remote_control',
+                        name: 'Remote control',
+                        icon: 'mdi:cellphone-wireless',
+                    },
+                    door_lock: {
+                        platform: 'binary_sensor',
+                        unique_id: '$deviceid-door-lock',
+                        state_topic: '$this/door_lock',
+                        name: 'Door lock',
+                        device_class: 'lock',
+                    },
+                    child_lock: {
+                        platform: 'binary_sensor',
+                        unique_id: '$deviceid-child-lock',
+                        state_topic: '$this/child_lock',
+                        name: 'Child lock',
+                        icon: 'mdi:account-lock',
+                    },
+                    wrinkle_care: {
+                        platform: 'binary_sensor',
+                        unique_id: '$deviceid-wrinkle-care',
+                        state_topic: '$this/wrinkle_care',
+                        name: 'Wrinkle care',
+                        icon: 'mdi:tshirt-crew',
                     },
                     drum_active: {
                         platform: 'binary_sensor',
@@ -522,6 +559,12 @@ export default class Device extends AABBDevice {
         this.publishProperty('status_code', phase)
         this.publishProperty('running', ACTIVE_PHASES.has(phase) ? 'ON' : 'OFF')
         this.publishProperty('drum_active', flags & FLAG_DRUM_ACTIVE ? 'ON' : 'OFF')
+        this.publishProperty('remote_control', flags & FLAG_REMOTE_CONTROL ? 'ON' : 'OFF')
+        this.publishProperty('child_lock', flags & FLAG_CHILD_LOCK ? 'ON' : 'OFF')
+        // device_class 'lock' is inverted by Home Assistant's convention: on means unlocked.
+        this.publishProperty('door_lock', rec[OFF_DOOR_LOCK] ? 'OFF' : 'ON')
+        this.publishProperty('wrinkle_care', rec[OFF_WRINKLE_CARE] & WRINKLE_CARE_ON ? 'ON' : 'OFF')
+        this.publishProperty('turbowash', rec[OFF_TURBOSHOT] & TURBOSHOT_ON ? 'ON' : 'OFF')
         this.publishProperty('cycles', rec[OFF_CYCLES])
         this.publishProperty('beep', BEEP[rec[OFF_BEEP]] ?? 'unknown')
         this.publishProperty('steam', rec[OFF_STEAM] & STEAM_ON ? 'ON' : 'OFF')

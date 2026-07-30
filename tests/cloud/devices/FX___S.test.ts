@@ -63,6 +63,12 @@ const RECONNECT_SNAPSHOT = buf(
     'aaff200a0055008e8e000100eb00430000000004370000000000000000020019001e00370e0c1105000000100400000000000000900100340000000000000400000000000000000000000000000018000000ac12bb',
 )
 
+// Remote control switched on from the panel, with the door lock that follows it a few seconds later.
+// Captured 09:53:48, three seconds after the toggle.
+const REMOTE_CONTROL_ON = buf(
+    'aaff200a00980094f8000100ec008600030302067200000000000000002400240032007201001b0000000210040000000020000010000034000000000000040000000000000000000000000000001800000000030302067200000000000000002400240032007201001b000000021004000000002000001001003400000000000004000000000000000000000000000000180000009852bb',
+)
+
 function setup() {
     const HA = new MockHAConnection()
     const thinq = new MockThinq2Device(DEVICE_ID, META)
@@ -236,6 +242,21 @@ describe('FX___S washer', () => {
         const attrs = JSON.parse(String(get(HA, 'available_options_attrs')))
         assert.equal(attrs.wash, null)
         assert.equal(attrs.water_temp, null)
+    })
+
+    test('decodes remote control, the door lock that follows it, and TurboShot', () => {
+        const { HA, thinq } = setup()
+        feed(thinq, REMOTE_CONTROL_ON)
+
+        assert.equal(get(HA, 'remote_control'), 'ON')
+        // Nothing was done to the door - switching remote control on locks it a few seconds later.
+        assert.equal(get(HA, 'door_lock'), 'OFF') // device_class lock: off means locked
+        assert.equal(get(HA, 'child_lock'), 'OFF')
+        assert.equal(get(HA, 'wrinkle_care'), 'OFF')
+        assert.equal(get(HA, 'turbowash'), 'ON')
+        // The same bit was read as "a cycle is loaded" before this was isolated on the panel.
+        assert.equal(get(HA, 'status'), 'standby')
+        assert.equal(get(HA, 'running'), 'OFF')
     })
 
     test('ignores frames that are not from the appliance', () => {
