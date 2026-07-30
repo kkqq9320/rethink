@@ -90,13 +90,14 @@ describe('FX___S washer', () => {
         feed(thinq, STANDBY)
 
         assert.equal(get(HA, 'power'), 'ON')
-        assert.equal(get(HA, 'status'), 'Standby')
+        assert.equal(get(HA, 'status'), 'standby')
         assert.equal(get(HA, 'status_code'), 1)
         assert.equal(get(HA, 'running'), 'OFF')
         assert.equal(get(HA, 'remaining_time'), 0) // not a timed phase
         assert.equal(get(HA, 'course'), 'AI Wash')
+        assert.equal(get(HA, 'current_course'), 'AI Wash')
         assert.equal(get(HA, 'wash'), 'Normal')
-        assert.equal(get(HA, 'water_temp'), 'Default')
+        assert.equal(get(HA, 'water_temp'), '40')
         assert.equal(get(HA, 'rinse'), '2')
         assert.equal(get(HA, 'spin'), 'High')
         assert.equal(get(HA, 'beep'), 'Very high')
@@ -108,7 +109,7 @@ describe('FX___S washer', () => {
         const { HA, thinq } = setup()
         feed(thinq, STARTED)
 
-        assert.equal(get(HA, 'status'), 'Starting')
+        assert.equal(get(HA, 'status'), 'starting')
         assert.equal(get(HA, 'status_code'), 3)
         assert.equal(get(HA, 'running'), 'ON')
         assert.equal(get(HA, 'drum_active'), 'ON')
@@ -120,7 +121,7 @@ describe('FX___S washer', () => {
         const { HA, thinq } = setup()
         feed(thinq, RINSING)
 
-        assert.equal(get(HA, 'status'), 'Rinsing')
+        assert.equal(get(HA, 'status'), 'rinsing')
         assert.equal(get(HA, 'status_code'), 12)
         assert.equal(get(HA, 'remaining_time'), 21)
         assert.equal(get(HA, 'total_time'), 28) // re-estimated mid-cycle, down from 36
@@ -135,14 +136,14 @@ describe('FX___S washer', () => {
         // The record's wash/water-temperature bytes have been consumed to 0 by this point; the selects
         // must still show what was selected.
         assert.equal(get(HA, 'wash'), 'Normal')
-        assert.equal(get(HA, 'water_temp'), 'Default')
+        assert.equal(get(HA, 'water_temp'), '40')
     })
 
     test('treats phase 42 as complete and suppresses the stuck 1-minute clock', () => {
         const { HA, thinq } = setup()
         feed(thinq, COMPLETE)
 
-        assert.equal(get(HA, 'status'), 'Complete')
+        assert.equal(get(HA, 'status'), 'complete')
         assert.equal(get(HA, 'status_code'), 42)
         assert.equal(get(HA, 'remaining_time'), 0)
         // The 0x10 flag is still set here, so deriving `running` from it reported a finished wash as
@@ -156,7 +157,7 @@ describe('FX___S washer', () => {
         const { HA, thinq } = setup()
         feed(thinq, RINSE_SPIN_STARTED)
 
-        assert.equal(get(HA, 'status'), 'Rinsing')
+        assert.equal(get(HA, 'status'), 'rinsing')
         assert.equal(get(HA, 'remaining_time'), 25)
         assert.equal(get(HA, 'rinse_remaining'), 1)
     })
@@ -167,7 +168,7 @@ describe('FX___S washer', () => {
         feed(thinq, POWERED_OFF)
 
         assert.equal(get(HA, 'power'), 'OFF')
-        assert.equal(get(HA, 'status'), 'Off')
+        assert.equal(get(HA, 'status'), 'off')
         assert.equal(get(HA, 'running'), 'OFF')
         assert.equal(get(HA, 'total_time'), 0)
         // Powering off clears the phase, the clock and wash/temperature/rinse, but NOT these two -
@@ -186,7 +187,7 @@ describe('FX___S washer', () => {
         const { HA, thinq } = setup()
         feed(thinq, SETTINGS_REPLY_POWER_OFF)
 
-        assert.equal(get(HA, 'status'), 'Off')
+        assert.equal(get(HA, 'status'), 'off')
         assert.equal(get(HA, 'status_code'), 0)
     })
 
@@ -205,7 +206,7 @@ describe('FX___S washer', () => {
         feed(thinq, RECONNECT_SNAPSHOT)
 
         // Without this the entities stay unknown from a restart until the appliance next changes state.
-        assert.equal(get(HA, 'status'), 'Spinning')
+        assert.equal(get(HA, 'status'), 'spinning')
         assert.equal(get(HA, 'status_code'), 14)
         assert.equal(get(HA, 'running'), 'ON')
         assert.equal(get(HA, 'course'), 'Rinse + Spin')

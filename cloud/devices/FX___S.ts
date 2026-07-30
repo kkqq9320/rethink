@@ -39,9 +39,8 @@ import AABBDevice from './aabb_device'
 // frame N is byte-identical to the previous record of frame N+1.
 //
 // SETTINGS REPLY (0xE6). payload = 00 02 01 FF <n> [<key> <status>]*n 00 <record 66B>
-// The per-key status is 0x00 when that key was actually applied and 0x11 when it already held the value.
-// This is how we caught the LG app silently re-sending a stale payload twice and never delivering a
-// water-temperature change the owner believed they had made.
+// The per-key status is 0x00 when that key was actually applied and 0x11 when it already held the value,
+// which is what makes a write verifiable rather than assumed.
 
 const FROM_DEVICE = 0x20
 const MSG_TUNNEL = 0x0a
@@ -83,6 +82,7 @@ const OFF_FLAGS = 36
 // running sensor or the option guard from it was a mistake caught on the appliance: it left "Running"
 // on for a finished wash and the selects unpublished for as long as the washer sat on Complete. The
 // phase is the authority for both; only the drum bit is read out of this byte.
+//
 // Set only while the drum is actually turning. It clears on pause, but it ALSO clears and re-sets on its
 // own mid-cycle (measured twice, with no command in between and the remaining time still counting down),
 // so it must not be used to mean "paused" - that is PHASE_PAUSED and nothing else.
@@ -98,19 +98,19 @@ const PHASE_CARE = 47
 // were each pinned by watching which option byte had just cleared. 3 and 37 were never isolated to a
 // named stage, so they stay generic rather than being guessed into "Sensing"/"Filling".
 const STATUS: Record<number, string> = {
-    [PHASE_OFF]: 'Off',
-    [PHASE_STANDBY]: 'Standby',
-    [PHASE_PAUSED]: 'Paused',
-    3: 'Starting',
-    37: 'Starting',
-    11: 'Washing',
-    40: 'Washing',
-    12: 'Rinsing',
-    14: 'Spinning',
-    [PHASE_DONE]: 'Complete',
-    [PHASE_CARE]: 'Laundry care',
+    [PHASE_OFF]: 'off',
+    [PHASE_STANDBY]: 'standby',
+    [PHASE_PAUSED]: 'paused',
+    3: 'starting',
+    37: 'starting',
+    11: 'washing',
+    40: 'washing',
+    12: 'rinsing',
+    14: 'spinning',
+    [PHASE_DONE]: 'complete',
+    [PHASE_CARE]: 'laundry_care',
 }
-const STATUS_OPTIONS = [...new Set(Object.values(STATUS))].concat('Unknown')
+const STATUS_OPTIONS = [...new Set(Object.values(STATUS))].concat('unknown')
 
 // Remaining/total time only mean anything while a wash is under way. At PHASE_DONE the counter stops at
 // 1 minute rather than reaching 0, and Laundry care leaves the previous cycle's values untouched - both
@@ -154,7 +154,11 @@ const COURSE_EXT: Record<number, string> = {
 }
 
 const WASH: Record<number, string> = { 0x00: 'Off', 0x03: 'Normal', 0x07: 'Soak' }
-const WATER_TEMP: Record<number, string> = { 0x00: 'Off', 0x03: 'Default', 0x05: '40' }
+// Corrected against the appliance's own display by selecting each of these from Home Assistant and
+// reading the panel: 0x03 shows 40 degrees and 0x05 shows 60, not the 40 that the capture session's
+// notes suggested. There is no 30-degree setting on this model. Whether 0x03 is literally "40" or "the
+// course default, which is 40 on AI Wash" is untested - it has only ever been observed on AI Wash.
+const WATER_TEMP: Record<number, string> = { 0x00: 'cool', 0x03: '40', 0x05: '60' }
 const SPIN: Record<number, string> = { 0x04: 'Medium', 0x06: 'High', 0x08: 'Dry fit' }
 const BEEP: Record<number, string> = { 0: 'Mute', 1: 'Low', 2: 'Medium', 3: 'High', 4: 'Very high' }
 // Rinse is the count itself; 1-4 were each written and read back unchanged.
@@ -170,6 +174,9 @@ const BEEP_BY_NAME = invert(BEEP)
 const COURSE_BY_NAME = invert(COURSE)
 
 export default class Device extends AABBDevice {
+    /** Last published remaining minutes, so the finish timestamp is only recomputed when it moves. */
+    lastRemaining: number | undefined
+
     constructor(HA: Connection, thinq: Thinq2Device, meta: Metadata) {
         super(HA, thinq)
         this.setConfig(
@@ -243,6 +250,24 @@ export default class Device extends AABBDevice {
                         state_topic: '$this/rinse_remaining',
                         name: 'Rinses remaining',
                         icon: 'mdi:water-sync',
+                    },
+                    // The select can only ever hold one of the courses we have names for, and this
+                    // washer's dial has many more than the four that have been run. This always shows
+                    // something - the name when we know it, `#114` when we do not - so the course is
+                    // visible even before its number has been identified.
+                    current_course: {
+                        platform: 'sensor',
+                        unique_id: '$deviceid-current-course',
+                        state_topic: '$this/current_course',
+                        name: 'Current course',
+                        icon: 'mdi:playlist-check',
+                    },
+                    end_time: {
+                        platform: 'sensor',
+                        unique_id: '$deviceid-end-time',
+                        state_topic: '$this/end_time',
+                        name: 'Finishes at',
+                        device_class: 'timestamp',
                     },
                     options_raw: {
                         platform: 'sensor',
@@ -415,14 +440,30 @@ export default class Device extends AABBDevice {
         // of a cycle the remaining-minutes byte sticks at 1 rather than reaching 0. The total is the
         // selected course's estimate though, which is worth seeing before pressing start, so it is
         // published whenever the appliance is on.
-        this.publishProperty('remaining_time', TIMED_PHASES.has(phase) ? rec[OFF_REMAIN_H] * 60 + rec[OFF_REMAIN_M] : 0)
+        const remaining = TIMED_PHASES.has(phase) ? rec[OFF_REMAIN_H] * 60 + rec[OFF_REMAIN_M] : 0
+        this.publishProperty('remaining_time', remaining)
+
+        // Recomputed only when the minute count actually moves. Doing it on every frame would push a
+        // slightly different timestamp several times a second and fill the recorder with noise.
+        if (remaining !== this.lastRemaining) {
+            this.lastRemaining = remaining
+            this.publishProperty(
+                'end_time',
+                remaining > 0 ? new Date(Date.now() + remaining * 60_000).toISOString() : 'None',
+            )
+        }
         this.publishProperty('total_time', phase === PHASE_OFF ? 0 : rec[OFF_TOTAL_H] * 60 + rec[OFF_TOTAL_M])
         this.publishProperty('rinse_remaining', rec[OFF_RINSE])
 
         // The course byte is not consumed - it survives the cycle, the finished state and even powering
         // off - so it is always worth publishing.
         const course = rec[OFF_COURSE]
-        this.publishOption('course', course === COURSE_EXTENDED ? COURSE_EXT[rec[OFF_COURSE_EXT]] : COURSE[course])
+        const courseName = course === COURSE_EXTENDED ? COURSE_EXT[rec[OFF_COURSE_EXT]] : COURSE[course]
+        this.publishOption('course', courseName)
+        this.publishProperty(
+            'current_course',
+            courseName ?? `#${course === COURSE_EXTENDED ? rec[OFF_COURSE_EXT] : course}`,
+        )
 
         // The rest are consumed as the appliance works through them and read 0 from the first stage
         // onwards, so they only report the selection while it sits at standby. Anywhere else,
