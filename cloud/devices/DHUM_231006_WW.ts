@@ -97,8 +97,22 @@ const MODES: Array<[number, string]> = [
  *
  * Independently confirmed by the appliance: the capability reply's 0x2c2 = 0x751d4 has bits
  * 2, 4, 6, 7 and 8 set - exactly these five values - which is the same "selectable fan
- * levels" mask the AC profiles use. (The mask's high bits 12, 14, 16, 17, 18 are unexplained
- * here as they are there.)
+ * levels" mask the AC profiles use.
+ *
+ * The high bits are no longer unexplained. LG's model JSON names every bit of that mask
+ * (support.airState.windStrength, see modeljson-findings-20260803.md):
+ *
+ *     2, 4, 6, 7, 8    DHUM_LOW / MID / HIGH / POWER / AUTO      <- these five, published here
+ *     12, 14, 16, 17, 18   SINGLE_LOW / MID / HIGH / POWER / AUTO   <- a second set
+ *
+ * So they are a parallel fan namespace rather than junk, the same shape as PAC_910604_WW's
+ * bits 12-16 turning out to be the five air-clean-mode fan levels. Nothing is published for
+ * the SINGLE set: which mode selects it, and whether 0x1fa even carries those values, is not
+ * known - the mask names them, it does not say how to reach them.
+ *
+ * Bit 8 is genuinely AUTO here, unlike RAC_056905_WW where the same bit position turned out to
+ * be 자연풍 and had been mislabelled auto for exactly that reason. Per-model dictionary, not a
+ * shared one.
  */
 const FAN_SPEEDS: Array<[number, string]> = [
     [2, 'low'],
