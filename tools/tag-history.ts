@@ -14,6 +14,17 @@
 //            been exercised, which is exactly how the dehumidifier's water-tank light hid
 //   VARIES   it moved - the captures already contain the evidence, no appliance needed
 //
+// ONLY TLV-BEARING FRAMES ARE PARSED, and the first version of this tool got that wrong. A device
+// sends several frame families and most are not TLV - the 0xa8 telemetry record is a fixed byte
+// layout, the 0x87/0xfd private channel carries its own format, acks carry nothing. Running
+// TLV.parse over those invents tags. It reported 0x0c8 (defrost) as present six times on
+// DHUM_231006_WW and every one of those hits came from a 0xa8 or a 0xfd frame; the tag has never
+// appeared in a real values dump. A tag reported ABSENT is a much weaker claim than a tag
+// reported CONSTANT, so inventing the latter is the expensive direction to be wrong in.
+//
+// Families are told apart by byte 8 under kind 0x87/0xa7: 0x01 is the capability reply, 0x04 the
+// values dump. Everything else is counted and printed as skipped rather than silently dropped.
+//
 // Usage:
 //   tsx tools/tag-history.ts --tags 0xc8,0x151,0x17c <capture.jsonl> [more.jsonl ...]
 
@@ -36,6 +47,7 @@ if (!files.length) {
 
 type Obs = { file: string; value: number; dir: string }
 const obs = new Map<number, Obs[]>(tags.map((t) => [t, []]))
+const skipped = new Map<string, number>()
 
 for (const file of files) {
     let lines: string[]
@@ -58,6 +70,13 @@ for (const file of files) {
         if (r.k !== 'wire' || !r.hex) continue
         const buf = Buffer.from(r.hex, 'hex')
         if (buf.length < 12) continue
+
+        const family = `kind=0x${buf[6].toString(16)} [7]=0x${buf[7].toString(16)} [8]=0x${buf[8].toString(16)}`
+        if ((buf[6] !== 0x87 && buf[6] !== 0xa7 && buf[6] !== 0x65) || (buf[8] !== 0x01 && buf[8] !== 0x04)) {
+            skipped.set(family, (skipped.get(family) ?? 0) + 1)
+            continue
+        }
+
         let tlv: TLV.TLV[]
         try {
             tlv = TLV.parse(buf.subarray(11, 11 + buf[10]))
@@ -73,7 +92,8 @@ for (const file of files) {
 
 const hex = (t: number) => `0x${t.toString(16).padStart(3, '0')}`
 
-console.log(`scanned ${files.length} capture(s) for ${tags.length} tag(s)\n`)
+console.log(`scanned ${files.length} capture(s) for ${tags.length} tag(s)`)
+console.log(`skipped (not TLV): ${[...skipped.entries()].map(([k, n]) => `${n}x ${k}`).join('  |  ') || 'none'}\n`)
 
 for (const t of tags) {
     const all = obs.get(t)!
