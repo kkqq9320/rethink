@@ -63,7 +63,17 @@ function normalise(line: Line): Line {
     return line.dir === 'toDevice' ? { tx: line.hex } : { rx: line.hex }
 }
 
-function replay(file: string) {
+/*
+ * Some handlers do not build their config synchronously. RAC_056905_WW waits 500 ms after the
+ * values response and then probes the filter over the private channel, giving that up to 5 s
+ * before publishing anything - so a replay that reads HA.devices the instant the last frame is
+ * fed sees nothing at all, for every RAC-family handler, ours and upstream's alike. Feeding the
+ * frames and then letting real timers run for a moment is what makes those profiles replayable.
+ */
+const SETTLE_MS = 6500
+const settle = () => new Promise((resolve) => setTimeout(resolve, SETTLE_MS))
+
+async function replay(file: string) {
     const lines: Line[] = fs
         .readFileSync(file, 'utf8')
         .split('\n')
@@ -94,9 +104,17 @@ function replay(file: string) {
         thinq.emit('data', Buffer.from(line.rx, 'hex'))
     }
 
+    await settle()
+
     const device = HA.devices[ID]
     console.log(`\n=== ${file}`)
     console.log(`    model ${meta.modelId} sw ${meta.swVersion} | ${frames} frames replayed`)
+    if (!device) {
+        console.log(`    NO DISCOVERY CONFIG PUBLISHED after ${SETTLE_MS} ms`)
+        console.log(`    frames the handler sent: ${thinq.outbox.length}`)
+        thinq.outbox.forEach((b) => console.log(`      tx ${b.toString('hex')}`))
+        return
+    }
     console.log(
         `    frames the handler sent: ${thinq.outbox.length}${thinq.outbox.length ? ' <-- NOT a read-only replay' : ''}`,
     )
@@ -115,7 +133,7 @@ function replay(file: string) {
 
 const files = process.argv.slice(2)
 if (!files.length) console.log('usage: tsx tools/replay-capture.ts <capture.jsonl> [more.jsonl ...]')
-for (const file of files) replay(file)
+for (const file of files) await replay(file)
 
 /*
  * A TLVDevice keeps a capability-retry interval and a refresh timer running, which hold the
