@@ -907,98 +907,55 @@ describe(MODEL_ID, () => {
         assert.equal(ha.getProperty(DEVICE_ID, 'tanklight', 'brightness_state'), 40, 'unchanged')
     })
 
-    test('the compressor is read out of the telemetry record', (t) => {
-        const { ha, thinq } = readyDevice(t)
-        const components = ha.devices[DEVICE_ID].config!.components as Record<string, Record<string, unknown>>
-
-        assert.equal(components.compressor?.platform, 'binary_sensor')
-        assert.equal(components.compressor?.device_class, 'running')
-
-        thinq.emit('data', buf(TELEMETRY_COMPRESSOR_ON_HEX))
-        assert.equal(ha.devices[DEVICE_ID].properties['compressor'], 'ON')
-
-        thinq.emit('data', buf(TELEMETRY_COMPRESSOR_OFF_HEX))
-        assert.equal(ha.devices[DEVICE_ID].properties['compressor'], 'OFF')
-    })
-
-    test('the compressor stops claiming to run once the appliance is switched off', (t) => {
-        const { ha, thinq } = readyDevice(t)
-
-        thinq.emit('data', buf(TELEMETRY_COMPRESSOR_ON_HEX))
-        assert.equal(ha.devices[DEVICE_ID].properties['compressor'], 'ON')
-
-        /*
-         * The telemetry record is the ONLY thing that publishes this sensor, and a switched-off
-         * appliance sends none - so without this the sensor keeps saying ON indefinitely. Measured
-         * against a smart plug on the same outlet: 13 h wrong on 2026-08-02 and 11 h wrong on
-         * 08-03, both while the appliance drew 2.7 W standby and the owner confirmed it was off.
-         */
-        thinq.emit('data', buf(STATE_POWER_OFF_HEX))
-        assert.equal(ha.devices[DEVICE_ID].properties['compressor'], 'OFF', 'off appliance, no compressor')
-    })
-
-    test('the raw compressor-group sensors are withdrawn, and withdrawn properly', (t) => {
+    test('the compressor sensor and its raw group are withdrawn, and withdrawn properly', (t) => {
         const { ha, thinq } = readyDevice(t)
         const components = ha.devices[DEVICE_ID].config!.components as Record<string, Record<string, unknown>>
 
         /*
-         * They existed so an external meter could settle whether any of them tracks watts. It
-         * did: @84 is a minute counter that wraps at 256, @87 is @86 in another byte, and the
-         * plug on the appliance's outlet is the power sensor. Nothing here was ever watts.
+         * The @86 decode was never in doubt - a smart plug on the appliance's outlet jumps to
+         * ~90 W in the same minute it goes non-zero. It was withdrawn for LATENCY: the 0xa8
+         * record arrives every five minutes and no TLV tag carries the fact, so the sensor was
+         * up to five minutes behind in both directions and there is no way to ask sooner
+         * without sending a frame the appliance did not invite.
          *
-         * Each key must still be PRESENT and carry `platform` and nothing else - that is what
+         * The four raw bytes went with it, their premise having died first: @84 is a minute
+         * counter that wraps at 256 and @87 is @86 in another byte, so there was nothing there
+         * for an external meter to correlate with.
+         *
+         * Each key must still be PRESENT carrying `platform` and nothing else - that is what
          * device discovery reads as a removal. Dropping the key instead only stops a fresh
          * install creating one and leaves the entities already in a registry live forever.
          */
-        for (const offset of [84, 87, 89, 90]) {
-            const stub = components[`telemetry_${offset}`]
-            assert.ok(stub, `telemetry_${offset} key still published`)
-            assert.deepEqual(Object.keys(stub), ['platform'], `telemetry_${offset} is a bare removal`)
+        for (const [name, platform] of [
+            ['compressor', 'binary_sensor'],
+            ['telemetry_84', 'sensor'],
+            ['telemetry_87', 'sensor'],
+            ['telemetry_89', 'sensor'],
+            ['telemetry_90', 'sensor'],
+        ] as const) {
+            const stub = components[name]
+            assert.ok(stub, `${name} key still published`)
+            assert.deepEqual(Object.keys(stub), ['platform'], `${name} is a bare removal`)
+            assert.equal(stub.platform, platform)
         }
 
+        /* and the record that fed them now publishes nothing at all */
+        const before = { ...ha.devices[DEVICE_ID].properties }
         thinq.emit('data', buf(TELEMETRY_COMPRESSOR_ON_HEX))
-        for (const offset of [84, 87, 89, 90]) {
-            assert.equal(ha.devices[DEVICE_ID].properties[`telemetry_${offset}`], undefined, `@${offset} unpublished`)
-        }
-        /* the compressor itself is unaffected - it was the one reading that survived */
-        assert.equal(ha.devices[DEVICE_ID].properties['compressor'], 'ON')
+        thinq.emit('data', buf(TELEMETRY_COMPRESSOR_OFF_HEX))
+        assert.deepEqual(ha.devices[DEVICE_ID].properties, before, 'the 0xa8 record is inert')
     })
 
-    test('a telemetry record of another subtype is left alone', (t) => {
-        const { ha, thinq } = readyDevice(t)
-
-        thinq.emit('data', buf(TELEMETRY_COMPRESSOR_ON_HEX))
-        assert.equal(ha.devices[DEVICE_ID].properties['compressor'], 'ON')
-
-        /*
-         * A 0x67 subtype carries a different layout, so its byte 86 means something else. It
-         * must not move the sensor.
-         */
-        const other = buf(TELEMETRY_COMPRESSOR_OFF_HEX)
-        other[7] = 0x67
-        thinq.emit('data', other)
-        assert.equal(ha.devices[DEVICE_ID].properties['compressor'], 'ON', 'unchanged')
-    })
-
-    test('frames that are not TLV publish nothing but the compressor', (t) => {
+    test('frames that are not TLV publish nothing', (t) => {
         const { ha, thinq } = readyDevice(t)
         const before = { ...ha.devices[DEVICE_ID].properties }
 
-        /*
-         * Both parse as TLV without throwing and would publish nonsense if that parse were
-         * trusted. The telemetry record contributes exactly one byte, read at a fixed offset.
-         */
+        /* Both parse as TLV without throwing and would publish nonsense if that parse were
+         * trusted - tag 0x0 repeated, values of 16777215. Neither is read. */
         thinq.emit('data', buf(TELEMETRY_A8_HEX))
         thinq.emit('data', buf(PRIVATE_87FD_HEX))
 
-        const after = { ...ha.devices[DEVICE_ID].properties }
-        assert.equal(typeof after['compressor'], 'string', 'the compressor was published')
-        /* the compressor group's raw bytes come from the same record and are expected too */
-        for (const key of ['compressor', 'telemetry_84', 'telemetry_87', 'telemetry_89', 'telemetry_90']) {
-            delete after[key]
-            delete before[key]
-        }
-        assert.deepEqual(after, before, 'nothing else changed')
+        assert.deepEqual(ha.devices[DEVICE_ID].properties, before, 'nothing changed')
     })
 
     test('a state frame marked 0x87 is still accepted', (t) => {

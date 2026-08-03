@@ -47,8 +47,9 @@ import HADevice from './base'
  *   the 0xa8 family (97 bytes, buf[7] = 0x66/0x67) and the 190-byte 0x87/0xfd/0x03 frames
  *                   share this appliance's envelope but their payloads are NOT TLV - parsing
  *                   them as TLV yields nonsense (tag 0x0 repeated, values of 16777215). One
- *                   byte of the 0x66/0x10 subtype is read at a fixed offset (the compressor,
- *                   see COMPRESSOR_RUNNING_OFFSET); the rest stays undecoded.
+ *                   byte of the 0x66/0x10 subtype used to be read as the compressor flag; that
+ *                   sensor was withdrawn on 2026-08-03 (see WITHDRAWN_COMPONENTS) and the whole
+ *                   family is now undecoded.
  *
  * Three tags LEFT that list on 2026-07-31 and are now the water tank's light: 0x21e, 0x3e0
  * and 0x185 sat at 0, 0 and 120 for an entire session purely because nobody had touched the
@@ -296,11 +297,28 @@ const HUMIDITY_MAX = 70
  * Read as `!== 0` rather than `=== 24`: if some firmware reports a stage there, non-zero still
  * means running.
  *
- * The record arrives every 5 minutes, so this sensor is coarse by nature - it says what the
- * compressor was doing at the last report, not what it is doing this second.
+ * ALL OF THAT STILL HOLDS. @86 is the compressor and the decode above is not in doubt - it was
+ * checked again on 2026-08-03 against a smart plug on the appliance's own outlet, which jumps
+ * to ~90 W in the same minute @86 goes non-zero and holds 100-150 W for as long as it stays
+ * there. The sensor was withdrawn for a different reason: LATENCY.
+ *
+ * The record arrives every 5 MINUTES and nothing else carries this fact - there is no TLV tag
+ * for the compressor anywhere in the 66 this appliance reports. So the sensor is up to five
+ * minutes behind in both directions, and that is not fixable from here: asking for a record
+ * sooner means sending a frame the appliance did not invite, which is the one thing this
+ * project does not do (see the FX___S query-frame incident).
+ *
+ * Measured on the day it was withdrawn - the appliance was switched on at 17:44:04, ran the fan
+ * alone at 5-8 W, and the compressor started at 17:44:41 - the sensor would have said "not
+ * running" for up to four more minutes while it ran.
+ *
+ * PAC_910604_WW has the same shape (its flag is @160 of the same 0xa8 family) and solved it a
+ * better way: a THIRD state. `compressorRunning: boolean | undefined`, reset to `undefined`
+ * whenever the appliance powers up, and while it is undefined the publish is suppressed
+ * entirely - silence rather than a claim. That is the pattern to copy if this is ever wanted
+ * back. It removes the wrongness but not the latency, and the owner judged the latency alone
+ * enough to drop it, having a plug on this outlet that answers instantly and exactly.
  */
-const COMPRESSOR_FRAME_LENGTH = 97
-const COMPRESSOR_RUNNING_OFFSET = 86
 
 /*
  * WITHDRAWN. Offsets 84, 87, 89 and 90 were published as raw bytes so an external power meter
@@ -318,11 +336,20 @@ const COMPRESSOR_RUNNING_OFFSET = 86
  *
  * Their keys are still published, carrying nothing but `platform`, because that is what device
  * discovery reads as "this entity is gone". Dropping the key merely stops a fresh install
- * creating one and leaves the four already in this owner's registry live forever, which is
+ * creating one and leaves the ones already in this owner's registry live forever, which is
  * exactly how the auto-dry rename left two orphans behind on RAC_056905_WW. Safe to delete
- * these three lines once the entities are gone from every install that ever had them.
+ * these lines once the entities are gone from every install that ever had them.
+ *
+ * `compressor` joins them for the latency reason set out above - the byte is right, the sensor
+ * was just always minutes old.
  */
-const COMPRESSOR_TELEMETRY_REMOVED = [84, 87, 89, 90]
+const WITHDRAWN_COMPONENTS: Array<[string, string]> = [
+    ['compressor', 'binary_sensor'],
+    ['telemetry_84', 'sensor'],
+    ['telemetry_87', 'sensor'],
+    ['telemetry_89', 'sensor'],
+    ['telemetry_90', 'sensor'],
+]
 
 type SwitchOptions = {
     /* raw TLV value written for 'ON' (default 1) */
@@ -396,28 +423,6 @@ export default class Device extends TLVDevice {
             comp: 'humidifier',
             write_xform: (val) => (val === 'ON' ? 1 : 0),
             read_xform: (raw) => (raw ? 'ON' : 'OFF'),
-            /*
-             * The compressor sensor is published from the 0xa8 telemetry record and from nothing
-             * else, so when the appliance stops sending that record the sensor keeps whatever it
-             * said last - forever. Measured against a smart plug on the same outlet over 48 h:
-             *
-             *   2026-08-02 14:00 -> 08-03 03:35   sensor ON, plug 2.7 W   13 h wrong
-             *   2026-08-03 05:00 -> now           sensor ON, plug 2.7 W   11 h wrong
-             *
-             * The owner confirms the appliance was switched off in the early hours. The starts
-             * are right - the plug jumps to ~90 W within the same hour the sensor goes ON - it is
-             * only the stopping that is never reported, because there is nothing left to report
-             * it with.
-             *
-             * A compressor cannot run while the appliance is off, so power going off says OFF
-             * here directly. The raw telemetry sensors are left alone deliberately: they are
-             * unitless diagnostics that say what byte N was in the last record, and freezing at
-             * the last value is what that means.
-             */
-            read_callback: () => {
-                if (!this.raw_clip_state[0x1f7]) this.HA.publishProperty(this.id, 'compressor', 'OFF')
-                return true
-            },
         })
 
         this.addField(config, {
@@ -811,20 +816,9 @@ export default class Device extends TLVDevice {
             read_xform: (raw) => (raw ? 'ON' : 'OFF'),
         })
 
-        /* Published from the 0xa8 telemetry rather than a tag - see COMPRESSOR_RUNNING_OFFSET. */
-        config.components['compressor'] = {
-            platform: 'binary_sensor',
-            unique_id: '$deviceid-compressor',
-            name: 'Compressor',
-            device_class: 'running',
-            icon: 'mdi:air-conditioner',
-            state_topic: '$this/compressor',
-            entity_category: 'diagnostic',
-        } as ComponentInfo
-
-        /* removal stubs - see COMPRESSOR_TELEMETRY_REMOVED */
-        for (const offset of COMPRESSOR_TELEMETRY_REMOVED) {
-            config.components[`telemetry_${offset}`] = { platform: 'sensor' } as ComponentInfo
+        /* removal stubs - see WITHDRAWN_COMPONENTS */
+        for (const [name, platform] of WITHDRAWN_COMPONENTS) {
+            config.components[name] = { platform } as ComponentInfo
         }
 
         /*
@@ -902,24 +896,11 @@ export default class Device extends TLVDevice {
         }
 
         /*
-         * The 97-byte telemetry record. Its payload is NOT TLV - parsing it as such yields
-         * nonsense - so it is read at a fixed offset, and only for the one subtype the offset
-         * was established on. The other 0xa8 subtypes (buf[7] = 0x67) carry a different layout
-         * and are deliberately left alone.
+         * The 97-byte 0xa8/0x66/0x10 telemetry record used to be read here for the compressor
+         * flag at offset 86 - see the withdrawal note above. Nothing reads it now, so it falls
+         * through like every other 0xa8 subtype: its payload is NOT TLV and parsing it as such
+         * yields nonsense, which is what the guard on the branch above is for.
          */
-        if (
-            buf[2] === 0x04 &&
-            buf[3] === 0x00 &&
-            buf[4] === 0x00 &&
-            buf[5] === 0x00 &&
-            buf[6] === 0xa8 &&
-            buf[7] === 0x66 &&
-            buf[8] === 0x10 &&
-            buf.length === COMPRESSOR_FRAME_LENGTH
-        ) {
-            this.HA.publishProperty(this.id, 'compressor', buf[COMPRESSOR_RUNNING_OFFSET] !== 0 ? 'ON' : 'OFF')
-            return
-        }
 
         super.processData(buf)
     }
