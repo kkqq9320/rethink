@@ -659,22 +659,30 @@ export default class Device extends TLVDevice {
                 entity_category: 'config',
             }
             /*
-             * MINUTES, not the '%' this handler used to declare. That '%' has no measurement
-             * behind it anywhere: PAC_910604_WW's own capture has the operator transcribing the
-             * appliance's display next to ten values of 0x225 decrementing about once a minute,
-             * and DHUM_231006_WW measured the same, so two appliances on this protocol say
-             * minutes and none says percent. ac_common publishes it as `min` too.
+             * OPEN QUESTION - the unit here is probably wrong, and it stays wrong until measured.
              *
-             * NOT measured on THIS unit, though - 0x225 has been 0 in all six observations across
-             * every capture, because no auto-dry cycle has ever run while recording. One cycle
-             * settles it: the number here should match the appliance's own display.
+             * '%' is what this handler has always declared and it has no measurement behind it
+             * anywhere. Against it: PAC_910604_WW's capture has the operator transcribing the
+             * appliance's display beside ten values of 0x225 decrementing about once a minute,
+             * DHUM_231006_WW measured the same, and ac_common publishes `min`. Two appliances on
+             * this protocol say minutes; none says percent.
+             *
+             * It was briefly changed to 'min' on that basis and changed back deliberately: 0x225
+             * has read 0 in all six observations across every capture of THIS appliance, because
+             * no auto-dry cycle has run while recording, so the change would have been inference
+             * dressed as a fix - which is the mistake this profile keeps having to undo. The
+             * sibling evidence is an argument for what to expect, not a measurement.
+             *
+             * TO SETTLE IT: run one cycle (switch on, then power the appliance off) and compare
+             * this number against the appliance's own display. If it counts minutes, change the
+             * unit and delete this comment.
              */
             const compADryRem = {
                 platform: 'sensor',
                 unique_id: '$deviceid-autodryremain',
                 name: 'Auto dry remaining',
                 icon: 'mdi:hair-dryer-outline',
-                unit_of_measurement: 'min',
+                unit_of_measurement: '%',
                 suggested_display_precision: 0,
                 entity_category: 'diagnostic',
             }
