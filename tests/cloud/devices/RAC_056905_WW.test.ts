@@ -133,6 +133,10 @@ describe(MODEL_ID, () => {
         // 0x2C1=87 is bits 0,1,2,4,6 - this unit really does have heat and auto.
         assert.deepEqual(components.climate.modes, ['off', 'cool', 'dry', 'fan_only', 'heat', 'auto'])
 
+        // 0x2C2=380 is bits 2,3,4,5,6,8: the five steps and nature, but no bit 22, so this unit
+        // gets no super breeze. Note there is no fan 'auto' on either unit - bit 8 is 자연풍.
+        assert.deepEqual(components.climate.fan_modes, ['very low', 'low', 'medium', 'high', 'very high', 'nature'])
+
         // Swing modes registered because 0x2CD has both 0x4 and 0x8.
         assert.deepEqual(components.climate.swing_modes, ['1', '2', '3', '4', '5', '6', 'on', 'off'])
         assert.deepEqual(components.climate.swing_horizontal_modes, [
@@ -252,6 +256,19 @@ describe(MODEL_ID, () => {
         // against 87 in the other fixture, so no heat and no auto are offered on this one.
         assert.equal(dev.raw_clip_state[0x2c1], 7, 'cool/dry/fan_only only - no heat, no auto')
         assert.deepEqual(components.climate.modes, ['off', 'cool', 'dry', 'fan_only'])
+
+        // 0x2C2=4194684 adds bit 22 on top of the other unit's set. The owner's appliance lists
+        // 초미풍 first, then 1..5, and offers 자연풍 - which is exactly bit 22, bits 2-6, bit 8.
+        // Bit 22's wire value is 16, not 22: this axis is where bit index and wire value diverge.
+        assert.deepEqual(components.climate.fan_modes, [
+            'super breeze',
+            'very low',
+            'low',
+            'medium',
+            'high',
+            'very high',
+            'nature',
+        ])
 
         dev.drop()
     })

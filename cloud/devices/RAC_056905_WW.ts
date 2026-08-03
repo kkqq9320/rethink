@@ -16,6 +16,31 @@ type CheckMode = (arg: number) => boolean
 // way to turn a selection back into a wire value - they cannot drift apart.
 const clipOpModes: Record<number, string> = { 0: 'cool', 1: 'dry', 2: 'fan_only', 4: 'heat', 6: 'auto' }
 
+/*
+ * Fan levels, in the order the appliance's own UI lists them. Three columns because on this axis
+ * the bit index and the wire value are NOT the same number: the five steps and nature happen to
+ * line up, but super breeze is bit 22 of 0x2c2 and wire value 16, per LG's airState.windStrength
+ * enum for this modelId. Reading bit 22 as wire 22 would be wrong.
+ *
+ * Names confirmed against the appliance by its owner: the app lists 초미풍 first, then 1..5, and
+ * offers 자연풍 separately. There is NO 'auto' on this model - LG's enum for it does not contain
+ * one, and what the handler used to call auto is 자연풍. It is listed here with the speeds rather
+ * than split into a switch because the wire has one field: bit 8 lives in the windStrength
+ * capability mask, so nature is a value of 0x1fa, and the app's toggle is presentation.
+ *
+ * The 'very low'..'very high' labels for the five steps are kept from before, so existing
+ * automations that use them keep working; the appliance shows them as 1..5.
+ */
+const clipFanModes: { bit: number; clip: number; ha: string }[] = [
+    { bit: 22, clip: 16, ha: 'super breeze' },
+    { bit: 2, clip: 2, ha: 'very low' },
+    { bit: 3, clip: 3, ha: 'low' },
+    { bit: 4, clip: 4, ha: 'medium' },
+    { bit: 5, clip: 5, ha: 'high' },
+    { bit: 6, clip: 6, ha: 'very high' },
+    { bit: 8, clip: 8, ha: 'nature' },
+]
+
 // LG's own names for the auto-dry strength axis, taken from this model's ThinQ model JSON
 // (`support.airState.autoDry.windStrength`). The index is the bit position in the 0x192
 // capability mask, which on this axis is also the value 0x1f2 carries: on PAC_910604_WW the five
@@ -292,6 +317,14 @@ export default class Device extends TLVDevice {
          * frame, so the entity silently disagrees with the appliance. An appliance that does not
          * report 0x2c1 at all keeps that fallback rather than getting an empty list.
          */
+        /*
+         * Same treatment for the fan levels, 0x2c2. Left hardcoded, the wall unit offered an
+         * 'auto' it does not have - that value is 자연풍 - and hid 초미풍 entirely, which the mask
+         * declares at bit 22. An appliance that does not report 0x2c2 keeps the old fixed list.
+         */
+        const fanMask = this.raw_clip_state[0x2c2]
+        const fanModes = fanMask ? clipFanModes.filter((m) => (fanMask >> m.bit) & 1).map((m) => m.ha) : undefined
+
         const opModeMask = this.raw_clip_state[0x2c1]
         const opModes = opModeMask
             ? [
@@ -317,8 +350,7 @@ export default class Device extends TLVDevice {
                     /* TODO: some devices report these temp ranges via tags 0x2e1 - 0x2ec */
                     min_temp: 18,
                     max_temp: 30,
-                    /* TODO: get from 0x2c2 */
-                    fan_modes: ['auto', 'very low', 'low', 'medium', 'high', 'very high'],
+                    fan_modes: fanModes ?? ['auto', 'very low', 'low', 'medium', 'high', 'very high'],
                     ...(opModes ? { modes: opModes } : {}),
                 } satisfies ClimateComponent,
             },
@@ -384,31 +416,10 @@ export default class Device extends TLVDevice {
             id: 0x1fa,
             name: 'fan_mode',
             comp: 'climate',
-            read_xform: (raw) => {
-                const modes2ha = [
-                    undefined,
-                    undefined,
-                    'very low',
-                    'low',
-                    'medium',
-                    'high',
-                    'very high',
-                    undefined,
-                    'auto',
-                ]
-                return modes2ha[raw]
-            },
-            write_xform: (val) => {
-                const modes2clip: Record<string, number> = {
-                    'very low': 2,
-                    low: 3,
-                    medium: 4,
-                    high: 5,
-                    'very high': 6,
-                    auto: 8,
-                }
-                return modes2clip[val]
-            },
+            // Read against the whole table, not just the declared subset: a level the appliance
+            // reports but did not advertise should still be named rather than blanking the entity.
+            read_xform: (raw) => clipFanModes.find((m) => m.clip === raw)?.ha,
+            write_xform: (val) => clipFanModes.find((m) => m.ha === val)?.clip,
             write_attach: [0x1f9, 0x1fe],
         })
 
