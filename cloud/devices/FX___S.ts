@@ -26,11 +26,24 @@ import log from '@/util/logging'
 //   short:     20 <type> <payload...>
 //   extended:  20 <type> <len16> <payload...>          len16 == buf.length + 4
 //
-// Message types seen from the appliance: 0x0A (tunnel, see below), 0xE6 (reply to a settings write),
-// 0x4D (the appliance declaring its own course table, see processCourseTable), 0xD8 (one byte that
-// follows the power state, sent unprompted - not used: it leads the state record by 16 s in one
-// measured transition and trails it by 31 s in another, so it buys nothing reliably), and
-// 0xC3/0x00/0x19/0x72/0x7F (short acks and handshake bytes, not decoded).
+// Message types seen from the appliance, censused across all three washer captures with
+// tools/aabb-survey.ts - the appliance sends thirteen and this handler dispatches on four:
+//
+//   0x0A  2184x   tunnel, see below
+//   0x4D   527x   the appliance declaring its own course table, see processCourseTable
+//   0xE6   136x   reply to a settings write
+//   0x3E    90x   the per-stage time plan for the selected cycle, see processStagePlan
+//
+//   0xD8   164x   one byte that follows the power state, sent unprompted. NOT used: it leads the
+//                 state record by 16 s in one measured transition and trails it by 31 s in another
+//   0xE2    19x   71 bytes, and only TWO distinct payloads across every capture. Fifteen byte
+//                 positions differ between them and several repeat each other (@9 = @24, @18 = @20),
+//                 so it is structured rather than noise - undecoded
+//   0x31    11x   99 bytes, every byte identical in all eleven. A fixed declaration of something
+//   0x88     2x   37 bytes, likewise constant
+//   0x00   696x / 0xC3 286x / 0x7F 235x / 0x72 23x / 0x19 20x
+//                 short acks and handshake bytes. 0xC3 and 0x19 never vary at all; 0x7F carries
+//                 one byte that is only ever 3 or 4, 0x72 two that are {0,1} and {0,145,200,201}
 //
 // TUNNEL (0x0A). payload = 00 <id16> 00 01 <flag> <inner> <innerlen16> 00 <data>
 //   inner 0x03  6 or 17 bytes  heartbeat, ~1.5 s, only while powered on
@@ -62,6 +75,10 @@ const INNER_STATE_SINGLE = 0xeb
 // follow the app browsing courses, which makes it look like a reply; the zero-outgoing captures are
 // what settle it. Even if a query would also produce it, there is no reason to send one.
 const MSG_COURSE_TABLE = 0x4d
+/* The per-stage time plan for the selected cycle - see processStagePlan(). */
+const MSG_STAGE_PLAN = 0x3e
+/* Always exactly this long: 20 3E <u16 mins> <u16 cumulative> <stage>. */
+const STAGE_PLAN_LEN = 7
 // Three variants share this message type and the first byte tells them apart. 0x03 is the dial;
 // 0x02 carries the two extended courses' default settings (decoded - it is where the record's
 // base-course byte was confirmed - but deliberately unused, see setExtendedCourse); 0x01 is a
@@ -305,6 +322,10 @@ const BEEP_BY_NAME = invert(BEEP)
 const COURSE_BY_NAME = invert(COURSE)
 
 export default class Device extends AABBDevice {
+    /** Minutes per stage of the cycle the appliance is set to, index 0 = stage 1. */
+    stagePlan: number[] = []
+    /** Planned length in minutes: the last cumulative that agreed with the running sum. */
+    stagePlanTotal: number | undefined
     /** Last published remaining minutes, so the finish timestamp is only recomputed when it moves. */
     lastRemaining: number | undefined
 
@@ -367,6 +388,25 @@ export default class Device extends AABBDevice {
                         state_topic: '$this/status_code',
                         name: 'Status code',
                         icon: 'mdi:numeric',
+                        entity_category: 'diagnostic',
+                    },
+                    // The appliance's own plan for the selected cycle - see processStagePlan().
+                    cycle_plan: {
+                        platform: 'sensor',
+                        unique_id: '$deviceid-cycle-plan',
+                        state_topic: '$this/cycle_plan',
+                        name: 'Cycle plan',
+                        icon: 'mdi:timeline-clock-outline',
+                        entity_category: 'diagnostic',
+                    },
+                    cycle_plan_total: {
+                        platform: 'sensor',
+                        unique_id: '$deviceid-cycle-plan-total',
+                        state_topic: '$this/cycle_plan_total',
+                        name: 'Cycle plan total',
+                        icon: 'mdi:timer-outline',
+                        device_class: 'duration',
+                        unit_of_measurement: 'min',
                         entity_category: 'diagnostic',
                     },
                     running: {
@@ -634,7 +674,61 @@ export default class Device extends AABBDevice {
             this.processRecord(payload.subarray(start, start + RECORD_LEN))
         } else if (type === MSG_COURSE_TABLE) {
             this.processCourseTable(payload)
+        } else if (type === MSG_STAGE_PLAN && buf.length === STAGE_PLAN_LEN) {
+            /*
+             * Read from `buf`, NOT from `payload`. The extended-length test above is a heuristic -
+             * "the u16 after the type equals the frame length + 4" - and on this message that u16
+             * is the stage's duration in minutes. A stage of exactly 11 minutes therefore reads as
+             * extended, four bytes get eaten, and the stage vanishes from the plan.
+             *
+             * That is not hypothetical: stage 4 of the plan in washer-cycle-20260730.jsonl is 11
+             * minutes, and the first version of this decode dropped it. These frames are a fixed
+             * seven bytes and are never extended, so the length check replaces the guess.
+             */
+            this.processStagePlan(buf.subarray(2))
         }
+    }
+
+    /**
+     * The appliance's own plan for the cycle it is set to: one frame per stage, carrying that
+     * stage's length and the running total up to it.
+     *
+     *     20 3E | <u16 this stage's minutes> | <u16 cumulative> | <stage index, from 1>
+     *
+     * The cumulative field is what identifies it, and it was checked rather than assumed. Across
+     * every 0x3E frame in the three washer captures there are nine distinct payloads, each sent
+     * ten times, forming two plans:
+     *
+     *     stage  1   2   3   4   5   6   7          stage  1   2
+     *     mins   3  94  22  11   3   3   0          mins  22  13
+     *     cum    3  97 119 130 133 136   5          cum   22  35
+     *
+     * Eight of the nine satisfy cum(n) = cum(n-1) + mins(n) exactly. The ninth is stage 7 of the
+     * first plan, which carries mins 0 and cum 5 and fits nothing - it is left in the string as
+     * itself rather than dropped or explained away.
+     *
+     * WHAT THIS IS NOT: it is not progress. Every stage arrives at once, before the cycle starts,
+     * and nothing here says which stage is current - the phase byte in the state record is still
+     * the only thing that does. This is the shape of the plan, which is why it is a diagnostic
+     * string rather than a step counter.
+     *
+     * A stage index of 1 starts a new plan; selecting a different course replaces it wholesale.
+     */
+    processStagePlan(payload: Buffer) {
+        const mins = payload.readUInt16BE(0)
+        const cum = payload.readUInt16BE(2)
+        const stage = payload[4]
+
+        if (stage === 1) this.stagePlan = []
+        this.stagePlan[stage - 1] = mins
+
+        // The last cumulative that still agrees with the running sum is the planned length; a
+        // stage that breaks the sum (see above) must not be allowed to become the total.
+        const running = this.stagePlan.slice(0, stage).reduce((a, b) => a + (b ?? 0), 0)
+        if (running === cum) this.stagePlanTotal = cum
+
+        this.publishProperty('cycle_plan', this.stagePlan.map((m) => m ?? '?').join('/'))
+        if (this.stagePlanTotal !== undefined) this.publishProperty('cycle_plan_total', this.stagePlanTotal)
     }
 
     /**

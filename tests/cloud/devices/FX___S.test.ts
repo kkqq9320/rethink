@@ -328,6 +328,42 @@ describe('FX___S washer', () => {
         feed(thinq, buf('aa09f0241001018cbb')) // our own start command echoed back
         assert.equal(get(HA, 'status'), undefined)
     })
+    test('the appliance declares its cycle as a per-stage time plan', () => {
+        const { HA, thinq } = setup()
+
+        /*
+         * Nine real 0x3E frames from washer-cycle-20260730.jsonl - the whole set that capture
+         * contains. They form two plans; each arrived ten times and the order is not guaranteed,
+         * so the decode must depend on neither.
+         *
+         *   stage  1   2   3   4   5   6   7
+         *   mins   3  94  22  11   3   3   0
+         *   cum    3  97 119 130 133 136   5     <- stage 7 fits nothing, see processStagePlan
+         */
+        for (const f of [
+            'aa0b203e00030003014fbb',
+            'aa0b203e005e00610281bb',
+            'aa0b203e0016007703f6bb',
+            'aa0b203e000b008204f1bb',
+            'aa0b203e0003008505f5bb',
+            'aa0b203e0003008806f1bb',
+        ])
+            feed(thinq, Buffer.from(f, 'hex'))
+
+        assert.equal(get(HA, 'cycle_plan'), '3/94/22/11/3/3')
+        assert.equal(get(HA, 'cycle_plan_total'), 136)
+
+        /* stage 7 breaks the running sum: it shows in the plan but must not become the total */
+        feed(thinq, Buffer.from('aa0b203e00000005074abb', 'hex'))
+        assert.equal(get(HA, 'cycle_plan'), '3/94/22/11/3/3/0')
+        assert.equal(get(HA, 'cycle_plan_total'), 136, 'total unchanged by the odd stage')
+
+        /* a stage 1 starts a new plan rather than extending the old one */
+        feed(thinq, Buffer.from('aa0b203e001600160115bb', 'hex'))
+        feed(thinq, Buffer.from('aa0b203e000d00230210bb', 'hex'))
+        assert.equal(get(HA, 'cycle_plan'), '22/13')
+        assert.equal(get(HA, 'cycle_plan_total'), 35)
+    })
 })
 
 describe('FX___S commands', () => {
