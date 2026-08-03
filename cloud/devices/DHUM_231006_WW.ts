@@ -303,21 +303,26 @@ const COMPRESSOR_FRAME_LENGTH = 97
 const COMPRESSOR_RUNNING_OFFSET = 86
 
 /*
- * The rest of the compressor group, published as RAW BYTES with no unit and no scale, at the
- * owner's request, so they can be compared against a real power meter.
+ * WITHDRAWN. Offsets 84, 87, 89 and 90 were published as raw bytes so an external power meter
+ * could settle whether any of them tracks watts. Forty-eight hours of history against a smart
+ * plug on the appliance's own outlet answered it, and the answer is no:
  *
- * Across all 43 telemetry records on file, exactly five offsets are zero when @86 is zero and
- * non-zero when it is not: 84, 86, 87, 89 and 90. @86 is the two-valued one and became the
- * compressor sensor; these four carry magnitudes - @84 spans 0..23+ in small steps and is the
- * most analogue-looking of them, @87 sits at 50/57/59, @89 and @90 at 24/38/50/57.
+ *   @84  steps +5 every five-minute record and wraps at 256. A minute counter, not a magnitude,
+ *        and it was the one that looked most analogue.
+ *   @87  is 0 or 59 and changes at the same instants as @86. It is that flag in another byte.
+ *   @89  @90  a handful of discrete values, moving with @86 and carrying nothing beyond it.
  *
- * NOTHING HERE CLAIMS THEY ARE WATTS. No tag on this appliance carries power (the ACs' 0x2b3
- * appears in none of the 66 tags seen across nine captures), so there is no in-appliance
- * reading to calibrate against; that is exactly why they go out raw, for an external meter to
- * settle. If a correlation turns up, the right change is a proper sensor with a unit - not a
- * relabelling of these.
+ * The premise is dead as well as the readings: the plug IS the power sensor. There was never
+ * going to be an in-appliance number to calibrate - no tag here carries power - so the useful
+ * outcome of this experiment is that the meter stays and the proxies go.
+ *
+ * Their keys are still published, carrying nothing but `platform`, because that is what device
+ * discovery reads as "this entity is gone". Dropping the key merely stops a fresh install
+ * creating one and leaves the four already in this owner's registry live forever, which is
+ * exactly how the auto-dry rename left two orphans behind on RAC_056905_WW. Safe to delete
+ * these three lines once the entities are gone from every install that ever had them.
  */
-const COMPRESSOR_TELEMETRY_OFFSETS = [84, 87, 89, 90]
+const COMPRESSOR_TELEMETRY_REMOVED = [84, 87, 89, 90]
 
 type SwitchOptions = {
     /* raw TLV value written for 'ON' (default 1) */
@@ -817,16 +822,9 @@ export default class Device extends TLVDevice {
             entity_category: 'diagnostic',
         } as ComponentInfo
 
-        for (const offset of COMPRESSOR_TELEMETRY_OFFSETS) {
-            config.components[`telemetry_${offset}`] = {
-                platform: 'sensor',
-                unique_id: `$deviceid-telemetry_${offset}`,
-                name: `Compressor telemetry @${offset}`,
-                icon: 'mdi:help-circle-outline',
-                state_topic: `$this/telemetry_${offset}`,
-                state_class: 'measurement',
-                entity_category: 'diagnostic',
-            } as ComponentInfo
+        /* removal stubs - see COMPRESSOR_TELEMETRY_REMOVED */
+        for (const offset of COMPRESSOR_TELEMETRY_REMOVED) {
+            config.components[`telemetry_${offset}`] = { platform: 'sensor' } as ComponentInfo
         }
 
         /*
@@ -920,9 +918,6 @@ export default class Device extends TLVDevice {
             buf.length === COMPRESSOR_FRAME_LENGTH
         ) {
             this.HA.publishProperty(this.id, 'compressor', buf[COMPRESSOR_RUNNING_OFFSET] !== 0 ? 'ON' : 'OFF')
-            for (const offset of COMPRESSOR_TELEMETRY_OFFSETS) {
-                this.HA.publishProperty(this.id, `telemetry_${offset}`, buf[offset])
-            }
             return
         }
 

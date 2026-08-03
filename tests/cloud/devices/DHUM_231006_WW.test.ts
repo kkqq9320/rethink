@@ -935,28 +935,33 @@ describe(MODEL_ID, () => {
          */
         thinq.emit('data', buf(STATE_POWER_OFF_HEX))
         assert.equal(ha.devices[DEVICE_ID].properties['compressor'], 'OFF', 'off appliance, no compressor')
-
-        /* and the raw diagnostics are deliberately NOT faked - they still say what the last
-         * record said, which is what an unlabelled byte at offset N means */
-        assert.equal(ha.devices[DEVICE_ID].properties['telemetry_87'], 59)
     })
 
-    test('the compressor group is published raw, for an external meter to settle', (t) => {
+    test('the raw compressor-group sensors are withdrawn, and withdrawn properly', (t) => {
         const { ha, thinq } = readyDevice(t)
-        const props = () => ha.devices[DEVICE_ID].properties
+        const components = ha.devices[DEVICE_ID].config!.components as Record<string, Record<string, unknown>>
+
+        /*
+         * They existed so an external meter could settle whether any of them tracks watts. It
+         * did: @84 is a minute counter that wraps at 256, @87 is @86 in another byte, and the
+         * plug on the appliance's outlet is the power sensor. Nothing here was ever watts.
+         *
+         * Each key must still be PRESENT and carry `platform` and nothing else - that is what
+         * device discovery reads as a removal. Dropping the key instead only stops a fresh
+         * install creating one and leaves the entities already in a registry live forever.
+         */
+        for (const offset of [84, 87, 89, 90]) {
+            const stub = components[`telemetry_${offset}`]
+            assert.ok(stub, `telemetry_${offset} key still published`)
+            assert.deepEqual(Object.keys(stub), ['platform'], `telemetry_${offset} is a bare removal`)
+        }
 
         thinq.emit('data', buf(TELEMETRY_COMPRESSOR_ON_HEX))
-        /* the bytes of that captured record, at the four offsets that track the compressor */
-        assert.equal(props()['telemetry_84'], 5)
-        assert.equal(props()['telemetry_87'], 59)
-        assert.equal(props()['telemetry_89'], 38)
-        assert.equal(props()['telemetry_90'], 38)
-
-        /* all four are zero whenever the compressor is - that is what picked them out */
-        thinq.emit('data', buf(TELEMETRY_COMPRESSOR_OFF_HEX))
         for (const offset of [84, 87, 89, 90]) {
-            assert.equal(props()[`telemetry_${offset}`], 0, `@${offset} zero while stopped`)
+            assert.equal(ha.devices[DEVICE_ID].properties[`telemetry_${offset}`], undefined, `@${offset} unpublished`)
         }
+        /* the compressor itself is unaffected - it was the one reading that survived */
+        assert.equal(ha.devices[DEVICE_ID].properties['compressor'], 'ON')
     })
 
     test('a telemetry record of another subtype is left alone', (t) => {
