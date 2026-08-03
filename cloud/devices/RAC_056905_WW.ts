@@ -658,17 +658,43 @@ export default class Device extends TLVDevice {
                 icon: 'mdi:hair-dryer',
                 entity_category: 'config',
             }
+            /*
+             * MINUTES, not the '%' this handler used to declare. That '%' has no measurement
+             * behind it anywhere: PAC_910604_WW's own capture has the operator transcribing the
+             * appliance's display next to ten values of 0x225 decrementing about once a minute,
+             * and DHUM_231006_WW measured the same, so two appliances on this protocol say
+             * minutes and none says percent. ac_common publishes it as `min` too.
+             *
+             * NOT measured on THIS unit, though - 0x225 has been 0 in all six observations across
+             * every capture, because no auto-dry cycle has ever run while recording. One cycle
+             * settles it: the number here should match the appliance's own display.
+             */
             const compADryRem = {
                 platform: 'sensor',
                 unique_id: '$deviceid-autodryremain',
                 name: 'Auto dry remaining',
                 icon: 'mdi:hair-dryer-outline',
-                unit_of_measurement: '%',
+                unit_of_measurement: 'min',
                 suggested_display_precision: 0,
+                entity_category: 'diagnostic',
+            }
+            /*
+             * Whether a cycle is running at all, derived from the same tag rather than published
+             * from one of its own - PAC_910604_WW does exactly this. It is a separate question
+             * from the 'autodry' switch above: that switch is the standing preference for the next
+             * power-off and stays ON while a cycle is cancelled, and only this goes OFF.
+             */
+            const compADryRunning = {
+                platform: 'binary_sensor',
+                unique_id: '$deviceid-autodryrunning',
+                state_topic: '$this/autodryrunning',
+                name: 'Auto dry running',
+                icon: 'mdi:hair-dryer',
                 entity_category: 'diagnostic',
             }
             config['components']['autodry'] = compADry
             config['components']['autodryremain'] = compADryRem
+            config['components']['autodryrunning'] = compADryRunning
 
             this.addField(config, {
                 id: 0x20e,
@@ -685,6 +711,12 @@ export default class Device extends TLVDevice {
                 name: '',
                 comp: 'autodryremain',
                 writable: false,
+                // Returns true so the minutes sensor still publishes; the derived running flag
+                // rides along. raw_clip_state is already updated by the time this runs.
+                read_callback: () => {
+                    this.publishAutoDryRunning()
+                    return true
+                },
             })
 
             /*
@@ -816,14 +848,14 @@ export default class Device extends TLVDevice {
                 config,
                 0x3a2,
                 'heatexchangerclean',
-                'Heat exchanger cleaning',
+                'Cleaning - Heat exchanger',
                 'mdi:snowflake-melt',
                 { category: 'diagnostic' },
             )
         }
 
         if (this.raw_clip_state[0x34f] & (1 << 17)) {
-            this.addConfigSwitchField(config, 0x165, 'allclean', 'All cleaning', 'mdi:spray-bottle', {
+            this.addConfigSwitchField(config, 0x165, 'allclean', 'Cleaning - ALL', 'mdi:spray-bottle', {
                 onValue: 100,
                 category: 'diagnostic',
             })
@@ -1136,6 +1168,13 @@ export default class Device extends TLVDevice {
             },
             read_xform,
         )
+    }
+
+    /** A cycle is running when the remaining-minutes tag is above zero. Read out of
+     *  raw_clip_state rather than from the callback argument so the rule stays written against
+     *  the raw tag - same as PAC_910604_WW.publishAiDryRunning(). */
+    publishAutoDryRunning() {
+        this.HA.publishProperty(this.id, 'autodryrunning', this.raw_clip_state[0x225] > 0 ? 'ON' : 'OFF')
     }
 
     addConfigSwitchField(

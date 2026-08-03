@@ -242,6 +242,19 @@ describe(MODEL_ID, () => {
         const components = ha.devices[DEVICE_ID].config!.components as Record<string, Record<string, unknown>>
         assert.ok(components.autodry, 'autodry (0x2CC bit 0x4, as on the other unit)')
         assert.equal(components.autodry.platform, 'switch', 'the owner operates this from the app')
+
+        // Minutes, not the '%' this handler used to declare - two sibling appliances measured
+        // minutes against their own displays and none measured percent.
+        assert.equal(components.autodryremain.unit_of_measurement, 'min')
+
+        // Running is derived from the same tag rather than published from one of its own.
+        assert.equal(components.autodryrunning.platform, 'binary_sensor')
+        dev.raw_clip_state[0x225] = 0
+        dev.publishAutoDryRunning()
+        assert.equal(ha.getProperty(DEVICE_ID, 'autodryrunning', 'state'), 'OFF')
+        dev.raw_clip_state[0x225] = 32
+        dev.publishAutoDryRunning()
+        assert.equal(ha.getProperty(DEVICE_ID, 'autodryrunning', 'state'), 'ON')
         assert.ok(components.autodrylevel, 'autodrylevel (because this unit reports 0x192)')
         assert.equal(components.autodrylevel.platform, 'select')
 
@@ -329,6 +342,10 @@ describe(MODEL_ID, () => {
             assert.ok(components[name], `${name} present`)
             assert.equal(components[name].entity_category, category, `${name} category`)
         }
+
+        // Named to sort together in HA rather than by what each one cleans.
+        assert.equal(components.allclean.name, 'Cleaning - ALL')
+        assert.equal(components.heatexchangerclean.name, 'Cleaning - Heat exchanger')
 
         // 0x3A0 is inverted, measured that way on this appliance and on two others: 0 is on.
         thinq.resetRecorder()
