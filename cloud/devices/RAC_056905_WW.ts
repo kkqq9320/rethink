@@ -1,6 +1,6 @@
 import TLVDevice, { FieldDefinition } from './tlv_device'
 import { Device as Thinq2Device } from '../thinq2/device'
-import { ClimateComponent, DeviceDiscovery, type Connection } from '../homeassistant'
+import { ClimateComponent, ComponentInfo, DeviceDiscovery, type Connection } from '../homeassistant'
 import { type Metadata } from '../thinq'
 import { allowExtendedType } from '@/util/casting'
 import * as TLV from '@/util/tlv'
@@ -675,6 +675,43 @@ export default class Device extends TLVDevice {
                 comp: 'autodryremain',
                 writable: false,
             })
+
+            /*
+             * Stopping a run already in progress is a write of 0x225 = 0 - the remaining-minutes
+             * tag set to zero. Not measured on this appliance: it is DHUM_231006_WW's captured
+             * cancel (the app's write, an ACK, then the appliance's own 0x225 going 29 -> 0), and
+             * PAC_910604_WW reaches the identical command from its own capture. Two appliances on
+             * this protocol, same tag, same value.
+             *
+             * A BUTTON, not a switch, because there is no start to pair with it: the appliance
+             * begins a run by itself when it is switched off with 0x20e set. The auto-dry SETTING
+             * is untouched by this - the switch above is the standing preference for the next
+             * power-off, and only the run in progress stops.
+             *
+             * No entity_category, deliberately, so it sits in the device page's Controls section
+             * rather than among the settings: it is an action taken now, not a preference.
+             *
+             * Registered straight into fields_by_ha because addField() would take
+             * fields_by_id[0x225] away from the remaining-minutes sensor above. The callback sends
+             * the frame and returns false so nothing stamps a 0 into local state - the appliance's
+             * own reply is what moves that sensor.
+             */
+            config['components']['autodry_cancel'] = {
+                platform: 'button',
+                unique_id: '$deviceid-autodry_cancel',
+                command_topic: '$this/autodry_cancel/set',
+                name: 'Stop auto dry',
+                icon: 'mdi:hair-dryer-outline',
+            } as ComponentInfo
+            this.fields_by_ha['autodry_cancel'] = {
+                name: '',
+                comp: '',
+                write_xform: (val) => (val === 'PRESS' ? 0 : null),
+                write_callback: () => {
+                    this.send([1, 1, 2, 1, 1], [{ t: 0x225, v: 0 }])
+                    return false
+                },
+            }
 
             // The strength axis, 0x1f2. Which strengths exist is the appliance's own answer in
             // 0x192, not a per-model constant: this unit declares bits 2/4/6 - low/mid/high, three

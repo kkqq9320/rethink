@@ -276,6 +276,19 @@ describe(MODEL_ID, () => {
         assert.equal(thinq.outbox.length, 1)
         assert.deepEqual(tlvOf(thinq.outbox[0]), [{ t: 0x20e, v: 0 }])
 
+        // Cancelling a run is 0x225 = 0, and it must NOT touch 0x20e: the setting stays put and
+        // only the run stops. In Controls rather than Configuration, so no entity_category.
+        const components = ha.devices[DEVICE_ID].config!.components as Record<string, Record<string, unknown>>
+        assert.equal(components.autodry_cancel.platform, 'button')
+        assert.equal(components.autodry_cancel.entity_category, undefined)
+
+        // Emitted directly, as the DHUM_231006_WW test does: the button is registered straight
+        // into fields_by_ha, so there is no component topic for setProperty() to look up.
+        thinq.resetRecorder()
+        ha.emit('setProperty', DEVICE_ID, 'autodry_cancel', 'PRESS')
+        assert.equal(thinq.outbox.length, 1)
+        assert.deepEqual(tlvOf(thinq.outbox[0]), [{ t: 0x225, v: 0 }])
+
         dev.drop()
     })
 
