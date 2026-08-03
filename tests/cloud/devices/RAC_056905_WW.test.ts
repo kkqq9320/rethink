@@ -42,6 +42,30 @@ const WRITE_MODE_FAN_ONLY_HEX = '01010400000065020101067E427E837F80B452'
 const WRITE_MODE_HEAT_HEX = '01010400000065020101077E447E837F902AF936'
 const WRITE_POWER_OFF_HEX = '01010400000065020101027DC00576'
 
+// A SECOND, real RAC_056905_WW: the wall unit captured 2026-07-30 (caps-rac-20260730.jsonl).
+//
+// Worth knowing before reading the assertions: its capability mask is not the same hardware as
+// the fixture above. 0x2C1=7 here (bits 0,1,2 - cool/dry/fan_only) against 0x2C1=87 (bits
+// 0,1,2,4,6 - which adds heat and auto), and both replies are internally consistent, each unit's
+// 0x2D7 list agreeing with its own mask. One modelId, two different sets of modes.
+//
+// It also carries 0x192=84, the auto-dry strength axis, which the other unit does not report.
+const CAPS_RESPONSE_WALL_HEX =
+    '0000040000008702010879' +
+    'B001E190CAB047B0B040017CD4101AD3F0020000B85024B8903CB8D020B9103CB0C1B10FB306B2A00800B2C0B370' +
+    '200005B480B4F0045011B5A08000B6A05100B6F0249003B701B740BC40BD30080000BD60080FFB0FEA1021DD0464' +
+    '4F649054BC08FA01B5C0B61033B642B5C1B61032B642B5C2B61032B642' +
+    'F0B8'
+
+// The same unit's state frame, carrying 0x1F2=6 (auto dry strength) and 0x20E=255.
+const QUERY_RESPONSE_WALL_HEX =
+    '0000040000008702040C' +
+    '907E407DC07E827F50397F90307EC07F00C840C880C8C083408390FF83C0A880868086C0870087C18F8089407C86' +
+    'E880594088408A103F8A50528A808C808CC0ACD032CA00A041D540D580C900CAC01E90BCCB40CB89CBC0CC00CC40' +
+    'CC909E8B40E801FA80BF600567BFC0BFA00567C000BE5061BE906E6240BEC0C340C0C0EE40C380CCC8CD08CD4890' +
+    '004B414BC14CC1' +
+    '165E'
+
 function makeDevice() {
     const ha = new MockHAConnection()
     const thinq = new MockThinq2Device(DEVICE_ID, META)
@@ -183,6 +207,45 @@ describe(MODEL_ID, () => {
 
         assert.equal(thinq.outbox.length, 1)
         assert.equal(hex(thinq.outbox[0]), WRITE_POWER_OFF_HEX.toUpperCase())
+
+        dev.drop()
+    })
+
+    test('auto dry level appears when the appliance declares the axis (0x192)', (t) => {
+        enableMockTimers(t)
+        const { ha, thinq, dev } = makeDevice()
+        thinq.resetRecorder() // discard the queryCaps from the constructor
+
+        thinq.emit('data', buf(CAPS_RESPONSE_WALL_HEX))
+        thinq.emit('data', buf(QUERY_RESPONSE_WALL_HEX))
+        tickMockTimers(t, 6000)
+
+        // The first values response builds the config; states publish off the next one, the same
+        // way the initial-state test above does it.
+        thinq.emit('data', buf(QUERY_RESPONSE_WALL_HEX))
+        tickMockTimers(t, 1000)
+
+        const components = ha.devices[DEVICE_ID].config!.components as Record<string, Record<string, unknown>>
+        assert.ok(components.autodry, 'autodry (0x2CC bit 0x4, as on the other unit)')
+        assert.ok(components.autodrylevel, 'autodrylevel (because this unit reports 0x192)')
+        assert.equal(components.autodrylevel.platform, 'sensor')
+
+        // 0x192=84 is bits 2/4/6, so this unit offers low/mid/high - not the five PAC_910604_WW
+        // declares - and the captured 0x1F2=6 is the top of its own set.
+        assert.equal(ha.getProperty(DEVICE_ID, 'autodrylevel', 'state'), 'high')
+
+        // The same capture is also the evidence that one modelId spans different hardware.
+        assert.equal(dev.raw_clip_state[0x2c1], 7, 'cool/dry/fan_only only - no heat, no auto')
+
+        dev.drop()
+    })
+
+    test('auto dry level stays absent on a unit that does not report 0x192', (t) => {
+        const { ha, dev } = buildReadyDevice(t)
+
+        const components = ha.devices[DEVICE_ID].config!.components as Record<string, Record<string, unknown>>
+        assert.ok(components.autodry, 'autodry is still unlocked by 0x2CC')
+        assert.ok(!components.autodrylevel, 'no autodrylevel - 0x192 absent from this caps reply')
 
         dev.drop()
     })

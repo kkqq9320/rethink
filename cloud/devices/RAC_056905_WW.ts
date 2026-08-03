@@ -10,6 +10,18 @@ import HADevice from './base'
 
 type PowerModeChangeHook = () => void
 type CheckMode = (arg: number) => boolean
+
+// LG's own names for the auto-dry strength axis, taken from this model's ThinQ model JSON
+// (`support.airState.autoDry.windStrength`). The index is the bit position in the 0x192
+// capability mask, which on this axis is also the value 0x1f2 carries: on PAC_910604_WW the five
+// declared bits 2-6 line up with the levels 1..5 that appliance shows on its own panel.
+const autoDryLevels: Record<number, string> = {
+    2: 'low',
+    3: 'low_mid',
+    4: 'mid',
+    5: 'mid_high',
+    6: 'high',
+}
 export default class Device extends TLVDevice {
     meta: Metadata
     initialValuesReceived: boolean = false
@@ -617,6 +629,37 @@ export default class Device extends TLVDevice {
                 comp: 'autodryremain',
                 writable: false,
             })
+
+            // Auto dry has a strength axis as well as an on/off, on 0x1f2, and which strengths
+            // exist is the appliance's own answer in 0x192 rather than a per-model constant: the
+            // unit this was measured on declares bits 2/4/6 (low/mid/high) where PAC_910604_WW
+            // declares all five of 2-6. Hence the gate on 0x192 - a unit without it gets no entity.
+            //
+            // READ-ONLY, deliberately. 0x1f2 has only ever been captured at a single value (6) on
+            // this model, so nothing establishes what writing to it does, and a write would be a
+            // guess dressed as a control.
+            if (this.raw_clip_state[0x192]) {
+                // Built as a const and then assigned, like compADry above: ComponentInfo does not
+                // declare `icon`, and a direct object literal would trip the excess-property check.
+                const compADryLevel = {
+                    platform: 'sensor',
+                    unique_id: '$deviceid-autodrylevel',
+                    name: 'Auto dry level',
+                    icon: 'mdi:hair-dryer',
+                    entity_category: 'diagnostic',
+                }
+                config['components']['autodrylevel'] = compADryLevel
+
+                this.addField(config, {
+                    id: 0x1f2,
+                    name: '',
+                    comp: 'autodrylevel',
+                    writable: false,
+                    // An unnamed level shows as its raw number rather than vanishing - the same
+                    // choice FX___S makes for a course it has no name for.
+                    read_xform: (raw) => autoDryLevels[raw] ?? `#${raw}`,
+                })
+            }
         }
 
         if (this.getIDUActionRunningTLVNum() != null) {
