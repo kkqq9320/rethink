@@ -921,6 +921,26 @@ describe(MODEL_ID, () => {
         assert.equal(ha.devices[DEVICE_ID].properties['compressor'], 'OFF')
     })
 
+    test('the compressor stops claiming to run once the appliance is switched off', (t) => {
+        const { ha, thinq } = readyDevice(t)
+
+        thinq.emit('data', buf(TELEMETRY_COMPRESSOR_ON_HEX))
+        assert.equal(ha.devices[DEVICE_ID].properties['compressor'], 'ON')
+
+        /*
+         * The telemetry record is the ONLY thing that publishes this sensor, and a switched-off
+         * appliance sends none - so without this the sensor keeps saying ON indefinitely. Measured
+         * against a smart plug on the same outlet: 13 h wrong on 2026-08-02 and 11 h wrong on
+         * 08-03, both while the appliance drew 2.7 W standby and the owner confirmed it was off.
+         */
+        thinq.emit('data', buf(STATE_POWER_OFF_HEX))
+        assert.equal(ha.devices[DEVICE_ID].properties['compressor'], 'OFF', 'off appliance, no compressor')
+
+        /* and the raw diagnostics are deliberately NOT faked - they still say what the last
+         * record said, which is what an unlabelled byte at offset N means */
+        assert.equal(ha.devices[DEVICE_ID].properties['telemetry_87'], 59)
+    })
+
     test('the compressor group is published raw, for an external meter to settle', (t) => {
         const { ha, thinq } = readyDevice(t)
         const props = () => ha.devices[DEVICE_ID].properties

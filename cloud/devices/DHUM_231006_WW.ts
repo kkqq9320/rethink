@@ -391,6 +391,28 @@ export default class Device extends TLVDevice {
             comp: 'humidifier',
             write_xform: (val) => (val === 'ON' ? 1 : 0),
             read_xform: (raw) => (raw ? 'ON' : 'OFF'),
+            /*
+             * The compressor sensor is published from the 0xa8 telemetry record and from nothing
+             * else, so when the appliance stops sending that record the sensor keeps whatever it
+             * said last - forever. Measured against a smart plug on the same outlet over 48 h:
+             *
+             *   2026-08-02 14:00 -> 08-03 03:35   sensor ON, plug 2.7 W   13 h wrong
+             *   2026-08-03 05:00 -> now           sensor ON, plug 2.7 W   11 h wrong
+             *
+             * The owner confirms the appliance was switched off in the early hours. The starts
+             * are right - the plug jumps to ~90 W within the same hour the sensor goes ON - it is
+             * only the stopping that is never reported, because there is nothing left to report
+             * it with.
+             *
+             * A compressor cannot run while the appliance is off, so power going off says OFF
+             * here directly. The raw telemetry sensors are left alone deliberately: they are
+             * unitless diagnostics that say what byte N was in the last record, and freezing at
+             * the last value is what that means.
+             */
+            read_callback: () => {
+                if (!this.raw_clip_state[0x1f7]) this.HA.publishProperty(this.id, 'compressor', 'OFF')
+                return true
+            },
         })
 
         this.addField(config, {
