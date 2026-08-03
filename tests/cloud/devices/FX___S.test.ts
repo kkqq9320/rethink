@@ -161,8 +161,10 @@ describe('FX___S washer', () => {
         // The 0x10 flag is still set here, so deriving `running` from it reported a finished wash as
         // running - seen on the appliance after the first deploy.
         assert.equal(get(HA, 'running'), 'OFF')
-        // ...and the course must still come through, since that byte is never consumed.
+        // ...and the course must still come through, since that byte is never consumed. The select
+        // holds it because it is what the next start will run; the sensor clears because nothing is on.
         assert.equal(get(HA, 'course'), 'AI Wash')
+        assert.equal(get(HA, 'current_course'), '-')
     })
 
     test('decodes a different course, proving the phase codes are not course-specific', () => {
@@ -591,7 +593,9 @@ describe('FX___S zero course byte', () => {
         assert.equal(get(HA, 'course'), 'AI Wash')
         feed(thinq, ZERO_COURSE_SNAPSHOT)
         assert.equal(get(HA, 'course'), 'AI Wash')
-        assert.equal(get(HA, 'current_course'), 'AI Wash')
+        // A record with neither a phase nor a course: the select keeps the selection, and the sensor
+        // clears because this frame is the appliance saying nothing is on, not a missing reading.
+        assert.equal(get(HA, 'current_course'), '-')
         // The rest of the record is still read: this frame really does say the appliance is off.
         assert.equal(get(HA, 'power'), 'OFF')
     })
@@ -610,5 +614,91 @@ describe('FX___S zero course byte', () => {
         dut.processRecord(rec)
         assert.deepEqual(courseOptions(HA), before)
         assert.equal(get(HA, 'course'), 'AI Wash')
+    })
+})
+
+describe('FX___S current course clears when nothing is running', () => {
+    // A record the appliance never sent in any capture: laundry care (phase 47) is real - it is what
+    // the "Laundry care when done" setting starts - but no capture caught the phase byte itself. It is
+    // synthesised here because the interesting case is the ORDER 42 -> 47 -> 0, and the only thing that
+    // needs to be true of the frame is its phase.
+    function record(phase: number, course = 0x72) {
+        const rec = Buffer.alloc(66)
+        rec[20] = phase
+        rec[4] = course
+        return rec
+    }
+
+    test('holds the course through standby and the whole cycle', () => {
+        const { HA, thinq } = setup()
+        feed(thinq, STANDBY)
+        assert.equal(get(HA, 'current_course'), 'AI Wash')
+        feed(thinq, STARTED)
+        assert.equal(get(HA, 'current_course'), 'AI Wash')
+        feed(thinq, RINSING)
+        assert.equal(get(HA, 'current_course'), 'AI Wash')
+    })
+
+    test('clears at complete, stays clear through laundry care, and stays clear when switched off', () => {
+        const { HA, thinq, dut } = setup()
+        feed(thinq, STANDBY)
+
+        dut.processRecord(record(42))
+        assert.equal(get(HA, 'current_course'), '-')
+        // The flicker this is here to prevent: care follows complete on every cycle that ends with the
+        // setting on, and restoring the name for its duration would read as a second wash starting.
+        dut.processRecord(record(47))
+        assert.equal(get(HA, 'current_course'), '-')
+        dut.processRecord(record(0))
+        assert.equal(get(HA, 'current_course'), '-')
+    })
+
+    test('never writes the placeholder to the select, which would not accept it', () => {
+        const { HA, thinq, dut } = setup()
+        feed(thinq, STANDBY)
+        dut.processRecord(record(42))
+
+        // '-' is not one of the select's options and Home Assistant rejects a state that is not, so the
+        // select must keep the selection - which is also what the next start will actually run.
+        assert.equal(get(HA, 'course'), 'AI Wash')
+        assert.ok(!courseOptions(HA).includes('-'))
+    })
+
+    test('comes back on its own when a course is selected again', () => {
+        const { HA, thinq, dut } = setup()
+        feed(thinq, COMPLETE)
+        assert.equal(get(HA, 'current_course'), '-')
+        dut.processRecord(record(1, 0x2e))
+        assert.equal(get(HA, 'current_course'), 'Normal')
+    })
+})
+
+describe('FX___S entity names', () => {
+    const nameOf = (HA: MockHAConnection, key: string) =>
+        (HA.devices[DEVICE_ID].config!.components[key] as unknown as { name: string }).name
+
+    test('the seven writable cycle settings are grouped under one prefix', () => {
+        const { HA } = setup()
+        assert.deepEqual(
+            ['course', 'wash', 'water_temp', 'rinse', 'spin', 'steam', 'turbowash'].map((k) => nameOf(HA, k)),
+            [
+                'Course - Select',
+                'Course - Wash',
+                'Course - Water temperature',
+                'Course - Rinse',
+                'Course - Spin',
+                'Course - Steam',
+                'Course - TurboShot',
+            ],
+        )
+    })
+
+    test('the readings that describe the cycle keep their own names', () => {
+        const { HA } = setup()
+        // These report what the appliance is doing rather than setting it, so grouping them with the
+        // controls would say they are adjustable.
+        assert.equal(nameOf(HA, 'current_course'), 'Current course')
+        assert.equal(nameOf(HA, 'cycle_plan'), 'Cycle plan')
+        assert.equal(nameOf(HA, 'remaining_time'), 'Remaining time')
     })
 })

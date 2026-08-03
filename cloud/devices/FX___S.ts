@@ -181,6 +181,18 @@ const TIMED_PHASES = new Set([3, 37, 11, 40, 12, 14, PHASE_PAUSED])
 // says Paused, and a "Running" sensor that stays on through a pause is no use in an automation.
 const ACTIVE_PHASES = new Set([3, 37, 11, 40, 12, 14, PHASE_CARE])
 
+// Phases in which no cycle is under way any more, so `current_course` reads as a leftover rather than as
+// information - the course byte itself survives the cycle, the finished state and being powered off.
+//
+// The owner asked for 0 and 42. Laundry care (47) is in here as well because it only ever follows 42:
+// clearing at 42, restoring the name for the length of the care run and clearing it again at 0 would
+// flicker the sensor through "-" -> "AI Wash" -> "-" on every cycle that ends with care switched on.
+// Nothing before the wash is included - standby has a course selected and waiting, which is the one
+// moment the name matters most.
+const FINISHED_PHASES = new Set([PHASE_OFF, PHASE_DONE, PHASE_CARE])
+// Deliberately not '' or 'none': the sensor has no device_class, so this is what shows on the dashboard.
+const COURSE_CLEARED = '-'
+
 // ---------------------------------------------------------------------------------------------------
 // Settings keys, all confirmed by single-variable writes made from the LG app.
 const KEY_COURSE = 0x0a
@@ -520,12 +532,21 @@ export default class Device extends AABBDevice {
                         icon: 'mdi:counter',
                         entity_category: 'diagnostic',
                     },
+                    // The seven entities below WRITE the next cycle's settings, and Home Assistant sorts
+                    // a device's entities by name, which scattered them among the readings. The shared
+                    // "Course - " prefix groups them, and marks them as the ones that change something -
+                    // the readings that describe the cycle (Current course, Cycle plan, Remaining time)
+                    // deliberately keep their own names.
+                    //
+                    // This is a display change only: an entity_id is assigned when the entity is first
+                    // created and is not re-derived when the name changes, so anything already pointing
+                    // at select.lg_washer_course keeps working.
                     course: {
                         platform: 'select',
                         unique_id: '$deviceid-course',
                         state_topic: '$this/course',
                         command_topic: '$this/course/set',
-                        name: 'Course',
+                        name: 'Course - Select',
                         icon: 'mdi:playlist-check',
                         // Grows as the appliance declares its dial or reports a course we have no name
                         // for; see courseOptions. Republished by setCourseOptions when it does.
@@ -536,7 +557,7 @@ export default class Device extends AABBDevice {
                         unique_id: '$deviceid-wash',
                         state_topic: '$this/wash',
                         command_topic: '$this/wash/set',
-                        name: 'Wash',
+                        name: 'Course - Wash',
                         icon: 'mdi:washing-machine',
                         options: Object.values(WASH),
                     },
@@ -545,7 +566,7 @@ export default class Device extends AABBDevice {
                         unique_id: '$deviceid-water-temp',
                         state_topic: '$this/water_temp',
                         command_topic: '$this/water_temp/set',
-                        name: 'Water temperature',
+                        name: 'Course - Water temperature',
                         icon: 'mdi:thermometer-water',
                         options: Object.values(WATER_TEMP),
                     },
@@ -554,7 +575,7 @@ export default class Device extends AABBDevice {
                         unique_id: '$deviceid-rinse',
                         state_topic: '$this/rinse',
                         command_topic: '$this/rinse/set',
-                        name: 'Rinse',
+                        name: 'Course - Rinse',
                         icon: 'mdi:water',
                         options: RINSE.map(String),
                     },
@@ -563,7 +584,7 @@ export default class Device extends AABBDevice {
                         unique_id: '$deviceid-spin',
                         state_topic: '$this/spin',
                         command_topic: '$this/spin/set',
-                        name: 'Spin',
+                        name: 'Course - Spin',
                         icon: 'mdi:rotate-right',
                         options: Object.values(SPIN),
                     },
@@ -572,7 +593,7 @@ export default class Device extends AABBDevice {
                         unique_id: '$deviceid-turbowash',
                         state_topic: '$this/turbowash',
                         command_topic: '$this/turbowash/set',
-                        name: 'TurboShot',
+                        name: 'Course - TurboShot',
                         icon: 'mdi:car-turbocharger',
                     },
                     steam: {
@@ -580,7 +601,7 @@ export default class Device extends AABBDevice {
                         unique_id: '$deviceid-steam',
                         state_topic: '$this/steam',
                         command_topic: '$this/steam/set',
-                        name: 'Steam',
+                        name: 'Course - Steam',
                         icon: 'mdi:kettle-steam',
                     },
                     beep: {
@@ -803,6 +824,12 @@ export default class Device extends AABBDevice {
 
         // Recomputed only when the minute count actually moves. Doing it on every frame would push a
         // slightly different timestamp several times a second and fill the recorder with noise.
+        //
+        // 'None' is the right payload for "no finish time", and that was measured rather than assumed
+        // after it was reported as the cause of a log error. Published to this very topic on the live
+        // instance: 'None' sets the sensor to unknown SILENTLY, while an empty payload sets it to
+        // unknown and logs `Invalid state message '' from ...` - mqtt/sensor.py special-cases the
+        // string and treats everything else it cannot parse as an error. Do not "fix" this to ''.
         if (remaining !== this.lastRemaining) {
             this.lastRemaining = remaining
             this.publishProperty(
@@ -819,14 +846,21 @@ export default class Device extends AABBDevice {
         // zero identifier, but the same reasoning applies and the alternative is publishing "#ext0".
         const course = rec[OFF_COURSE]
         const identifier = course === COURSE_EXTENDED ? rec[OFF_COURSE_EXT] : course
-        if (identifier !== COURSE_NONE) {
-            const label = this.courseLabel(course, rec[OFF_COURSE_EXT])
+        const label = identifier === COURSE_NONE ? undefined : this.courseLabel(course, rec[OFF_COURSE_EXT])
+        if (label !== undefined) {
             this.registerCourse(label)
             this.publishProperty('course', label)
-            this.publishProperty('current_course', label)
             // Depends only on which course is selected, so it is published in every phase, not just standby.
             this.publishLimits(course, rec[OFF_COURSE_EXT])
         }
+
+        // The select holds the SELECTION and keeps it - it is what the next start will run, and '-' is
+        // not one of its options, so Home Assistant would reject it. This sensor answers a different
+        // question, "what is the washer doing", and once the answer is "nothing" the leftover name reads
+        // as a cycle that is still on. It clears even when the course byte is absent, because a record
+        // that reports neither a phase nor a course is the emptiest evidence there is that nothing is on.
+        if (FINISHED_PHASES.has(phase)) this.publishProperty('current_course', COURSE_CLEARED)
+        else if (label !== undefined) this.publishProperty('current_course', label)
 
         // The rest are consumed as the appliance works through them and read 0 from the first stage
         // onwards, so they only report the selection while it sits at standby. Anywhere else,
