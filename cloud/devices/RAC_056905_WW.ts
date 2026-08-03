@@ -11,6 +11,11 @@ import HADevice from './base'
 type PowerModeChangeHook = () => void
 type CheckMode = (arg: number) => boolean
 
+// Operating modes by their 0x1f9 wire value, which is also their bit position in the 0x2c1
+// capability mask. One table, read one way to build the mode list HA is offered and the other
+// way to turn a selection back into a wire value - they cannot drift apart.
+const clipOpModes: Record<number, string> = { 0: 'cool', 1: 'dry', 2: 'fan_only', 4: 'heat', 6: 'auto' }
+
 // LG's own names for the auto-dry strength axis, taken from this model's ThinQ model JSON
 // (`support.airState.autoDry.windStrength`). The index is the bit position in the 0x192
 // capability mask, which on this axis is also the value 0x1f2 carries: on PAC_910604_WW the five
@@ -271,6 +276,32 @@ export default class Device extends TLVDevice {
     }
 
     initMakeSetConfig() {
+        /*
+         * Which operating modes this appliance actually has, from 0x2c1 - a bitmask whose bit
+         * index is the value 0x1f9 carries. Three sources agree on the unit this was measured
+         * on: the mask reads 7 (bits 0,1,2), the 0x2d7 mode list in the same capability reply
+         * is 0,1,2, and LG's ThinQ model JSON declares support.airState.opMode as cool/dry/fan
+         * for this modelId.
+         *
+         * It cannot be a per-model constant. A second, real RAC_056905_WW - the one the test
+         * fixtures were taken from - reads 0x2c1 = 87, bits 0,1,2,4,6, and does have heat and
+         * auto. One modelId, two different sets of modes.
+         *
+         * Left unset, HA falls back to its own default list and offers heat and auto on a unit
+         * that has neither; selecting one is ACKed on the wire and never comes back in a state
+         * frame, so the entity silently disagrees with the appliance. An appliance that does not
+         * report 0x2c1 at all keeps that fallback rather than getting an empty list.
+         */
+        const opModeMask = this.raw_clip_state[0x2c1]
+        const opModes = opModeMask
+            ? [
+                  'off',
+                  ...Object.entries(clipOpModes)
+                      .filter(([bit]) => (opModeMask >> Number(bit)) & 1)
+                      .map(([, name]) => name),
+              ]
+            : undefined
+
         const config: DeviceDiscovery & { components: { climate: ClimateComponent } } = allowExtendedType({
             ...HADevice.config(this.meta, { name: 'LG Air Conditioner' }),
             components: {
@@ -288,7 +319,7 @@ export default class Device extends TLVDevice {
                     max_temp: 30,
                     /* TODO: get from 0x2c2 */
                     fan_modes: ['auto', 'very low', 'low', 'medium', 'high', 'very high'],
-                    /* TODO: get allowed op modes from 0x2c1 */
+                    ...(opModes ? { modes: opModes } : {}),
                 } satisfies ClimateComponent,
             },
         })
@@ -338,7 +369,7 @@ export default class Device extends TLVDevice {
                 return true
             },
             write_xform: (val) => {
-                const modes2clip: Record<string, number> = { cool: 0, dry: 1, fan_only: 2, heat: 4, auto: 6 }
+                const modes2clip = Object.fromEntries(Object.entries(clipOpModes).map(([clip, ha]) => [ha, +clip]))
                 if (val === 'off') {
                     // Call function power (0x1f7) with value OFF
                     this.setProperty('climate-power', 'OFF')
@@ -596,12 +627,25 @@ export default class Device extends TLVDevice {
         }
 
         if (this.raw_clip_state[0x2cc] & 4) {
+            /*
+             * Auto dry is a control on this appliance, not a readout. The owner operates both the
+             * on/off and the strength from the official app, which is what settles it - a
+             * read-only binary_sensor cannot express that and loses the control entirely.
+             *
+             * The wire encoding is inherited rather than measured HERE, and that distinction is
+             * worth keeping: no write to 0x20e or 0x1f2 has ever been captured from a RAC. What
+             * exists is PAC_910604_WW, same TLV protocol and same two tags, where both writes are
+             * captured and deployed - 0x20e takes 255 and 0 and 0x1f2 takes 2..6 - and this unit
+             * reads 0x20e = 255 and 0x1f2 = 6, inside both of those domains. If a write turns out
+             * not to take, capture the app doing it and correct this; the appliance ACKs and
+             * ignores what it does not accept, which is quiet rather than harmful.
+             */
             const compADry = {
-                platform: 'binary_sensor',
+                platform: 'switch',
                 unique_id: '$deviceid-autodry',
                 name: 'Auto dry',
                 icon: 'mdi:hair-dryer',
-                entity_category: 'diagnostic',
+                entity_category: 'config',
             }
             const compADryRem = {
                 platform: 'sensor',
@@ -619,7 +663,9 @@ export default class Device extends TLVDevice {
                 id: 0x20e,
                 name: '',
                 comp: 'autodry',
-                writable: false,
+                // 255, not the 1 that addConfigSwitchField writes: that is the value this unit
+                // reports for "on" and the value PAC_910604_WW's captured writes carry.
+                write_xform: (val) => (val === 'ON' ? 255 : 0),
                 read_xform: (raw) => (raw ? 'ON' : 'OFF'),
             })
 
@@ -630,23 +676,27 @@ export default class Device extends TLVDevice {
                 writable: false,
             })
 
-            // Auto dry has a strength axis as well as an on/off, on 0x1f2, and which strengths
-            // exist is the appliance's own answer in 0x192 rather than a per-model constant: the
-            // unit this was measured on declares bits 2/4/6 (low/mid/high) where PAC_910604_WW
-            // declares all five of 2-6. Hence the gate on 0x192 - a unit without it gets no entity.
+            // The strength axis, 0x1f2. Which strengths exist is the appliance's own answer in
+            // 0x192, not a per-model constant: this unit declares bits 2/4/6 - low/mid/high, three
+            // of them - where PAC_910604_WW declares all five of 2-6 and offers 1단..5단. So the
+            // options are built from the mask and a unit that does not report it gets no entity.
             //
-            // READ-ONLY, deliberately. 0x1f2 has only ever been captured at a single value (6) on
-            // this model, so nothing establishes what writing to it does, and a write would be a
-            // guess dressed as a control.
-            if (this.raw_clip_state[0x192]) {
+            // PAC_910604_WW reaches the same axis through addSelectField with a contiguous rawBase,
+            // which cannot express 2/4/6; hence the explicit mapping here.
+            const declaredLevels = Object.keys(autoDryLevels)
+                .map(Number)
+                .filter((bit) => (this.raw_clip_state[0x192] >> bit) & 1)
+
+            if (declaredLevels.length) {
                 // Built as a const and then assigned, like compADry above: ComponentInfo does not
                 // declare `icon`, and a direct object literal would trip the excess-property check.
                 const compADryLevel = {
-                    platform: 'sensor',
+                    platform: 'select',
                     unique_id: '$deviceid-autodrylevel',
                     name: 'Auto dry level',
                     icon: 'mdi:hair-dryer',
-                    entity_category: 'diagnostic',
+                    options: declaredLevels.map((bit) => autoDryLevels[bit]),
+                    entity_category: 'config',
                 }
                 config['components']['autodrylevel'] = compADryLevel
 
@@ -654,10 +704,10 @@ export default class Device extends TLVDevice {
                     id: 0x1f2,
                     name: '',
                     comp: 'autodrylevel',
-                    writable: false,
-                    // An unnamed level shows as its raw number rather than vanishing - the same
-                    // choice FX___S makes for a course it has no name for.
+                    // A level outside the declared set shows as its raw number rather than
+                    // vanishing - the same choice FX___S makes for a course it has no name for.
                     read_xform: (raw) => autoDryLevels[raw] ?? `#${raw}`,
+                    write_xform: (val) => declaredLevels.find((bit) => autoDryLevels[bit] === val),
                 })
             }
         }

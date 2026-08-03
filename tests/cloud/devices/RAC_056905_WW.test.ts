@@ -4,6 +4,13 @@ import DUT from '@/cloud/devices/RAC_056905_WW'
 import type { Metadata } from '@/cloud/thinq'
 import { MockHAConnection, MockThinq2Device, buf, hex } from '@/tests/helpers/mocks'
 import { enableMockTimers, tickMockTimers } from '@/tests/helpers/timers'
+import * as TLV from '@/util/tlv'
+
+/** The TLVs a frame carries. Lets a write be asserted on meaning rather than on bytes, which
+ *  matters where no capture of that write exists to compare against. */
+function tlvOf(frame: Buffer) {
+    return TLV.parse(frame.subarray(11, 11 + frame[10])).map(({ t, v }) => ({ t, v }))
+}
 
 const DEVICE_ID = 'test-id'
 const MODEL_ID = 'RAC_056905_WW'
@@ -123,6 +130,9 @@ describe(MODEL_ID, () => {
         // Conversely, airclean (0x2CC bit 0x1) is not unlocked.
         assert.ok(!components.airclean, 'airclean off (0x2CC bit 0x1 unset)')
 
+        // 0x2C1=87 is bits 0,1,2,4,6 - this unit really does have heat and auto.
+        assert.deepEqual(components.climate.modes, ['off', 'cool', 'dry', 'fan_only', 'heat', 'auto'])
+
         // Swing modes registered because 0x2CD has both 0x4 and 0x8.
         assert.deepEqual(components.climate.swing_modes, ['1', '2', '3', '4', '5', '6', 'on', 'off'])
         assert.deepEqual(components.climate.swing_horizontal_modes, [
@@ -227,15 +237,44 @@ describe(MODEL_ID, () => {
 
         const components = ha.devices[DEVICE_ID].config!.components as Record<string, Record<string, unknown>>
         assert.ok(components.autodry, 'autodry (0x2CC bit 0x4, as on the other unit)')
+        assert.equal(components.autodry.platform, 'switch', 'the owner operates this from the app')
         assert.ok(components.autodrylevel, 'autodrylevel (because this unit reports 0x192)')
-        assert.equal(components.autodrylevel.platform, 'sensor')
+        assert.equal(components.autodrylevel.platform, 'select')
 
-        // 0x192=84 is bits 2/4/6, so this unit offers low/mid/high - not the five PAC_910604_WW
-        // declares - and the captured 0x1F2=6 is the top of its own set.
+        // 0x192=84 is bits 2/4/6, so this unit offers three strengths - not the five
+        // PAC_910604_WW declares - and the captured 0x1F2=6 is the top of its own set.
+        assert.deepEqual(components.autodrylevel.options, ['low', 'mid', 'high'])
         assert.equal(ha.getProperty(DEVICE_ID, 'autodrylevel', 'state'), 'high')
+        assert.equal(ha.getProperty(DEVICE_ID, 'autodry', 'state'), 'ON') // 0x20E=255
 
-        // The same capture is also the evidence that one modelId spans different hardware.
+        // The same capture is also the evidence that one modelId spans different hardware, and
+        // the mode list has to follow the appliance rather than the model name: 0x2C1=7 here
+        // against 87 in the other fixture, so no heat and no auto are offered on this one.
         assert.equal(dev.raw_clip_state[0x2c1], 7, 'cool/dry/fan_only only - no heat, no auto')
+        assert.deepEqual(components.climate.modes, ['off', 'cool', 'dry', 'fan_only'])
+
+        dev.drop()
+    })
+
+    test('auto dry writes carry the strength the mask names, not its position', (t) => {
+        enableMockTimers(t)
+        const { ha, thinq, dev } = makeDevice()
+        thinq.resetRecorder()
+        thinq.emit('data', buf(CAPS_RESPONSE_WALL_HEX))
+        thinq.emit('data', buf(QUERY_RESPONSE_WALL_HEX))
+        tickMockTimers(t, 6000)
+        thinq.resetRecorder()
+
+        // 'mid' is the second option offered, but its wire value is 4 - bit 4 of 0x192 - not 1.
+        // A contiguous base+index select would send 3 here, which is why this one maps explicitly.
+        ha.setProperty(DEVICE_ID, 'autodrylevel', 'command', 'mid')
+        assert.equal(thinq.outbox.length, 1)
+        assert.deepEqual(tlvOf(thinq.outbox[0]), [{ t: 0x1f2, v: 4 }])
+
+        thinq.resetRecorder()
+        ha.setProperty(DEVICE_ID, 'autodry', 'command', 'OFF')
+        assert.equal(thinq.outbox.length, 1)
+        assert.deepEqual(tlvOf(thinq.outbox[0]), [{ t: 0x20e, v: 0 }])
 
         dev.drop()
     })
