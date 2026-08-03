@@ -760,6 +760,75 @@ export default class Device extends TLVDevice {
             }
         }
 
+        /*
+         * Six controls the appliance had been reporting and nobody was reading, all decoded in
+         * one capture session (`wall-features-20260803.jsonl`): the owner toggled each one in the
+         * official app while rethink recorded, so every tag below is a MEASURED write with a
+         * measured echo, not an inference from a sibling model.
+         *
+         * Note ordering in that capture: the notes were typed AFTER each action, not before. The
+         * sound pair settles it - a note-before reading leaves "사운드 끄기" with no 0x3a0=0 after
+         * it anywhere, and a note-after reading produces the inverted polarity that DHUM_231006_WW
+         * and PAC_910604_WW had each measured independently. Worth stating because the whole
+         * mapping flips on it.
+         *
+         *   0x3a0  버튼음        INVERTED - 0 is on, 1 is off. Same polarity as the other two.
+         *   0x12d  굿슬립
+         *   0x12f  굿슬립 시작 온도 자동 설정
+         *   0x133  굿슬립 맞춤 온도 조절
+         *   0x3a2  열교환기 세척  1 starts, 0 stops
+         *   0x165  올클리닝      100 starts, 0 stops, and it READS BACK 2 while running
+         *
+         * Each is gated on the capability its own reply declares, so a unit without the feature
+         * gets no entity. 스마트케어 is deliberately absent: 0x2ca declares SMARTCARE_2_0_COOL on
+         * this unit but the app offers no such control, which is the appliance over-declaring -
+         * the same shape as support.reserve over-declaring WEEKLY_SCHEDULE.
+         */
+        if (this.raw_clip_state[0x374] & 4) {
+            this.addConfigSwitchField(config, 0x3a0, 'beep', 'Beep sound', 'mdi:volume-high', {
+                onValue: 0,
+                offValue: 1,
+            })
+        }
+
+        if (this.raw_clip_state[0x2f0] & 8) {
+            this.addConfigSwitchField(config, 0x12d, 'goodsleep', 'Good sleep', 'mdi:sleep')
+            // Both are settings inside 굿슬립 in the app, and neither has a capability bit of its
+            // own that has been identified - they ride on GOODSLEEP.
+            this.addConfigSwitchField(
+                config,
+                0x12f,
+                'goodsleepstarttemp',
+                'Good sleep auto start temperature',
+                'mdi:thermometer-auto',
+            )
+            this.addConfigSwitchField(
+                config,
+                0x133,
+                'goodsleepcustomtemp',
+                'Good sleep custom temperature',
+                'mdi:thermometer-lines',
+            )
+        }
+
+        if (this.raw_clip_state[0x350] & 8) {
+            this.addConfigSwitchField(
+                config,
+                0x3a2,
+                'heatexchangerclean',
+                'Heat exchanger cleaning',
+                'mdi:snowflake-melt',
+                { category: 'diagnostic' },
+            )
+        }
+
+        if (this.raw_clip_state[0x34f] & (1 << 17)) {
+            this.addConfigSwitchField(config, 0x165, 'allclean', 'All cleaning', 'mdi:spray-bottle', {
+                onValue: 100,
+                category: 'diagnostic',
+            })
+        }
+
         if (this.getIDUActionRunningTLVNum() != null) {
             this.addField(
                 config,
@@ -1069,13 +1138,21 @@ export default class Device extends TLVDevice {
         )
     }
 
-    addConfigSwitchField(config: DeviceDiscovery, id: number, name: string, desc: string, icon: string) {
+    addConfigSwitchField(
+        config: DeviceDiscovery,
+        id: number,
+        name: string,
+        desc: string,
+        icon: string,
+        opts: { onValue?: number; offValue?: number; category?: 'config' | 'diagnostic' } = {},
+    ) {
+        const { onValue = 1, offValue = 0, category = 'config' } = opts
         const comp = {
             platform: 'switch',
             unique_id: '$deviceid-' + name,
             name: desc,
             icon: icon,
-            entity_category: 'config',
+            entity_category: category,
         }
         config['components'][name] = comp
 
@@ -1083,8 +1160,11 @@ export default class Device extends TLVDevice {
             id: id,
             name: '',
             comp: name,
-            write_xform: (val) => (val === 'ON' ? 1 : 0),
-            read_xform: (raw) => (raw ? 'ON' : 'OFF'),
+            write_xform: (val) => (val === 'ON' ? onValue : offValue),
+            // Compared against the OFF value rather than the ON value, because a tag need not
+            // read back what was written: 0x165 takes 100 to start and then reports 2 while it
+            // runs. With the default offValue of 0 this is the old `raw ? ON : OFF` exactly.
+            read_xform: (raw) => (raw === offValue ? 'OFF' : 'ON'),
         })
     }
 

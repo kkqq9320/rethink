@@ -309,6 +309,46 @@ describe(MODEL_ID, () => {
         dev.drop()
     })
 
+    test('the six app-decoded controls appear, in the categories they belong in', (t) => {
+        enableMockTimers(t)
+        const { ha, thinq, dev } = makeDevice()
+        thinq.resetRecorder()
+        thinq.emit('data', buf(CAPS_RESPONSE_WALL_HEX))
+        thinq.emit('data', buf(QUERY_RESPONSE_WALL_HEX))
+        tickMockTimers(t, 6000)
+
+        const components = ha.devices[DEVICE_ID].config!.components as Record<string, Record<string, unknown>>
+        for (const [name, category] of [
+            ['beep', 'config'],
+            ['goodsleep', 'config'],
+            ['goodsleepstarttemp', 'config'],
+            ['goodsleepcustomtemp', 'config'],
+            ['heatexchangerclean', 'diagnostic'],
+            ['allclean', 'diagnostic'],
+        ] as const) {
+            assert.ok(components[name], `${name} present`)
+            assert.equal(components[name].entity_category, category, `${name} category`)
+        }
+
+        // 0x3A0 is inverted, measured that way on this appliance and on two others: 0 is on.
+        thinq.resetRecorder()
+        ha.setProperty(DEVICE_ID, 'beep', 'command', 'ON')
+        assert.deepEqual(tlvOf(thinq.outbox[0]), [{ t: 0x3a0, v: 0 }])
+
+        // 0x165 starts with 100 and reports 2 while running, so ON must not be read as "equals
+        // what we wrote" - that would leave the switch stuck off through the whole cycle. Both
+        // numbers are from the capture: TX 0x165=100 at +137.2s, rx 0x165=2 at +137.5s.
+        thinq.resetRecorder()
+        ha.setProperty(DEVICE_ID, 'allclean', 'command', 'ON')
+        assert.deepEqual(tlvOf(thinq.outbox[0]), [{ t: 0x165, v: 100 }])
+
+        const allclean = dev.fields_by_id[0x165]
+        assert.equal(allclean.read_xform!(2), 'ON', 'reads back 2 while running')
+        assert.equal(allclean.read_xform!(0), 'OFF')
+
+        dev.drop()
+    })
+
     test('auto dry level stays absent on a unit that does not report 0x192', (t) => {
         const { ha, dev } = buildReadyDevice(t)
 
