@@ -102,7 +102,7 @@ describe('FX___S washer', () => {
         feed(thinq, STANDBY)
 
         assert.equal(get(HA, 'power'), 'ON')
-        assert.equal(get(HA, 'status'), 'standby')
+        assert.equal(get(HA, 'status'), 'initial')
         assert.equal(get(HA, 'status_code'), 1)
         assert.equal(get(HA, 'running'), 'OFF')
         assert.equal(get(HA, 'remaining_time'), 0) // not a timed phase
@@ -121,7 +121,7 @@ describe('FX___S washer', () => {
         const { HA, thinq } = setup()
         feed(thinq, STARTED)
 
-        assert.equal(get(HA, 'status'), 'starting')
+        assert.equal(get(HA, 'status'), 'detecting')
         assert.equal(get(HA, 'status_code'), 3)
         assert.equal(get(HA, 'running'), 'ON')
         assert.equal(get(HA, 'drum_active'), 'ON')
@@ -155,7 +155,7 @@ describe('FX___S washer', () => {
         const { HA, thinq } = setup()
         feed(thinq, COMPLETE)
 
-        assert.equal(get(HA, 'status'), 'complete')
+        assert.equal(get(HA, 'status'), 'end')
         assert.equal(get(HA, 'status_code'), 42)
         assert.equal(get(HA, 'remaining_time'), 0)
         // The 0x10 flag is still set here, so deriving `running` from it reported a finished wash as
@@ -183,7 +183,7 @@ describe('FX___S washer', () => {
         feed(thinq, POWERED_OFF)
 
         assert.equal(get(HA, 'power'), 'OFF')
-        assert.equal(get(HA, 'status'), 'off')
+        assert.equal(get(HA, 'status'), 'power_off')
         assert.equal(get(HA, 'running'), 'OFF')
         assert.equal(get(HA, 'total_time'), 0)
         // Powering off clears the phase, the clock and wash/temperature/rinse, but NOT these two -
@@ -202,7 +202,7 @@ describe('FX___S washer', () => {
         const { HA, thinq } = setup()
         feed(thinq, SETTINGS_REPLY_POWER_OFF)
 
-        assert.equal(get(HA, 'status'), 'off')
+        assert.equal(get(HA, 'status'), 'power_off')
         assert.equal(get(HA, 'status_code'), 0)
     })
 
@@ -263,7 +263,7 @@ describe('FX___S washer', () => {
         assert.equal(get(HA, 'wrinkle_care'), 'OFF')
         assert.equal(get(HA, 'turbowash'), 'ON')
         // The same bit was read as "a cycle is loaded" before this was isolated on the panel.
-        assert.equal(get(HA, 'status'), 'standby')
+        assert.equal(get(HA, 'status'), 'initial')
         assert.equal(get(HA, 'running'), 'OFF')
     })
 
@@ -315,7 +315,7 @@ describe('FX___S washer', () => {
         // Switching it off at the panel drops the connection; going unavailable would throw away a
         // state we know is correct and read as a network fault.
         assert.equal(HA.devices[DEVICE_ID].availability, 'online')
-        assert.equal(get(HA, 'status'), 'off')
+        assert.equal(get(HA, 'status'), 'power_off')
     })
 
     test('goes unavailable when it drops from any other state', () => {
@@ -700,5 +700,56 @@ describe('FX___S entity names', () => {
         assert.equal(nameOf(HA, 'current_course'), 'Current course')
         assert.equal(nameOf(HA, 'cycle_plan'), 'Cycle plan')
         assert.equal(nameOf(HA, 'remaining_time'), 'Remaining time')
+    })
+})
+
+describe('FX___S status names follow the appliance, aligned against LG on one clock', () => {
+    // Every pair below was measured, not chosen: our phase byte and the LG cloud's own status for this
+    // appliance were laid on one timeline across three washes (2026-07-30 from the capture, two more on
+    // 2026-08-03 from Home Assistant's recorder) and each of our transitions had exactly one cloud
+    // transition beside it. See the table above STATUS in the handler.
+    const MEASURED: [number, string][] = [
+        [0, 'power_off'],
+        [1, 'initial'],
+        [2, 'pause'],
+        [3, 'detecting'],
+        [37, 'detecting'],
+        [11, 'running'],
+        [40, 'detecting'], // the appliance re-senses mid-wash; this is not a second name for washing
+        [12, 'rinsing'],
+        [14, 'spinning'],
+        [42, 'end'],
+        [47, 'refreshing'],
+    ]
+
+    for (const [phase, name] of MEASURED) {
+        test(`phase ${phase} is ${name}`, () => {
+            const { HA, dut } = setup()
+            const rec = Buffer.alloc(66)
+            rec[20] = phase
+            dut.processRecord(rec)
+            assert.equal(get(HA, 'status'), name)
+            assert.equal(get(HA, 'status_code'), phase)
+        })
+    }
+
+    test('every name it can publish is one of the options it declared', () => {
+        const { HA, dut } = setup()
+        const declared = (HA.devices[DEVICE_ID].config!.components.status as unknown as { options: string[] }).options
+
+        for (const [phase] of MEASURED) {
+            const rec = Buffer.alloc(66)
+            rec[20] = phase
+            dut.processRecord(rec)
+            assert.ok(declared.includes(String(get(HA, 'status'))), `${phase} publishes a declared option`)
+        }
+
+        // A phase we have never seen. The fallback used to be 'Unknown', which is not in the list - and
+        // a sensor with device_class 'enum' has its state rejected when it is not one of the options.
+        const rec = Buffer.alloc(66)
+        rec[20] = 200
+        dut.processRecord(rec)
+        assert.equal(get(HA, 'status'), 'unknown')
+        assert.ok(declared.includes('unknown'))
     })
 })

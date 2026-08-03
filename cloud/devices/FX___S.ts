@@ -154,21 +154,45 @@ const PHASE_PAUSED = 2
 const PHASE_DONE = 42
 const PHASE_CARE = 47
 
-// Phase codes. 11/40 alternate through the wash stage and 3/37 lead into it; the four confirmed stages
-// were each pinned by watching which option byte had just cleared. 3 and 37 were never isolated to a
-// named stage, so they stay generic rather than being guessed into "Sensing"/"Filling".
+// Phase codes, named as LG names them. Every one of these was pinned by laying our phase byte and the
+// LG cloud's own status for the same appliance on one clock, across three washes - 2026-07-30 (the
+// capture, aligned to the cloud's history for those minutes) and two on 2026-08-03 (both timelines
+// straight out of Home Assistant's recorder). Each of our transitions has exactly one cloud transition
+// beside it, and where two of our codes carry the same name the cloud does not move at all, which is
+// what makes the pairing 1:1 rather than a guess:
+//
+//   ours       LG           evidence
+//   0          power_off    all three
+//   1          initial      all three
+//   2          pause        7/30, twice; the second matched to 0.5 s
+//   3          detecting    7/30, matched to 0.02 s
+//   37         detecting    7/30 and 8/03; no cloud transition, it was already detecting
+//   11         running      all three, five times
+//   40         detecting    all three, five times - the appliance re-senses mid-wash
+//   12         rinsing      all three
+//   14         spinning     all three
+//   42         end          all three
+//   47         refreshing   7/30, twice
+//
+// The 7/30 capture's clock runs 13 s ahead of Home Assistant's, which shows up as a CONSTANT offset -
+// six transitions match to under a second once it is applied, including two that match exactly. A
+// semantic mismatch would not be constant, which is why the offset is a clock and not a doubt.
+//
+// The cloud is the LABEL SOURCE, not the judge: our byte is the measurement and LG's name is what they
+// call it. Renaming these to LG's vocabulary is deliberate - the same appliance is also visible through
+// the official integration, and two names for one stage is worse than either name.
 const STATUS: Record<number, string> = {
-    [PHASE_OFF]: 'off',
-    [PHASE_STANDBY]: 'standby',
-    [PHASE_PAUSED]: 'paused',
-    3: 'starting',
-    37: 'starting',
-    11: 'washing',
-    40: 'washing',
+    [PHASE_OFF]: 'power_off',
+    [PHASE_STANDBY]: 'initial',
+    [PHASE_PAUSED]: 'pause',
+    3: 'detecting',
+    37: 'detecting',
+    11: 'running',
+    40: 'detecting',
     12: 'rinsing',
     14: 'spinning',
-    [PHASE_DONE]: 'complete',
-    [PHASE_CARE]: 'laundry_care',
+    [PHASE_DONE]: 'end',
+    [PHASE_CARE]: 'refreshing',
 }
 const STATUS_OPTIONS = [...new Set(Object.values(STATUS))].concat('unknown')
 
@@ -799,7 +823,9 @@ export default class Device extends AABBDevice {
         const flags = rec[OFF_FLAGS]
 
         this.publishProperty('power', phase === PHASE_OFF ? 'OFF' : 'ON')
-        this.publishProperty('status', STATUS[phase] ?? 'Unknown')
+        // Lower case: this sensor declares device_class 'enum', and Home Assistant rejects a state that
+        // is not one of the declared options - 'Unknown' was not one of them, 'unknown' is.
+        this.publishProperty('status', STATUS[phase] ?? 'unknown')
         this.publishProperty('status_code', phase)
         this.publishProperty('running', ACTIVE_PHASES.has(phase) ? 'ON' : 'OFF')
         this.publishProperty('drum_active', flags & FLAG_DRUM_ACTIVE ? 'ON' : 'OFF')
