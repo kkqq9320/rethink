@@ -520,10 +520,11 @@ export default class Device extends TLVDevice {
          * the level - and both are read-only, because this is the appliance counting down,
          * not a setting.
          *
-         * MINUTES, NOT PERCENT, and that is measured rather than inherited. RAC_056905_WW
-         * publishes the same tag as 'autodryremain' in '%'; do not copy that here. A capture
-         * of a real cycle on this appliance (aidry-run.jsonl) has the operator transcribing
-         * what the appliance's own display said, and the tag matches it exactly.
+         * MINUTES, NOT PERCENT, and that is measured rather than inherited. A capture of a real
+         * cycle on this appliance (aidry-run.jsonl) has the operator transcribing what the
+         * appliance's own display said, and the tag matches it exactly. RAC_056905_WW published
+         * the same tag in '%' until 2026-08-04, when a cycle was finally run on that unit and it
+         * counted minutes too; upstream and #122's 'binary' style still say '%'.
          *
          * READ THE WHOLE FILE. aidry-run.jsonl holds TWO capture sessions: a `stopped` marker
          * at t+213.8s and then a fresh `session` record at t+706.8s. An earlier version of

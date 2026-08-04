@@ -659,30 +659,32 @@ export default class Device extends TLVDevice {
                 entity_category: 'config',
             }
             /*
-             * OPEN QUESTION - the unit here is probably wrong, and it stays wrong until measured.
+             * MINUTES - measured on THIS appliance on 2026-08-04 (wall-autodry-20260804.jsonl),
+             * which is what the '%' this handler declared for years was always missing.
              *
-             * '%' is what this handler has always declared and it has no measurement behind it
-             * anywhere. Against it: PAC_910604_WW's capture has the operator transcribing the
-             * appliance's display beside ten values of 0x225 decrementing about once a minute,
-             * DHUM_231006_WW measured the same, and ac_common publishes `min`. Two appliances on
-             * this protocol say minutes; none says percent.
+             * The run: a cycle started at 12:07:17 KST with 0x225 = 8 while the official app
+             * showed 8분, and the value stepped 8 -> 7 in 59 s before the cancel button below took
+             * it to 0. Two readings that do not depend on each other - the appliance's own display
+             * as the app renders it, and a decrement rate that a percentage of an unknown-length
+             * cycle would not produce.
              *
-             * It was briefly changed to 'min' on that basis and changed back deliberately: 0x225
-             * has read 0 in all six observations across every capture of THIS appliance, because
-             * no auto-dry cycle has run while recording, so the change would have been inference
-             * dressed as a fix - which is the mistake this profile keeps having to undo. The
-             * sibling evidence is an argument for what to expect, not a measurement.
+             * The sibling units are why this was the expected answer rather than a surprise:
+             * PAC_910604_WW's aidry-run.jsonl has ten values of 0x225 stepping once a minute
+             * beside the operator transcribing the appliance display, and DHUM_231006_WW measured
+             * the same. Those were an argument; the run above is the measurement.
              *
-             * TO SETTLE IT: run one cycle (switch on, then power the appliance off) and compare
-             * this number against the appliance's own display. If it counts minutes, change the
-             * unit and delete this comment.
+             * Note for anyone reading upstream: '%' is not just this handler's habit. #122's
+             * ac_common keeps '%' for the 'binary' auto-dry style specifically - the style the
+             * 0x2cc bit selects, i.e. this unit - and switches to 'min' only for 'select' and
+             * 'switchLevel'. The measurement above says the split is wrong for this appliance.
              */
             const compADryRem = {
                 platform: 'sensor',
                 unique_id: '$deviceid-autodryremain',
                 name: 'Auto dry remaining',
                 icon: 'mdi:hair-dryer-outline',
-                unit_of_measurement: '%',
+                device_class: 'duration',
+                unit_of_measurement: 'min',
                 suggested_display_precision: 0,
                 entity_category: 'diagnostic',
             }

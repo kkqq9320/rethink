@@ -243,11 +243,13 @@ describe(MODEL_ID, () => {
         assert.ok(components.autodry, 'autodry (0x2CC bit 0x4, as on the other unit)')
         assert.equal(components.autodry.platform, 'switch', 'the owner operates this from the app')
 
-        // Still '%', deliberately. Two sibling appliances measured minutes and none measured
-        // percent, but 0x225 has never been seen non-zero on THIS one, so the unit stays as it
-        // is until a cycle is run against the appliance's own display. Pinned so that a change
-        // has to be a decision rather than a drive-by.
-        assert.equal(components.autodryremain.unit_of_measurement, '%')
+        // MINUTES, measured on this appliance on 2026-08-04 (wall-autodry-20260804.jsonl): a cycle
+        // started with this sensor at 8 while the app showed 8분, and it stepped 8 -> 7 in 59 s.
+        // Upstream declares '%' here, and so does #122's ac_common for the 'binary' style this
+        // unit falls into; neither has a measurement behind it. Pinned so that a change back has
+        // to be a decision rather than a drive-by.
+        assert.equal(components.autodryremain.unit_of_measurement, 'min')
+        assert.equal(components.autodryremain.device_class, 'duration')
 
         // Running is derived from the same tag rather than published from one of its own.
         assert.equal(components.autodryrunning.platform, 'binary_sensor')
