@@ -1062,3 +1062,53 @@ describe('FX___S delay-end reservation', () => {
         assert.equal(thinq.outbox.length, 0)
     })
 })
+
+describe('FX___S reservation armed on the appliance itself', () => {
+    // The record the washer sent at 2026-08-04 18:21:28, the moment a three-hour reservation was armed
+    // on the panel: phase 1 -> 7, the reservation 330 -> 180 minutes, and the flags byte 0 -> 128.
+    function armed() {
+        const rec = Buffer.alloc(66)
+        rec[4] = 0x72
+        rec[10] = 0
+        rec[11] = 180
+        rec[20] = 7
+        rec[21] = 1
+        rec[36] = 0x80
+        rec[38] = 0x80
+        return rec
+    }
+
+    test('phase 7 is what the model JSON called RESERVED, and it really happens', () => {
+        const { HA, dut } = setup()
+        dut.processRecord(armed())
+        assert.equal(get(HA, 'status'), 'reserved')
+        assert.equal(get(HA, 'status_code'), 7)
+        assert.equal(get(HA, 'reservation'), 3)
+    })
+
+    test('the drum is not reported as turning while the appliance waits', () => {
+        const { HA, dut } = setup()
+        dut.processRecord(armed())
+        // The flags byte has bit 0x80 set - the same bit that means the drum is turning during a
+        // cycle - and the appliance is standing still for the next three hours. Reporting "Drum
+        // turning: on" for all of it was the defect this test exists to keep out.
+        assert.equal(get(HA, 'drum_active'), 'OFF')
+        // ...and it is not running either: it has not started.
+        assert.equal(get(HA, 'running'), 'OFF')
+    })
+
+    test('the bit still means the drum in the phases where that was measured', () => {
+        const { HA, thinq } = setup()
+        feed(thinq, STARTED) // phase 3, flags 0x80
+        assert.equal(get(HA, 'drum_active'), 'ON')
+    })
+
+    test('powering off clears the reservation, as it did on 2026-07-30 and again today', () => {
+        const { HA, dut } = setup()
+        dut.processRecord(armed())
+        assert.equal(get(HA, 'reservation'), 3)
+        dut.processRecord(Buffer.alloc(66)) // phase 0, everything zero
+        assert.equal(get(HA, 'reservation'), 0)
+        assert.equal(get(HA, 'status'), 'power_off')
+    })
+})

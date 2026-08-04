@@ -151,9 +151,16 @@ const STEAM_ON = 0x10
 // nothing else, and the door lock follows a few seconds later.
 const FLAG_REMOTE_CONTROL = 0x10
 const FLAG_CHILD_LOCK = 0x20
-// Set only while the drum is actually turning. It clears on pause, but it ALSO clears and re-sets on its
+// Set while the drum is actually turning. It clears on pause, but it ALSO clears and re-sets on its
 // own mid-cycle (measured twice, with no command in between and the remaining time still counting down),
 // so it must not be used to mean "paused" - that is PHASE_PAUSED and nothing else.
+//
+// It is NOT purely the drum, which only showed up when a state nobody had reached before finally
+// happened: arming a delay-end reservation on the panel set this bit while the appliance stood still
+// for the next three hours (2026-08-04 18:21:28, phase 1 -> 7 with this byte 0 -> 128). So the bit is
+// closer to "a cycle is under way", and RESERVED is excluded below rather than the bit being renamed -
+// what it means in the phases that were measured is unchanged, and there is no second observation yet
+// to say what it means anywhere else.
 const FLAG_DRUM_ACTIVE = 0x80
 
 // One byte each, found by toggling them on the panel one at a time with a pause in between - the run
@@ -947,7 +954,8 @@ export default class Device extends AABBDevice {
         this.publishProperty('status', STATUS[phase] ?? 'unknown')
         this.publishProperty('status_code', phase)
         this.publishProperty('running', ACTIVE_PHASES.has(phase) ? 'ON' : 'OFF')
-        this.publishProperty('drum_active', flags & FLAG_DRUM_ACTIVE ? 'ON' : 'OFF')
+        // A reservation sets the same bit with the drum standing still for hours - see FLAG_DRUM_ACTIVE.
+        this.publishProperty('drum_active', flags & FLAG_DRUM_ACTIVE && phase !== PHASE_RESERVED ? 'ON' : 'OFF')
         this.remoteControl = (flags & FLAG_REMOTE_CONTROL) !== 0
         this.publishProperty('remote_control', this.remoteControl ? 'ON' : 'OFF')
         this.publishProperty('child_lock', flags & FLAG_CHILD_LOCK ? 'ON' : 'OFF')
