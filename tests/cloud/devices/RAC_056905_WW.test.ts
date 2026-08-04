@@ -409,6 +409,20 @@ describe(MODEL_ID, () => {
         assert.equal(allclean.read_xform!(2), 'ON', 'reads back 2 while running')
         assert.equal(allclean.read_xform!(0), 'OFF')
 
+        /*
+         * 255 is NOT on. Both cleaning tags sit there for minutes at a time while the appliance is
+         * switched off - six times on the morning of 2026-08-04 alone - and "anything but 0 is ON"
+         * published that as a cleaning cycle in progress. The same frames carry fan RPM 0 where a
+         * real run carries ~85, so the reading was false. What 255 means is not measured.
+         */
+        assert.equal(allclean.read_xform!(255), 'OFF', '255 is not a run')
+        assert.equal(allclean.read_xform!(100), 'ON', 'our own write, before the appliance says 2')
+
+        const hexclean = dev.fields_by_id[0x3a2]
+        assert.equal(hexclean.read_xform!(1), 'ON', 'the appliance echoes 1 while running')
+        assert.equal(hexclean.read_xform!(0), 'OFF')
+        assert.equal(hexclean.read_xform!(255), 'OFF', '255 is not a run')
+
         dev.drop()
     })
 

@@ -897,6 +897,19 @@ export default class Device extends TLVDevice {
             )
         }
 
+        /*
+         * Both cleaning switches pin the values that count as ON, rather than taking anything
+         * non-zero. Measured on 2026-08-03 while the owner drove each from the app: starting the
+         * heat exchanger clean writes 0x3A2 = 1 and the appliance reports 1; starting the all
+         * clean writes 0x165 = 100 and the appliance reports 2, never 100.
+         *
+         * Then on 2026-08-04 both tags were seen at 255 for minutes at a time with the appliance
+         * switched off, which the old "anything but 0 is ON" rule published as two cleaning cycles
+         * running (wall-autodry-20260804.jsonl, 12:14:44 and again five times that morning). The
+         * same frames carry fan RPM 0 against ~85 during a real run, so whatever 255 is, it is not
+         * this. 100 stays in the ON set for 0x165 only to cover our own write before the appliance
+         * answers with 2 - the appliance itself has never been seen reporting it.
+         */
         if (this.raw_clip_state[0x350] & 8) {
             this.addConfigSwitchField(
                 config,
@@ -904,13 +917,14 @@ export default class Device extends TLVDevice {
                 'heatexchangerclean',
                 'Cleaning - Heat exchanger',
                 'mdi:snowflake-melt',
-                { category: 'diagnostic' },
+                { readOnValues: [1], category: 'diagnostic' },
             )
         }
 
         if (this.raw_clip_state[0x34f] & (1 << 17)) {
             this.addConfigSwitchField(config, 0x165, 'allclean', 'Cleaning - ALL', 'mdi:spray-bottle', {
                 onValue: 100,
+                readOnValues: [2, 100],
                 category: 'diagnostic',
             })
         }
@@ -1237,9 +1251,14 @@ export default class Device extends TLVDevice {
         name: string,
         desc: string,
         icon: string,
-        opts: { onValue?: number; offValue?: number; category?: 'config' | 'diagnostic' } = {},
+        opts: {
+            onValue?: number
+            offValue?: number
+            readOnValues?: number[]
+            category?: 'config' | 'diagnostic'
+        } = {},
     ) {
-        const { onValue = 1, offValue = 0, category = 'config' } = opts
+        const { onValue = 1, offValue = 0, readOnValues, category = 'config' } = opts
         const comp = {
             platform: 'switch',
             unique_id: '$deviceid-' + name,
@@ -1254,10 +1273,23 @@ export default class Device extends TLVDevice {
             name: '',
             comp: name,
             write_xform: (val) => (val === 'ON' ? onValue : offValue),
-            // Compared against the OFF value rather than the ON value, because a tag need not
-            // read back what was written: 0x165 takes 100 to start and then reports 2 while it
-            // runs. With the default offValue of 0 this is the old `raw ? ON : OFF` exactly.
-            read_xform: (raw) => (raw === offValue ? 'OFF' : 'ON'),
+            /*
+             * Two rules, and the narrow one exists because the wide one was wrong.
+             *
+             * The default compares against the OFF value, because a tag need not read back what
+             * was written: 0x165 takes 100 to start and then reports 2 while it runs. With the
+             * default offValue of 0 this is the old `raw ? ON : OFF` exactly.
+             *
+             * `readOnValues` names the values that mean ON instead, for tags whose read domain
+             * has a third member. Both cleaning tags do: they sit at 255 for minutes at a time
+             * while the appliance is off, and "not 0" turned that into a switch reading ON with
+             * nothing running. What 255 means is NOT measured - it may be an armed/auto marker,
+             * the way 255 on 0x20e means auto dry is on smart - but it is certainly not the
+             * running value this switch starts and stops, and the same frame carries fan RPM 0
+             * where a real run carries RPM ~85 (measured 2026-08-03 with 0x3a2 = 1).
+             */
+            read_xform: (raw) =>
+                readOnValues ? (readOnValues.includes(raw) ? 'ON' : 'OFF') : raw === offValue ? 'OFF' : 'ON',
         })
     }
 
