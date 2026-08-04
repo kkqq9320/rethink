@@ -926,3 +926,52 @@ describe('FX___S finish time does not wobble while the appliance revises its own
         }
     })
 })
+
+describe('FX___S names every state its own maker declares', () => {
+    // LG's model JSON for this appliance declares 33 states, each with an index, and the index is this
+    // byte: every one of the eleven values measured here is declared at exactly the number measured,
+    // which is what licenses using the rest of that list for states this appliance has not reached.
+    const DECLARED = [
+        0, 1, 2, 3, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 21, 23, 27, 28, 29, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43,
+        47, 48, 49,
+    ]
+
+    test('no declared state reads as unknown', () => {
+        const { HA, dut } = setup()
+        const declared = (HA.devices[DEVICE_ID].config!.components.status as unknown as { options: string[] }).options
+
+        for (const phase of DECLARED) {
+            const rec = Buffer.alloc(66)
+            rec[20] = phase
+            dut.processRecord(rec)
+            const name = String(get(HA, 'status'))
+            assert.notEqual(name, 'unknown', `phase ${phase} has no name`)
+            assert.ok(declared.includes(name), `phase ${phase} publishes ${name}, which is not an option`)
+        }
+    })
+
+    test('the two that matter are named', () => {
+        const { HA, dut } = setup()
+        const rec = Buffer.alloc(66)
+
+        // A delay-end reservation counting down.
+        rec[20] = 7
+        dut.processRecord(rec)
+        assert.equal(get(HA, 'status'), 'reserved')
+
+        // A finished cycle on a machine that does NOT leave remote control on. This owner's washer
+        // always finishes on 42, which the JSON calls END_REMOTE_MAINTAIN_ON; 16 is the plain END and
+        // used to publish 'unknown'.
+        rec[20] = 16
+        dut.processRecord(rec)
+        assert.equal(get(HA, 'status'), 'end')
+    })
+
+    test('a byte outside the declaration still falls back rather than inventing a name', () => {
+        const { HA, dut } = setup()
+        const rec = Buffer.alloc(66)
+        rec[20] = 200
+        dut.processRecord(rec)
+        assert.equal(get(HA, 'status'), 'unknown')
+    })
+})

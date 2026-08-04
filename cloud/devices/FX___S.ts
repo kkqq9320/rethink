@@ -157,6 +157,9 @@ const PHASE_STANDBY = 1
 const PHASE_PAUSED = 2
 const PHASE_DONE = 42
 const PHASE_CARE = 47
+// A delay-end reservation is set and counting down. Declared by the model JSON, not yet seen here -
+// nothing keys off it beyond its name, so an appliance that never reaches it loses nothing.
+const PHASE_RESERVED = 7
 
 // Phase codes, named as LG names them. Every one of these was pinned by laying our phase byte and the
 // LG cloud's own status for the same appliance on one clock, across three washes - 2026-07-30 (the
@@ -185,6 +188,25 @@ const PHASE_CARE = 47
 // The cloud is the LABEL SOURCE, not the judge: our byte is the measurement and LG's name is what they
 // call it. Renaming these to LG's vocabulary is deliberate - the same appliance is also visible through
 // the official integration, and two names for one stage is worse than either name.
+//
+// LG's own model JSON for this appliance settles the rest. Its `MonitoringValue.state` declares 33
+// states with an index each, and THE INDEX IS THIS BYTE: all eleven values ever measured here are
+// declared, at exactly the number we measured, including the two that were pinned only by the clock
+// alignment above (3 = DETECTING, 11 = RUNNING). Eleven of eleven, from a source that has no idea what
+// we captured.
+//
+// So the values below that were never observed come from that declaration rather than from a guess,
+// and they exist to stop a state this appliance can reach reading as `unknown`. Two are worth naming:
+//
+//   7   RESERVED    a delay-end reservation is set and counting down
+//   16  END         a finished cycle. We only ever see 42, which the JSON calls
+//                   END_REMOTE_MAINTAIN_ON - this owner leaves remote control on. A machine with it
+//                   off looks likely to finish on 16 instead, which used to publish `unknown`.
+//
+// Where the JSON is finer than the cloud, the cloud's coarser word is kept, because matching the
+// official integration is the whole point of this vocabulary: 37 is CLOTHING_RECOGNITION and 40 is
+// POLLUTION_DETECTING, and the cloud reports both as `detecting`. 42 is END_REMOTE_MAINTAIN_ON and
+// 47 is LAUNDRYCARE, reported as `end` and `refreshing`.
 const STATUS: Record<number, string> = {
     [PHASE_OFF]: 'power_off',
     [PHASE_STANDBY]: 'initial',
@@ -197,6 +219,29 @@ const STATUS: Record<number, string> = {
     14: 'spinning',
     [PHASE_DONE]: 'end',
     [PHASE_CARE]: 'refreshing',
+    // Declared by the model JSON, never seen on this appliance.
+    5: 'add_drain',
+    6: 'detergent_amount',
+    [PHASE_RESERVED]: 'reserved',
+    8: 'soak',
+    9: 'prewash',
+    13: 'rinsehold',
+    15: 'drying',
+    16: 'end',
+    21: 'refreshing',
+    23: 'error_auto_off',
+    27: 'frozen_prevent_initial',
+    28: 'frozen_prevent_pause',
+    29: 'frozen_prevent_running',
+    34: 'audible_diagnosis',
+    35: 'auto_dt_open_pause',
+    36: 'confirm_start_for_control',
+    38: 'detergent_input',
+    39: 'softener_input',
+    41: 'tub_cleaning',
+    43: 'steam',
+    48: 'ezdispense_cleaning',
+    49: 'end_waiting',
 }
 const STATUS_OPTIONS = [...new Set(Object.values(STATUS))].concat('unknown')
 
