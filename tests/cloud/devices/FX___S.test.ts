@@ -975,3 +975,90 @@ describe('FX___S names every state its own maker declares', () => {
         assert.equal(get(HA, 'status'), 'unknown')
     })
 })
+
+describe('FX___S delay-end reservation', () => {
+    // The two frames the LG app sent on 2026-08-04 while a capture ran, byte for byte, with the owner
+    // setting 5 hours and then 5 hours 30. The appliance's record answered 300 and then 330 - which is
+    // what those are in minutes - so both directions are pinned by the same labelled action.
+    const APP_SET_5H = buf('aa1cf0e5000201ff081e03200221061f0335013e0043007f012cc1bb')
+    const APP_SET_5H30 = buf('aa1cf0e5000201ff081e03200221061f0335013e0043007f014ae7bb')
+
+    // The record the appliance was holding when the app sent those: AI Wash, normal/40/2/high, turbo
+    // on, steam off. Reproduced here because the write is built from the last record.
+    function idle(minutes = 0, flag = false) {
+        const rec = Buffer.alloc(66)
+        rec[0] = 3 // wash normal
+        rec[1] = 3 // 40 degrees
+        rec[2] = 2 // two rinses
+        rec[3] = 6 // high spin
+        rec[4] = 0x72 // AI Wash
+        rec[20] = 1 // standby
+        rec[33] = 0x20 // turboshot on
+        rec[10] = (minutes >> 8) & 0xff
+        rec[11] = minutes & 0xff
+        if (flag) rec[38] = 0x80
+        return rec
+    }
+
+    test('reads the reservation as hours', () => {
+        const { HA, dut } = setup()
+        dut.processRecord(idle(300, true))
+        assert.equal(get(HA, 'reservation'), 5)
+        dut.processRecord(idle(330, true))
+        assert.equal(get(HA, 'reservation'), 5.5)
+        // 2026-07-30, the only other record in four captures with the flag set.
+        dut.processRecord(idle(210, true))
+        assert.equal(get(HA, 'reservation'), 3.5)
+    })
+
+    test('reads no reservation as zero, and ignores a stale count without the flag', () => {
+        const { HA, dut } = setup()
+        dut.processRecord(idle(0, false))
+        assert.equal(get(HA, 'reservation'), 0)
+        dut.processRecord(idle(330, false))
+        assert.equal(get(HA, 'reservation'), 0)
+    })
+
+    test('writing 5 hours reproduces the frame the app sent', () => {
+        const { thinq, dut } = setup()
+        dut.processRecord(idle())
+        thinq.resetRecorder()
+        dut.setProperty('reservation', '5')
+        assert.equal(hex(thinq.outbox[0]), hex(APP_SET_5H))
+    })
+
+    test('writing 5.5 hours reproduces the second frame', () => {
+        const { thinq, dut } = setup()
+        dut.processRecord(idle())
+        thinq.resetRecorder()
+        dut.setProperty('reservation', '5.5')
+        assert.equal(hex(thinq.outbox[0]), hex(APP_SET_5H30))
+    })
+
+    test('zero is sent - it is the value the app itself uses for "none"', () => {
+        const { thinq, dut } = setup()
+        dut.processRecord(idle())
+        thinq.resetRecorder()
+        dut.setProperty('reservation', '0')
+        // The same frame with the 16-bit field at zero, which is the shape the extended-course capture
+        // carried: ... 7f 00 00 <checksum> BB.
+        const sent = thinq.outbox[0]
+        assert.deepEqual([...sent.subarray(sent.length - 5, sent.length - 2)], [0x7f, 0x00, 0x00])
+    })
+
+    test('refuses what the appliance declares out of range rather than sending it', () => {
+        const { thinq, dut } = setup()
+        dut.processRecord(idle())
+        thinq.resetRecorder()
+        dut.setProperty('reservation', '2') // below the declared 3 h
+        dut.setProperty('reservation', '20') // above the declared 19 h
+        dut.setProperty('reservation', '5.25') // not a half hour
+        assert.equal(thinq.outbox.length, 0)
+    })
+
+    test('does nothing until a record has been seen', () => {
+        const { thinq, dut } = setup()
+        dut.setProperty('reservation', '5')
+        assert.equal(thinq.outbox.length, 0)
+    })
+})

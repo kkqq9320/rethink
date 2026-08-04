@@ -116,6 +116,24 @@ const OFF_REMAIN_H = 12
 const OFF_REMAIN_M = 13
 const OFF_TOTAL_H = 14
 const OFF_TOTAL_M = 15
+// The delay-end reservation, as a 16-bit big-endian count of MINUTES until the cycle finishes, and a
+// flag that says one is set. Labelled by the owner setting 5 h and then 5 h 30 in the LG app while a
+// capture ran: the record went to 300 and then 330, which is exactly what those are in minutes, and
+// the write frame carried the same numbers. A third value settles it from data that predates the
+// hypothesis - washer-cycle-20260730.jsonl holds one record at 210 (3 h 30, the shortest the appliance
+// allows plus a half hour), and that is the ONLY other record in 750 where the flag below is set.
+const OFF_RESERVE_HI = 10
+const OFF_RESERVE_LO = 11
+// Bit 0x80 of this byte, set in every record that carries a reservation and in no other - three
+// occurrences across four captures, against 747 records with both at zero.
+const OFF_RESERVE_FLAG = 38
+const RESERVE_SET = 0x80
+// The model JSON's `reserveTimeHour` is a range of 3..19 with `reserve30min` true, so the appliance
+// takes half hours from three to nineteen. Zero is what the app sends when there is no reservation.
+const RESERVE_MIN_MINUTES = 180
+const RESERVE_MAX_MINUTES = 19 * 60
+const RESERVE_STEP_MINUTES = 30
+
 const OFF_COURSE_EXT = 22 // key 0x0B
 const OFF_PHASE = 20
 const OFF_PHASE_PREV = 21
@@ -280,6 +298,13 @@ const KEY_SPIN = 0x21
 const KEY_TURBOWASH = 0x35
 const KEY_STEAM = 0x3e
 const KEY_LAUNDRY_CARE = 0x57
+// The one key that carries a SIXTEEN-bit value. That is why the option write always looked like it had
+// a stray zero on the end: `7f 00 00` is this key holding no reservation, not a key and a trailing
+// byte. It also makes the model JSON's `courseDownloadDataLength: 21` come out exactly - nine one-byte
+// pairs (18) plus this three-byte entry.
+const KEY_RESERVE = 0x7f
+// Seen in every captured option write, always zero, never explained. Reproduced as captured.
+const KEY_UNKNOWN_43 = 0x43
 
 const OP_START = 0x01
 const OP_PAUSE = 0x02
@@ -731,6 +756,24 @@ export default class Device extends AABBDevice {
                         name: 'Resume',
                         icon: 'mdi:play-pause',
                     },
+                    // Hours until the cycle should FINISH, which is what this appliance's reservation
+                    // means. Half hours, because the appliance takes them; 0 is no reservation. The
+                    // range starts at 0 rather than at the appliance's 3 so that the entity can say
+                    // "none" at all - setProperty refuses the impossible gap in between rather than
+                    // sending something the appliance declares invalid.
+                    reservation: {
+                        platform: 'number',
+                        unique_id: '$deviceid-reservation',
+                        state_topic: '$this/reservation',
+                        command_topic: '$this/reservation/set',
+                        name: 'Course - Reservation',
+                        icon: 'mdi:timer-sand',
+                        min: 0,
+                        max: 19,
+                        step: 0.5,
+                        unit_of_measurement: 'h',
+                        mode: 'box',
+                    },
                     laundry_care: {
                         platform: 'switch',
                         unique_id: '$deviceid-laundry-care',
@@ -913,6 +956,13 @@ export default class Device extends AABBDevice {
         this.publishProperty('wrinkle_care', rec[OFF_WRINKLE_CARE] & WRINKLE_CARE_ON ? 'ON' : 'OFF')
         this.publishProperty('turbowash', rec[OFF_TURBOSHOT] & TURBOSHOT_ON ? 'ON' : 'OFF')
         this.publishProperty('laundry_care', rec[OFF_LAUNDRY_CARE] & LAUNDRY_CARE_ON ? 'ON' : 'OFF')
+        // Published in hours because that is the unit the appliance's own panel and app use, and
+        // because a number entity reading 330 would invite someone to write 330 back.
+        const reserveMinutes = (rec[OFF_RESERVE_HI] << 8) | rec[OFF_RESERVE_LO]
+        this.publishProperty(
+            'reservation',
+            rec[OFF_RESERVE_FLAG] & RESERVE_SET ? Math.round((reserveMinutes / 60) * 2) / 2 : 0,
+        )
         this.publishProperty('cycles', String(rec[OFF_CYCLES]))
         this.publishProperty('beep', BEEP[rec[OFF_BEEP]] ?? 'unknown')
         this.publishProperty('steam', rec[OFF_STEAM] & STEAM_ON ? 'ON' : 'OFF')
@@ -1127,6 +1177,55 @@ export default class Device extends AABBDevice {
         )
     }
 
+    /**
+     * Set (or clear) the delay-end reservation, in minutes.
+     *
+     * This reproduces the frame the LG app sent when the owner set 5 h and then 5 h 30 with a capture
+     * running, byte for byte: eight entries, the last of which is the only 16-bit one this protocol
+     * has. The other seven are the current options read back out of the last record, which is what the
+     * app was doing too - it re-sends its idea of the whole selection every time.
+     *
+     *   f0 e5 00 02 01 ff 08  1e <wash> 20 <rinse> 21 <spin> 1f <temp>
+     *                         35 <turbowash> 3e <steam> 43 00  7f <minutes:u16>
+     *
+     * A reservation is only STAGED by this. The appliance stayed on Standby through both writes and
+     * never reached phase 7 (RESERVED), so something still has to start it - the same as setting a
+     * course does not run it. Powering the appliance off clears the reservation: that is what happened
+     * in the 2026-07-30 capture, where 210 minutes and the flag both went to zero on power-off.
+     */
+    setReservation(minutes: number) {
+        const rec = this.lastRecord
+        if (!rec) return
+        this.send(
+            Buffer.from([
+                0xf0,
+                0xe5,
+                0x00,
+                0x02,
+                0x01,
+                0xff,
+                0x08,
+                KEY_WASH,
+                rec[OFF_WASH],
+                KEY_RINSE,
+                rec[OFF_RINSE],
+                KEY_SPIN,
+                rec[OFF_SPIN],
+                KEY_WATER_TEMP,
+                rec[OFF_WATER_TEMP],
+                KEY_TURBOWASH,
+                rec[OFF_TURBOSHOT] & TURBOSHOT_ON ? 1 : 0,
+                KEY_STEAM,
+                rec[OFF_STEAM] & STEAM_ON ? 1 : 0,
+                KEY_UNKNOWN_43,
+                0x00,
+                KEY_RESERVE,
+                (minutes >> 8) & 0xff,
+                minutes & 0xff,
+            ]),
+        )
+    }
+
     // Sent by the app immediately after an operation write, but only when the drum is actually about to
     // turn - a pause never carries it.
     trigger() {
@@ -1162,6 +1261,25 @@ export default class Device extends AABBDevice {
                 const count = Number(mqttValue)
                 if (RINSE.includes(count)) this.setField(KEY_RINSE, count)
                 return
+            }
+            case 'reservation': {
+                // The entity offers 0 to 19 in half hours so that "no reservation" is expressible, but
+                // the appliance's own declaration starts at 3 h. Rather than send something it says is
+                // out of range, refuse it and say so - a rejected write leaves no trace otherwise.
+                const minutes = Math.round(Number(mqttValue) * 60)
+                if (!Number.isFinite(minutes) || minutes < 0) return
+                if (minutes !== 0 && (minutes < RESERVE_MIN_MINUTES || minutes > RESERVE_MAX_MINUTES)) {
+                    log(
+                        'status',
+                        `${this.id}: reservation ${mqttValue} h is outside the ${RESERVE_MIN_MINUTES / 60}-${RESERVE_MAX_MINUTES / 60} h this appliance declares; not sent`,
+                    )
+                    return
+                }
+                if (minutes % RESERVE_STEP_MINUTES !== 0) {
+                    log('status', `${this.id}: reservation ${mqttValue} h is not a half hour; not sent`)
+                    return
+                }
+                return this.setReservation(minutes)
             }
         }
 
