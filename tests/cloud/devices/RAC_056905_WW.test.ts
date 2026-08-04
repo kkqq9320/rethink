@@ -137,8 +137,21 @@ describe(MODEL_ID, () => {
         // gets no super breeze. Note there is no fan 'auto' on either unit - bit 8 is 자연풍.
         assert.deepEqual(components.climate.fan_modes, ['very low', 'low', 'medium', 'high', 'very high', 'nature'])
 
-        // Swing modes registered because 0x2CD has both 0x4 and 0x8.
-        assert.deepEqual(components.climate.swing_modes, ['1', '2', '3', '4', '5', '6', 'on', 'off'])
+        // Swing modes registered because 0x2CD has both 0x4 and 0x8. The three 'focus' entries are
+        // the app's 집중 회전, measured as values of the same tag on 2026-08-04.
+        assert.deepEqual(components.climate.swing_modes, [
+            '1',
+            '2',
+            '3',
+            '4',
+            '5',
+            '6',
+            'focus upper',
+            'focus middle',
+            'focus lower',
+            'on',
+            'off',
+        ])
         assert.deepEqual(components.climate.swing_horizontal_modes, [
             '1',
             '2',
@@ -192,6 +205,35 @@ describe(MODEL_ID, () => {
 
         assert.equal(thinq.outbox.length, 1)
         assert.equal(hex(thinq.outbox[0]), WRITE_MODE_FAN_ONLY_HEX.toUpperCase())
+
+        dev.drop()
+    })
+
+    test('HA write swing focus modes emits the tag values the app sends', (t) => {
+        const { thinq, dev, ha } = buildReadyDevice(t)
+
+        /*
+         * The TLV payloads below are the ones the LG app put on the wire on 2026-08-04 while the
+         * owner pressed each control (wall-swing-20260804.jsonl, two agreeing passes). Only the
+         * payload is pinned, not the whole frame: an app-originated frame and one of ours differ
+         * in the counter byte at [9] and therefore in the CRC, so a full-frame comparison would be
+         * asserting our own encoder rather than the captured truth.
+         *      C8 4E    -> 0x321 = 14    focus upper
+         *      C8 50 19 -> 0x321 = 25    focus middle
+         *      C8 50 24 -> 0x321 = 36    focus lower
+         */
+        const cases: [string, string][] = [
+            ['focus upper', 'C84E'],
+            ['focus middle', 'C85019'],
+            ['focus lower', 'C85024'],
+        ]
+
+        for (const [mode, payload] of cases) {
+            thinq.resetRecorder()
+            ha.setProperty(DEVICE_ID, 'climate', 'swing_mode_command', mode)
+            assert.equal(thinq.outbox.length, 1, `${mode} sends exactly one frame`)
+            assert.ok(hex(thinq.outbox[0]).includes(payload), `${mode} carries ${payload}`)
+        }
 
         dev.drop()
     })

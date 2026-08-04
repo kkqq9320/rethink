@@ -433,13 +433,54 @@ export default class Device extends TLVDevice {
         })
 
         if (this.raw_clip_state[0x2cd] & 4) {
-            config['components']['climate']['swing_modes'] = ['1', '2', '3', '4', '5', '6', 'on', 'off']
+            /*
+             * The appliance's app offers a '집중 회전' (focused swing) alongside the six fixed
+             * positions and the full sweep, in three flavours the owner names upper / middle /
+             * lower. They are VALUES OF THIS SAME TAG, measured 2026-08-04 by operating each one
+             * from the LG app while recording (wall-swing-20260804.jsonl):
+             *
+             *      upper   0x321 = 14        middle  0x321 = 25        lower   0x321 = 36
+             *
+             * Each was captured twice, in two passes that agree, and every write is a lone
+             * single-TLV frame - nothing else is written alongside - so the mutual exclusion with
+             * 'on' and the fixed positions costs nothing here: writing 14 replaces 100 the way
+             * writing 3 does. The same sweep re-sent 6 and 5 as positive controls and they came
+             * back as 6 and 5, which is also what fixes the notes as trailing their actions.
+             *
+             * They are NOT named for a vane range, deliberately. 14 / 25 / 36 look like the
+             * two-digit range encoding the horizontal axis uses below (13 = '1-3', 35 = '3-5'),
+             * which would read as 1-4 / 2-5 / 3-6 - but the owner watched the middle one and
+             * reported 2..4, not 2..5. The wire values are measured; the range reading is an
+             * inference that one observation already disagrees with, so the labels say what the
+             * app's control says and the range stays a note.
+             *
+             * Not gated on a capability bit. 0x2cd = 2097157 here = bits 0, 2 and 21; bit 2 is
+             * this whole axis and bit 21 is unexplained and a candidate, but no unit WITHOUT the
+             * focus control has been seen, so gating on it would be a guess. The surrounding
+             * list is static in the same way.
+             */
+            config['components']['climate']['swing_modes'] = [
+                '1',
+                '2',
+                '3',
+                '4',
+                '5',
+                '6',
+                'focus upper',
+                'focus middle',
+                'focus lower',
+                'on',
+                'off',
+            ]
             this.addField(config, {
                 id: 0x321,
                 name: 'swing_mode',
                 comp: 'climate',
                 read_xform: (raw) => {
                     const modes2ha = ['off', '1', '2', '3', '4', '5', '6']
+                    modes2ha[14] = 'focus upper'
+                    modes2ha[25] = 'focus middle'
+                    modes2ha[36] = 'focus lower'
                     modes2ha[100] = 'on'
                     return modes2ha[raw]
                 },
@@ -452,6 +493,9 @@ export default class Device extends TLVDevice {
                         '4': 4,
                         '5': 5,
                         '6': 6,
+                        'focus upper': 14,
+                        'focus middle': 25,
+                        'focus lower': 36,
                         on: 100,
                     }
                     return modes2clip[val]
