@@ -788,9 +788,11 @@ describe('FX___S finish time is a timestamp, not a countdown that gives up', () 
         const before = Date.now()
         feed(thinq, RINSING) // 21 minutes left
 
+        // Published on the minute, so it can sit up to half a minute either side of the raw estimate.
         const predicted = Date.parse(String(get(HA, 'end_time')))
-        assert.ok(predicted >= before + 21 * 60_000, 'at least 21 minutes out')
-        assert.ok(predicted <= Date.now() + 21 * 60_000 + 1000)
+        assert.ok(predicted >= before + 21 * 60_000 - 30_000, 'about 21 minutes out')
+        assert.ok(predicted <= Date.now() + 21 * 60_000 + 30_000)
+        assert.equal(new Date(predicted).getSeconds(), 0)
     })
 
     test('it latches at the moment the cycle completes, instead of going unknown', () => {
@@ -842,5 +844,85 @@ describe('FX___S finish time is a timestamp, not a countdown that gives up', () 
         assert.ok(!seen.includes('None'))
         // ...and switching the appliance off afterwards keeps the finish time on screen.
         assert.ok(Date.parse(String(get(HA, 'end_time'))) > 0)
+    })
+})
+
+describe('FX___S finish time does not wobble while the appliance revises its own estimate', () => {
+    // The 2026-08-04 cycle, from Home Assistant's own recorder: (seconds into the cycle, remaining
+    // minutes as the appliance reported it). Its ticks are 43 to 74 s apart and it drops two minutes
+    // at once twice - that irregularity is what moved the published timestamp 21 times.
+    const TICKS: [number, number][] = [
+        [0, 35],
+        [17, 28],
+        [19, 27],
+        [73, 26],
+        [133, 25],
+        [193, 24],
+        [253, 23],
+        [313, 22],
+        [387, 21],
+        [402, 19],
+        [476, 18],
+        [523, 17],
+        [601, 16],
+        [639, 15],
+        [649, 14],
+        [729, 13],
+        [789, 12],
+        [883, 11],
+        [931, 10],
+        [974, 8],
+    ]
+
+    function runCycle() {
+        const { HA, dut } = setup()
+        const start = Date.now()
+        const seen: string[] = []
+        for (const [offset, remaining] of TICKS) {
+            const rec = Buffer.alloc(66)
+            rec[OFF_PHASE_FOR_TEST] = 11 // running, which is a timed phase
+            rec[13] = remaining % 60
+            rec[12] = Math.floor(remaining / 60)
+            // The handler stamps from Date.now(); shifting it per tick is what reproduces the
+            // re-anchoring, so the clock is moved rather than the record.
+            const at = start + offset * 1000
+            const realNow = Date.now
+            Date.now = () => at
+            try {
+                dut.processRecord(rec)
+            } finally {
+                Date.now = realNow
+            }
+            const value = String(get(HA, 'end_time') ?? '')
+            if (value && seen[seen.length - 1] !== value) seen.push(value)
+        }
+        return seen
+    }
+
+    const OFF_PHASE_FOR_TEST = 20
+
+    test('a minute of hysteresis cuts twenty-one publishes to a handful', () => {
+        const seen = runCycle()
+        // Measured: 27 recomputes over these ticks, 21 of which HA recorded as changes. Anything in
+        // single figures is the wobble gone; the exact number is not the point and is not pinned.
+        assert.ok(seen.length <= 8, `published ${seen.length} times: ${seen.join(' ')}`)
+        assert.ok(seen.length >= 2, 'but it must still follow the appliance revising its estimate')
+    })
+
+    test('every published value is on the minute', () => {
+        for (const value of runCycle()) {
+            assert.equal(new Date(value).getSeconds(), 0, `${value} carries seconds`)
+            assert.equal(new Date(value).getMilliseconds(), 0)
+        }
+    })
+
+    test('the revisions that survive are the real ones', () => {
+        const seen = runCycle().map((v) => Date.parse(v))
+        // The appliance's estimate genuinely moved - 35 minutes at the start, then 28 seventeen
+        // seconds later - so the first two must differ by minutes, not seconds.
+        assert.ok(Math.abs(seen[1] - seen[0]) >= 60_000)
+        for (let i = 1; i < seen.length; i++) {
+            assert.ok(Math.abs(seen[i] - seen[i - 1]) >= 60_000, 'no sub-minute step is ever published')
+        }
     })
 })

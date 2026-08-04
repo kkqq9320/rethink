@@ -366,8 +366,8 @@ export default class Device extends AABBDevice {
     energyReports: number[] = []
     /** Wh since the current cycle started, as the appliance last reported it. */
     energyTotal: number | undefined
-    /** Last published remaining minutes, so the finish timestamp is only recomputed when it moves. */
-    lastRemaining: number | undefined
+    /** The finish time last published while a cycle runs, so a re-anchored one under a minute away is not. */
+    endTimePredicted: number | undefined
 
     /**
      * Remote control gates STARTING the machine, not writing settings to it. Settings writes are
@@ -548,7 +548,11 @@ export default class Device extends AABBDevice {
                         platform: 'sensor',
                         unique_id: '$deviceid-end-time',
                         state_topic: '$this/end_time',
-                        name: 'Finishes at',
+                        // Not "Finishes at" any more: since the timestamp is latched at Complete and
+                        // kept, this entity holds a time in the past for most of the day and a
+                        // prediction only while a cycle runs. A name in the present tense was right
+                        // for one of those and wrong for the other.
+                        name: 'Finish time',
                         device_class: 'timestamp',
                     },
                     available_options: {
@@ -894,12 +898,34 @@ export default class Device extends AABBDevice {
          * sits finished) is deliberately NOT latched - that instant is the restart, not the finish,
          * and the retained value already holds the real one.
          */
-        if (remaining > 0 && remaining !== this.lastRemaining) {
-            this.publishProperty('end_time', new Date(Date.now() + remaining * 60_000).toISOString())
-        } else if (phase === PHASE_DONE && previousPhase !== undefined && previousPhase !== PHASE_DONE) {
-            this.publishProperty('end_time', new Date().toISOString())
+        if (remaining > 0) {
+            /*
+             * Only when it moves by a minute or more, because anything smaller is OUR noise rather
+             * than the appliance's news. The countdown is in whole minutes and the appliance revises
+             * it as it goes: measured over the 2026-08-04 cycle its ticks were 43 to 74 s apart and
+             * it dropped two minutes at once twice. Re-anchoring "now + remaining" at each of those
+             * lands on a slightly different instant every time, which published this entity 21 times
+             * in a 29-minute cycle. With the minute of hysteresis the same cycle publishes 6 times,
+             * over the same range - every genuine revision still gets through, and the wobble does
+             * not. A revision the appliance actually made cannot be smaller than its own granularity.
+             */
+            const predicted = Date.now() + remaining * 60_000
+            if (this.endTimePredicted === undefined || Math.abs(predicted - this.endTimePredicted) >= 60_000) {
+                this.endTimePredicted = predicted
+                // Published on the minute: the seconds carry no information, and a value that keeps
+                // its seconds invites the same wobble back in through a template or a comparison.
+                this.publishProperty('end_time', new Date(Math.round(predicted / 60_000) * 60_000).toISOString())
+            }
+        } else {
+            // So the next cycle's first prediction always publishes, however close it happens to fall
+            // to this one's.
+            this.endTimePredicted = undefined
+            if (phase === PHASE_DONE && previousPhase !== undefined && previousPhase !== PHASE_DONE) {
+                // Not rounded: this one is a measured event rather than an estimate, and it is
+                // published exactly once, so there is no wobble to suppress.
+                this.publishProperty('end_time', new Date().toISOString())
+            }
         }
-        this.lastRemaining = remaining
         this.publishProperty('total_time', phase === PHASE_OFF ? 0 : rec[OFF_TOTAL_H] * 60 + rec[OFF_TOTAL_M])
         this.publishProperty('rinse_remaining', rec[OFF_RINSE])
 
