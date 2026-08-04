@@ -781,3 +781,66 @@ describe('FX___S status names follow the appliance, aligned against LG on one cl
         assert.ok(declared.includes('unknown'))
     })
 })
+
+describe('FX___S finish time is a timestamp, not a countdown that gives up', () => {
+    test('while running it is the predicted finish', () => {
+        const { HA, thinq } = setup()
+        const before = Date.now()
+        feed(thinq, RINSING) // 21 minutes left
+
+        const predicted = Date.parse(String(get(HA, 'end_time')))
+        assert.ok(predicted >= before + 21 * 60_000, 'at least 21 minutes out')
+        assert.ok(predicted <= Date.now() + 21 * 60_000 + 1000)
+    })
+
+    test('it latches at the moment the cycle completes, instead of going unknown', () => {
+        const { HA, thinq } = setup()
+        feed(thinq, RINSING)
+        const running = String(get(HA, 'end_time'))
+
+        const before = Date.now()
+        feed(thinq, COMPLETE)
+        const finished = String(get(HA, 'end_time'))
+
+        assert.notEqual(finished, running)
+        // This is what makes Home Assistant render "5 minutes ago" rather than nothing: the entity
+        // has device_class 'timestamp', so a kept value is shown relative to now.
+        const at = Date.parse(finished)
+        assert.ok(at >= before && at <= Date.now(), 'the completion instant, not a prediction')
+    })
+
+    test('every frame that repeats Complete leaves the timestamp alone', () => {
+        const { HA, thinq } = setup()
+        feed(thinq, RINSING)
+        feed(thinq, COMPLETE)
+        const latched = String(get(HA, 'end_time'))
+
+        // Without the transition check this would be dragged along with the clock and read
+        // "0 minutes ago" forever - the appliance repeats its state for as long as it sits there.
+        feed(thinq, COMPLETE)
+        feed(thinq, COMPLETE)
+        assert.equal(get(HA, 'end_time'), latched)
+    })
+
+    test('a restart while the washer already sits finished does not restamp it', () => {
+        const { HA, thinq } = setup()
+        // First frame after a restart, already Complete. That instant is the restart, not the
+        // finish; the retained MQTT value still holds the real one, so publishing here would
+        // overwrite a true timestamp with a false one.
+        feed(thinq, COMPLETE)
+        assert.equal(get(HA, 'end_time'), undefined)
+    })
+
+    test("it never publishes 'None', which is what took it to unknown", () => {
+        const { HA, thinq } = setup()
+        const seen: string[] = []
+        for (const frame of [STANDBY, STARTED, RINSING, COMPLETE, POWERED_OFF]) {
+            feed(thinq, frame)
+            const value = get(HA, 'end_time')
+            if (value !== undefined) seen.push(String(value))
+        }
+        assert.ok(!seen.includes('None'))
+        // ...and switching the appliance off afterwards keeps the finish time on screen.
+        assert.ok(Date.parse(String(get(HA, 'end_time'))) > 0)
+    })
+})

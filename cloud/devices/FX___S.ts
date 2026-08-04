@@ -842,6 +842,9 @@ export default class Device extends AABBDevice {
     }
 
     processRecord(rec: Buffer) {
+        // Kept before lastRecord is overwritten: the finish timestamp latches on the MOVE into
+        // Complete, not on being in it, and every frame afterwards repeats the same phase.
+        const previousPhase = this.lastRecord?.[OFF_PHASE]
         this.lastRecord = rec
         const phase = rec[OFF_PHASE]
         const flags = rec[OFF_FLAGS]
@@ -872,21 +875,31 @@ export default class Device extends AABBDevice {
         const remaining = TIMED_PHASES.has(phase) ? rec[OFF_REMAIN_H] * 60 + rec[OFF_REMAIN_M] : 0
         this.publishProperty('remaining_time', remaining)
 
-        // Recomputed only when the minute count actually moves. Doing it on every frame would push a
-        // slightly different timestamp several times a second and fill the recorder with noise.
-        //
-        // 'None' is the right payload for "no finish time", and that was measured rather than assumed
-        // after it was reported as the cause of a log error. Published to this very topic on the live
-        // instance: 'None' sets the sensor to unknown SILENTLY, while an empty payload sets it to
-        // unknown and logs `Invalid state message '' from ...` - mqtt/sensor.py special-cases the
-        // string and treats everything else it cannot parse as an error. Do not "fix" this to ''.
-        if (remaining !== this.lastRemaining) {
-            this.lastRemaining = remaining
-            this.publishProperty(
-                'end_time',
-                remaining > 0 ? new Date(Date.now() + remaining * 60_000).toISOString() : 'None',
-            )
+        /*
+         * The finish time, which is a timestamp all the way through rather than a countdown that
+         * gives up. While a cycle runs it is the PREDICTED finish, recomputed only when the minute
+         * count actually moves - doing it on every frame would push a slightly different timestamp
+         * several times a second and fill the recorder with noise. When the cycle reaches Complete
+         * it is latched to that instant and left alone.
+         *
+         * It is never cleared. It used to publish 'None' the moment the clock stopped, which took
+         * the sensor to unknown and threw away the one number worth keeping: Home Assistant renders
+         * a `timestamp` entity relative to now, so a kept value reads "5 minutes ago" - the natural
+         * answer to "when did the washing finish?" - while unknown answers nothing. The next cycle
+         * overwrites it with its own prediction, and the retained MQTT value survives restarts.
+         *
+         * The latch is on the MOVE into Complete. Publishing on every frame that says Complete
+         * would drag the timestamp along with now and it would read "0 minutes ago" forever. A
+         * record that is already Complete when the first frame arrives (a restart while the washer
+         * sits finished) is deliberately NOT latched - that instant is the restart, not the finish,
+         * and the retained value already holds the real one.
+         */
+        if (remaining > 0 && remaining !== this.lastRemaining) {
+            this.publishProperty('end_time', new Date(Date.now() + remaining * 60_000).toISOString())
+        } else if (phase === PHASE_DONE && previousPhase !== undefined && previousPhase !== PHASE_DONE) {
+            this.publishProperty('end_time', new Date().toISOString())
         }
+        this.lastRemaining = remaining
         this.publishProperty('total_time', phase === PHASE_OFF ? 0 : rec[OFF_TOTAL_H] * 60 + rec[OFF_TOTAL_M])
         this.publishProperty('rinse_remaining', rec[OFF_RINSE])
 
