@@ -1,6 +1,6 @@
 import HADevice from './base'
 import { Device as Thinq2Device } from '../thinq2/device'
-import { type Connection } from '../homeassistant'
+import { type ComponentInfo, type Connection } from '../homeassistant'
 import { type Metadata } from '../thinq'
 import { allowExtendedType } from '@/util/casting'
 import AABBDevice from './aabb_device'
@@ -32,13 +32,17 @@ import log from '@/util/logging'
 //   0x0A  2184x   tunnel, see below
 //   0x4D   527x   the appliance declaring its own course table, see processCourseTable
 //   0xE6   136x   reply to a settings write
-//   0x3E    90x   the per-stage time plan for the selected cycle, see processStagePlan
+//   0x3E    90x   the appliance's own energy meter, one report every ~15 min, see
+//                 processEnergyReport
 //
 //   0xD8   164x   one byte that follows the power state, sent unprompted. NOT used: it leads the
 //                 state record by 16 s in one measured transition and trails it by 31 s in another
-//   0xE2    19x   71 bytes, and only TWO distinct payloads across every capture. Fifteen byte
-//                 positions differ between them and several repeat each other (@9 = @24, @18 = @20),
-//                 so it is structured rather than noise - undecoded
+//   0xE2    29x   71 bytes, sent ten times over ~14 s, 30 s before a cycle reaches Complete - so
+//                 there is one payload per completed cycle and no more. Decoded but NOT published:
+//                 the course (@9 = @24), the four options as they were SELECTED (@5-@8, which the
+//                 state record loses as it consumes them), the nominal minutes (@18 = @20) and the
+//                 cycle's energy in Wh (@22, which agrees with 0x3E's total). Everything here is
+//                 already published from frames that arrive sooner, except the as-selected options
 //   0x31    11x   99 bytes, every byte identical in all eleven. A fixed declaration of something
 //   0x88     2x   37 bytes, likewise constant
 //   0x00   696x / 0xC3 286x / 0x7F 235x / 0x72 23x / 0x19 20x
@@ -75,10 +79,10 @@ const INNER_STATE_SINGLE = 0xeb
 // follow the app browsing courses, which makes it look like a reply; the zero-outgoing captures are
 // what settle it. Even if a query would also produce it, there is no reason to send one.
 const MSG_COURSE_TABLE = 0x4d
-/* The per-stage time plan for the selected cycle - see processStagePlan(). */
-const MSG_STAGE_PLAN = 0x3e
-/* Always exactly this long: 20 3E <u16 mins> <u16 cumulative> <stage>. */
-const STAGE_PLAN_LEN = 7
+/* The appliance's ~15-minute energy report - see processEnergyReport(). */
+const MSG_ENERGY = 0x3e
+/* Always exactly this long: 20 3E <u16 Wh since last> <u16 Wh total> <report number>. */
+const ENERGY_LEN = 7
 // Three variants share this message type and the first byte tells them apart. 0x03 is the dial;
 // 0x02 carries the two extended courses' default settings (decoded - it is where the record's
 // base-course byte was confirmed - but deliberately unused, see setExtendedCourse); 0x01 is a
@@ -358,10 +362,10 @@ const BEEP_BY_NAME = invert(BEEP)
 const COURSE_BY_NAME = invert(COURSE)
 
 export default class Device extends AABBDevice {
-    /** Minutes per stage of the cycle the appliance is set to, index 0 = stage 1. */
-    stagePlan: number[] = []
-    /** Planned length in minutes: the last cumulative that agreed with the running sum. */
-    stagePlanTotal: number | undefined
+    /** Wh reported by each of the appliance's ~15-minute energy reports, index 0 = report 1. */
+    energyReports: number[] = []
+    /** Wh since the current cycle started, as the appliance last reported it. */
+    energyTotal: number | undefined
     /** Last published remaining minutes, so the finish timestamp is only recomputed when it moves. */
     lastRemaining: number | undefined
 
@@ -426,23 +430,39 @@ export default class Device extends AABBDevice {
                         icon: 'mdi:numeric',
                         entity_category: 'diagnostic',
                     },
-                    // The appliance's own plan for the selected cycle - see processStagePlan().
-                    cycle_plan: {
+                    // These two published 0x3E as a per-stage TIME plan. It is an energy meter -
+                    // see processEnergyReport() - so they are withdrawn rather than repurposed: an
+                    // entity that changes from minutes to watt-hours under the same name is worse
+                    // than one that goes away. Publishing the key with nothing but `platform` is
+                    // what withdraws it; omitting the key entirely would only stop a fresh install
+                    // creating one and leave every existing entity live forever, and an empty
+                    // object is rejected outright because `platform` is required by the schema.
+                    //
+                    // The cast is load-bearing: mqtt/discovery.py pops `platform` and reads what
+                    // is left, if it is empty, as a removal. Adding `unique_id` - or anything else
+                    // - silently turns the removal back into a registration, so do not "fix" this
+                    // by filling the type in. Safe to delete once every install has run this once.
+                    cycle_plan: { platform: 'sensor' } as ComponentInfo,
+                    cycle_plan_total: { platform: 'sensor' } as ComponentInfo,
+                    // What 0x3E actually carries. The appliance under-reads the plug on the same
+                    // outlet by about 10%, so this is the appliance's own account of itself rather
+                    // than a calibrated meter - and it updates only every ~15 minutes.
+                    energy: {
                         platform: 'sensor',
-                        unique_id: '$deviceid-cycle-plan',
-                        state_topic: '$this/cycle_plan',
-                        name: 'Cycle plan',
-                        icon: 'mdi:timeline-clock-outline',
-                        entity_category: 'diagnostic',
+                        unique_id: '$deviceid-energy',
+                        state_topic: '$this/energy',
+                        name: 'Energy this cycle',
+                        icon: 'mdi:lightning-bolt',
+                        device_class: 'energy',
+                        unit_of_measurement: 'Wh',
+                        state_class: 'total_increasing',
                     },
-                    cycle_plan_total: {
+                    energy_reports: {
                         platform: 'sensor',
-                        unique_id: '$deviceid-cycle-plan-total',
-                        state_topic: '$this/cycle_plan_total',
-                        name: 'Cycle plan total',
-                        icon: 'mdi:timer-outline',
-                        device_class: 'duration',
-                        unit_of_measurement: 'min',
+                        unique_id: '$deviceid-energy-reports',
+                        state_topic: '$this/energy_reports',
+                        name: 'Energy per report',
+                        icon: 'mdi:chart-histogram',
                         entity_category: 'diagnostic',
                     },
                     running: {
@@ -719,61 +739,65 @@ export default class Device extends AABBDevice {
             this.processRecord(payload.subarray(start, start + RECORD_LEN))
         } else if (type === MSG_COURSE_TABLE) {
             this.processCourseTable(payload)
-        } else if (type === MSG_STAGE_PLAN && buf.length === STAGE_PLAN_LEN) {
+        } else if (type === MSG_ENERGY && buf.length === ENERGY_LEN) {
             /*
              * Read from `buf`, NOT from `payload`. The extended-length test above is a heuristic -
              * "the u16 after the type equals the frame length + 4" - and on this message that u16
-             * is the stage's duration in minutes. A stage of exactly 11 minutes therefore reads as
-             * extended, four bytes get eaten, and the stage vanishes from the plan.
+             * is a watt-hour count. A report of exactly 11 Wh therefore reads as extended, four
+             * bytes get eaten, and the report is mangled.
              *
-             * That is not hypothetical: stage 4 of the plan in washer-cycle-20260730.jsonl is 11
-             * minutes, and the first version of this decode dropped it. These frames are a fixed
-             * seven bytes and are never extended, so the length check replaces the guess.
+             * That is not hypothetical: a report in washer-cycle-20260730.jsonl carries 11, and the
+             * first version of this decode dropped it. These frames are a fixed seven bytes and are
+             * never extended, so the length check replaces the guess.
              */
-            this.processStagePlan(buf.subarray(2))
+            this.processEnergyReport(buf.subarray(2))
         }
     }
 
     /**
-     * The appliance's own plan for the cycle it is set to: one frame per stage, carrying that
-     * stage's length and the running total up to it.
+     * The appliance's own energy meter, reported every ~15 minutes.
      *
-     *     20 3E | <u16 this stage's minutes> | <u16 cumulative> | <stage index, from 1>
+     *     20 3E | <u16 Wh since the last report> | <u16 Wh cumulative> | <report number, from 1>
      *
-     * The cumulative field is what identifies it, and it was checked rather than assumed. Across
-     * every 0x3E frame in the three washer captures there are nine distinct payloads, each sent
-     * ten times, forming two plans:
+     * THIS WAS READ AS A TIME PLAN AND IT IS NOT ONE. The first decode had the right structure -
+     * the second field really is the running sum of the first - and the wrong unit, because it
+     * only ever looked at the payloads and never at when they arrived. They arrive one at a time,
+     * 14:46 to 15:20 apart, for as long as the appliance is powered; a plan would arrive at once
+     * and before the cycle. What settled the unit was the smart plug on this appliance's outlet:
      *
-     *     stage  1   2   3   4   5   6   7          stage  1   2
-     *     mins   3  94  22  11   3   3   0          mins  22  13
-     *     cum    3  97 119 130 133 136   5          cum   22  35
+     *   2026-07-30, AI Wash    report 2 said 94   plug: 1880-2018 W for three minutes ~= 95 Wh,
+     *                                             and its own kWh counter moved +0.10 in the window
+     *   2026-08-04, Normal     cycle total 164    plug: +0.18 kWh over the cycle (+-10, it counts
+     *                                             in hundredths), so ~180 Wh
      *
-     * Eight of the nine satisfy cum(n) = cum(n-1) + mins(n) exactly. The ninth is stage 7 of the
-     * first plan, which carries mins 0 and cum 5 and fits nothing - it is left in the string as
-     * itself rather than dropped or explained away.
+     * The appliance reads about 10% under the plug, consistently, which is what metering only the
+     * heater and the motor rather than the whole appliance looks like. What is not in doubt is the
+     * scale: the same cycle ran 28.7 minutes and the old decode published its total as "167 min".
      *
-     * WHAT THIS IS NOT: it is not progress. Every stage arrives at once, before the cycle starts,
-     * and nothing here says which stage is current - the phase byte in the state record is still
-     * the only thing that does. This is the shape of the plan, which is why it is a diagnostic
-     * string rather than a step counter.
+     * The counter resets to zero when a cycle starts - report 1 of the 2026-08-04 cycle carried
+     * 140/140 - and keeps running afterwards while the appliance idles, at about 3 Wh per report.
      *
-     * A stage index of 1 starts a new plan; selecting a different course replaces it wholesale.
+     * Cross-check, from a different frame: 0xE2 (sent 30 s before the cycle finishes) carries the
+     * same total at @22. On 2026-08-04 both said 164, and 0xE2's two older samples - 128 and 33 -
+     * each match their cycle's 0x3E cumulative at that moment. That field had been undecoded.
+     *
+     * Report 2 of that cycle arrived one second after the appliance reached Complete, which is
+     * either the 15-minute cadence landing there by chance or the cycle end forcing a report. Two
+     * readings, one sample, so it is not settled either way.
      */
-    processStagePlan(payload: Buffer) {
-        const mins = payload.readUInt16BE(0)
-        const cum = payload.readUInt16BE(2)
-        const stage = payload[4]
+    processEnergyReport(payload: Buffer) {
+        const delta = payload.readUInt16BE(0)
+        const total = payload.readUInt16BE(2)
+        const report = payload[4]
 
-        if (stage === 1) this.stagePlan = []
-        this.stagePlan[stage - 1] = mins
+        if (report === 1) this.energyReports = []
+        this.energyReports[report - 1] = delta
+        this.energyTotal = total
 
-        // The last cumulative that still agrees with the running sum is the planned length; a
-        // stage that breaks the sum (see above) must not be allowed to become the total.
-        const running = this.stagePlan.slice(0, stage).reduce((a, b) => a + (b ?? 0), 0)
-        if (running === cum) this.stagePlanTotal = cum
-
-        this.publishProperty('cycle_plan', this.stagePlan.map((m) => m ?? '?').join('/'))
-        if (this.stagePlanTotal !== undefined) this.publishProperty('cycle_plan_total', this.stagePlanTotal)
+        // Home Assistant's statistics treat a drop as a meter reset, which is exactly what the
+        // appliance does at the start of every cycle, so the per-cycle totals still add up.
+        this.publishProperty('energy', total)
+        this.publishProperty('energy_reports', this.energyReports.map((wh) => wh ?? '?').join('/'))
     }
 
     /**

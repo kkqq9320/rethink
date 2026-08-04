@@ -330,17 +330,15 @@ describe('FX___S washer', () => {
         feed(thinq, buf('aa09f0241001018cbb')) // our own start command echoed back
         assert.equal(get(HA, 'status'), undefined)
     })
-    test('the appliance declares its cycle as a per-stage time plan', () => {
+    test('the appliance reports its own energy every fifteen minutes', () => {
         const { HA, thinq } = setup()
 
         /*
-         * Nine real 0x3E frames from washer-cycle-20260730.jsonl - the whole set that capture
-         * contains. They form two plans; each arrived ten times and the order is not guaranteed,
-         * so the decode must depend on neither.
-         *
-         *   stage  1   2   3   4   5   6   7
-         *   mins   3  94  22  11   3   3   0
-         *   cum    3  97 119 130 133 136   5     <- stage 7 fits nothing, see processStagePlan
+         * Real 0x3E frames from washer-cycle-20260730.jsonl - the whole set that capture contains.
+         * Each arrived ten times, one report every ~15 minutes, and the order is not guaranteed, so
+         * the decode must depend on neither. What they are was settled by the smart plug on this
+         * appliance's outlet: report 2 says 94 and the plug drew 1880-2018 W for three minutes in
+         * exactly that window. See processEnergyReport.
          */
         for (const f of [
             'aa0b203e00030003014fbb',
@@ -352,19 +350,49 @@ describe('FX___S washer', () => {
         ])
             feed(thinq, Buffer.from(f, 'hex'))
 
-        assert.equal(get(HA, 'cycle_plan'), '3/94/22/11/3/3')
-        assert.equal(get(HA, 'cycle_plan_total'), 136)
+        assert.equal(get(HA, 'energy_reports'), '3/94/22/11/3/3')
+        assert.equal(get(HA, 'energy'), 136)
 
-        /* stage 7 breaks the running sum: it shows in the plan but must not become the total */
-        feed(thinq, Buffer.from('aa0b203e00000005074abb', 'hex'))
-        assert.equal(get(HA, 'cycle_plan'), '3/94/22/11/3/3/0')
-        assert.equal(get(HA, 'cycle_plan_total'), 136, 'total unchanged by the odd stage')
+        /* An 11 Wh report reads as an extended frame if the length is not checked; this is that one. */
+        assert.equal(get(HA, 'energy_reports')?.toString().split('/')[3], '11')
 
-        /* a stage 1 starts a new plan rather than extending the old one */
+        /* Report 1 starts a new cycle's count rather than extending the old one. */
         feed(thinq, Buffer.from('aa0b203e001600160115bb', 'hex'))
         feed(thinq, Buffer.from('aa0b203e000d00230210bb', 'hex'))
-        assert.equal(get(HA, 'cycle_plan'), '22/13')
-        assert.equal(get(HA, 'cycle_plan_total'), 35)
+        assert.equal(get(HA, 'energy_reports'), '22/13')
+        assert.equal(get(HA, 'energy'), 35)
+    })
+
+    test('the 2026-08-04 Normal cycle, which is what settled the unit', () => {
+        const { HA, thinq } = setup()
+
+        // The three reports of that cycle, byte for byte from washer-normal-20260804.jsonl. The
+        // appliance ran 13:56:44 - 14:25:27, so a "167 minute" total was never possible; the plug
+        // measured +0.18 kWh over the same cycle against the 164 reported here.
+        feed(thinq, Buffer.from('aa0b203e008c008c01f4bb', 'hex')) // 14:10:08  140 / 140 / 1
+        feed(thinq, Buffer.from('aa0b203e001800a40284bb', 'hex')) // 14:25:28   24 / 164 / 2
+        assert.equal(get(HA, 'energy'), 164)
+
+        feed(thinq, Buffer.from('aa0b203e000300a70395bb', 'hex')) // 14:40:06    3 / 167 / 3
+        assert.equal(get(HA, 'energy'), 167, 'it keeps counting while the appliance idles')
+        assert.equal(get(HA, 'energy_reports'), '140/24/3')
+    })
+
+    test('0xE2 carries the same cycle total at @22, from a different frame family', () => {
+        // Not published - the handler ignores 0xE2 - but this is the cross-check that made the
+        // energy reading independent of the plug, so the bytes are recorded here. Sent ten times,
+        // 30 s before the cycle reached Complete: course 46 at @9 and @24, the options as selected
+        // (3/3/2/6) at @5-@8, the nominal 35 minutes at @18 and @20, and 164 Wh at @22.
+        const e2 = buf(
+            'aa4b20e2034300030302062e000000000000000023002300a4002e030105000000001404000000002000009000003000' +
+                '00000000000400000000000000000000000000000018000000fbbb',
+        )
+        const body = e2.subarray(2, e2.length - 2)
+        assert.equal(body[9], 46)
+        assert.equal(body[24], 46)
+        assert.deepEqual([...body.subarray(5, 9)], [3, 3, 2, 6])
+        assert.equal(body.readUInt16LE(18), 35)
+        assert.equal(body.readUInt16LE(22), 164) // the cycle total 0x3E reported one second later
     })
 })
 
@@ -698,7 +726,7 @@ describe('FX___S entity names', () => {
         // These report what the appliance is doing rather than setting it, so grouping them with the
         // controls would say they are adjustable.
         assert.equal(nameOf(HA, 'current_course'), 'Current course')
-        assert.equal(nameOf(HA, 'cycle_plan'), 'Cycle plan')
+        assert.equal(nameOf(HA, 'energy_reports'), 'Energy per report')
         assert.equal(nameOf(HA, 'remaining_time'), 'Remaining time')
     })
 })
