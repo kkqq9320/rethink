@@ -1086,21 +1086,15 @@ describe('FX___S reservation armed on the appliance itself', () => {
         assert.equal(get(HA, 'reservation'), 3)
     })
 
-    test('the drum is not reported as turning while the appliance waits', () => {
+    test('the flags bit is published as the appliance sets it, unexplained or not', () => {
         const { HA, dut } = setup()
         dut.processRecord(armed())
-        // The flags byte has bit 0x80 set - the same bit that means the drum is turning during a
-        // cycle - and the appliance is standing still for the next three hours. Reporting "Drum
-        // turning: on" for all of it was the defect this test exists to keep out.
-        assert.equal(get(HA, 'drum_active'), 'OFF')
-        // ...and it is not running either: it has not started.
-        assert.equal(get(HA, 'running'), 'OFF')
-    })
-
-    test('the bit still means the drum in the phases where that was measured', () => {
-        const { HA, thinq } = setup()
-        feed(thinq, STARTED) // phase 3, flags 0x80
+        // Bit 0x80 - the one this handler calls "drum turning" - is set here, with the appliance
+        // about to wait. Whether that is a load-sensing tumble or the bit meaning something broader
+        // is NOT settled by one record, so nothing is suppressed: see FLAG_DRUM_ACTIVE.
         assert.equal(get(HA, 'drum_active'), 'ON')
+        // Running is a different question and answers it correctly: a reservation has not started.
+        assert.equal(get(HA, 'running'), 'OFF')
     })
 
     test('powering off clears the reservation, as it did on 2026-07-30 and again today', () => {

@@ -155,12 +155,20 @@ const FLAG_CHILD_LOCK = 0x20
 // own mid-cycle (measured twice, with no command in between and the remaining time still counting down),
 // so it must not be used to mean "paused" - that is PHASE_PAUSED and nothing else.
 //
-// It is NOT purely the drum, which only showed up when a state nobody had reached before finally
-// happened: arming a delay-end reservation on the panel set this bit while the appliance stood still
-// for the next three hours (2026-08-04 18:21:28, phase 1 -> 7 with this byte 0 -> 128). So the bit is
-// closer to "a cycle is under way", and RESERVED is excluded below rather than the bit being renamed -
-// what it means in the phases that were measured is unchanged, and there is no second observation yet
-// to say what it means anywhere else.
+// OPEN QUESTION, deliberately left alone. Arming a delay-end reservation on the panel set this bit
+// (2026-08-04 18:21:28, phase 1 -> 7, this byte 0 -> 128), which was briefly read here as proof the
+// bit means "a cycle is under way" rather than the drum - and the sensor was made to suppress it in
+// RESERVED. That was one record. The owner's reading is at least as good: the appliance tumbles
+// briefly to sense the load when a cycle is armed, so the drum really may have been turning.
+//
+// Neither reading is settled. Against the tumble: the door was open at that moment - which is what
+// the error was - and no washer turns its drum with the door open. Against the flag reading: it is a
+// single sample taken in an error state, which is not what a reservation normally looks like. So the
+// bit is published exactly as the appliance sets it, and the test that settles it is to arm a
+// reservation with the door shut and watch for five minutes: the appliance sends a record on any
+// change, so if the bit clears when a sensing tumble ends, that record will say so.
+//
+// Across every capture the bit is set in phases 3, 7, 11, 12, 14, 37 and 40, and clear in 42 and 47.
 const FLAG_DRUM_ACTIVE = 0x80
 
 // One byte each, found by toggling them on the panel one at a time with a pause in between - the run
@@ -954,8 +962,7 @@ export default class Device extends AABBDevice {
         this.publishProperty('status', STATUS[phase] ?? 'unknown')
         this.publishProperty('status_code', phase)
         this.publishProperty('running', ACTIVE_PHASES.has(phase) ? 'ON' : 'OFF')
-        // A reservation sets the same bit with the drum standing still for hours - see FLAG_DRUM_ACTIVE.
-        this.publishProperty('drum_active', flags & FLAG_DRUM_ACTIVE && phase !== PHASE_RESERVED ? 'ON' : 'OFF')
+        this.publishProperty('drum_active', flags & FLAG_DRUM_ACTIVE ? 'ON' : 'OFF')
         this.remoteControl = (flags & FLAG_REMOTE_CONTROL) !== 0
         this.publishProperty('remote_control', this.remoteControl ? 'ON' : 'OFF')
         this.publishProperty('child_lock', flags & FLAG_CHILD_LOCK ? 'ON' : 'OFF')
