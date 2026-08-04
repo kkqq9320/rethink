@@ -1086,15 +1086,53 @@ describe('FX___S reservation armed on the appliance itself', () => {
         assert.equal(get(HA, 'reservation'), 3)
     })
 
-    test('the flags bit is published as the appliance sets it, unexplained or not', () => {
+    test('the drum is not reported as turning for the hours a reservation waits', () => {
         const { HA, dut } = setup()
         dut.processRecord(armed())
-        // Bit 0x80 - the one this handler calls "drum turning" - is set here, with the appliance
-        // about to wait. Whether that is a load-sensing tumble or the bit meaning something broader
-        // is NOT settled by one record, so nothing is suppressed: see FLAG_DRUM_ACTIVE.
-        assert.equal(get(HA, 'drum_active'), 'ON')
+        // Bit 0x80 is set for the whole reservation - five records over three minutes on
+        // 2026-08-04, never clearing, while the appliance stood still. A sensing tumble would have
+        // ended and said so, because a reservation emits a record every minute as it counts down.
+        assert.equal(get(HA, 'drum_active'), 'OFF')
         // Running is a different question and answers it correctly: a reservation has not started.
         assert.equal(get(HA, 'running'), 'OFF')
+    })
+
+    test('the bit still means the drum in the phases where that was measured', () => {
+        const { HA, thinq } = setup()
+        feed(thinq, STARTED) // phase 3, flags 0x80
+        assert.equal(get(HA, 'drum_active'), 'ON')
+    })
+
+    test('the finish time counts the reservation, not the cycle length', () => {
+        const { HA, dut } = setup()
+        const before = Date.now()
+        // 18:45:21 exactly: seven hours to go, on a cycle whose own length reads 30 minutes.
+        const rec = armed()
+        rec[10] = 1
+        rec[11] = 163 // 419 minutes
+        rec[12] = 0
+        rec[13] = 30 // the cycle is half an hour, and that is NOT when it finishes
+        dut.processRecord(rec)
+
+        const at = Date.parse(String(get(HA, 'end_time')))
+        assert.ok(at >= before + 419 * 60_000 - 30_000, 'about seven hours out, not thirty minutes')
+        assert.ok(at <= Date.now() + 419 * 60_000 + 30_000)
+        // ...and the remaining-time sensor stays out of it: the cycle has not started.
+        assert.equal(get(HA, 'remaining_time'), 0)
+    })
+
+    test('it counts down a minute at a time without the reservation setpoint jittering', () => {
+        const { HA, dut } = setup()
+        const seen = new Set<string>()
+        for (const minutes of [420, 419, 418, 417, 416]) {
+            const rec = armed()
+            rec[10] = (minutes >> 8) & 0xff
+            rec[11] = minutes & 0xff
+            dut.processRecord(rec)
+            seen.add(String(get(HA, 'reservation')))
+        }
+        // Published in half hours, so a minute of countdown does not move it.
+        assert.deepEqual([...seen], ['7'])
     })
 
     test('powering off clears the reservation, as it did on 2026-07-30 and again today', () => {

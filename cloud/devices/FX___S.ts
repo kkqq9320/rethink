@@ -155,20 +155,18 @@ const FLAG_CHILD_LOCK = 0x20
 // own mid-cycle (measured twice, with no command in between and the remaining time still counting down),
 // so it must not be used to mean "paused" - that is PHASE_PAUSED and nothing else.
 //
-// OPEN QUESTION, deliberately left alone. Arming a delay-end reservation on the panel set this bit
-// (2026-08-04 18:21:28, phase 1 -> 7, this byte 0 -> 128), which was briefly read here as proof the
-// bit means "a cycle is under way" rather than the drum - and the sensor was made to suppress it in
-// RESERVED. That was one record. The owner's reading is at least as good: the appliance tumbles
-// briefly to sense the load when a cycle is armed, so the drum really may have been turning.
+// It is NOT only the drum, and settling that took two attempts. Arming a reservation sets this bit;
+// the first time that was seen it was one record, and the owner's explanation - the appliance tumbles
+// briefly to sense the load when a cycle is armed - fitted it just as well, so nothing was changed.
 //
-// Neither reading is settled. Against the tumble: the door was open at that moment - which is what
-// the error was - and no washer turns its drum with the door open. Against the flag reading: it is a
-// single sample taken in an error state, which is not what a reservation normally looks like. So the
-// bit is published exactly as the appliance sets it, and the test that settles it is to arm a
-// reservation with the door shut and watch for five minutes: the appliance sends a record on any
-// change, so if the bit clears when a sensing tumble ends, that record will say so.
+// The measurement that separates them: a reservation armed with the door shut on 2026-08-04 at
+// 18:45:18 and left alone. It counts down a minute at a time, so records arrive every minute, and
+// across five of them spanning three minutes this bit never cleared. A sensing tumble ends, and the
+// record that ended it would have said so. The drum is not turning for the seven hours that follow.
 //
-// Across every capture the bit is set in phases 3, 7, 11, 12, 14, 37 and 40, and clear in 42 and 47.
+// So RESERVED is suppressed where it is published, rather than the bit being renamed: what it means
+// in the phases that were measured is unchanged, including clearing and re-setting mid-wash on its
+// own. Across every capture it is set in phases 3, 7, 11, 12, 14, 37 and 40, and clear in 42 and 47.
 const FLAG_DRUM_ACTIVE = 0x80
 
 // One byte each, found by toggling them on the panel one at a time with a pause in between - the run
@@ -962,7 +960,8 @@ export default class Device extends AABBDevice {
         this.publishProperty('status', STATUS[phase] ?? 'unknown')
         this.publishProperty('status_code', phase)
         this.publishProperty('running', ACTIVE_PHASES.has(phase) ? 'ON' : 'OFF')
-        this.publishProperty('drum_active', flags & FLAG_DRUM_ACTIVE ? 'ON' : 'OFF')
+        // Not while a reservation waits: the bit is set for the whole of it - see FLAG_DRUM_ACTIVE.
+        this.publishProperty('drum_active', flags & FLAG_DRUM_ACTIVE && phase !== PHASE_RESERVED ? 'ON' : 'OFF')
         this.remoteControl = (flags & FLAG_REMOTE_CONTROL) !== 0
         this.publishProperty('remote_control', this.remoteControl ? 'ON' : 'OFF')
         this.publishProperty('child_lock', flags & FLAG_CHILD_LOCK ? 'ON' : 'OFF')
@@ -990,6 +989,19 @@ export default class Device extends AABBDevice {
         this.publishProperty('remaining_time', remaining)
 
         /*
+         * A reservation is a countdown too, and a much longer one, so the finish time below uses it
+         * instead. Measured 2026-08-04 18:45 onwards: the reservation ticks down a minute at a time
+         * (420, 419, 418, ...) while the remaining-minutes bytes hold the CYCLE's length - they read
+         * 30 for a thirty-minute cycle seven hours away, so they are not what "finishes at" wants.
+         *
+         * Taking this as the time to the FINISH rather than to the start is LG's own framing - the
+         * model JSON calls the feature `endReserveTime` and the appliance's panel calls it 종료 예약.
+         * It has not been watched all the way down, and the check when it is: the cycle should start
+         * when this counter reaches the cycle's own length, which is the 30 above, not at zero.
+         */
+        const untilFinish = phase === PHASE_RESERVED && rec[OFF_RESERVE_FLAG] & RESERVE_SET ? reserveMinutes : remaining
+
+        /*
          * The finish time, which is a timestamp all the way through rather than a countdown that
          * gives up. While a cycle runs it is the PREDICTED finish, recomputed only when the minute
          * count actually moves - doing it on every frame would push a slightly different timestamp
@@ -1008,7 +1020,7 @@ export default class Device extends AABBDevice {
          * sits finished) is deliberately NOT latched - that instant is the restart, not the finish,
          * and the retained value already holds the real one.
          */
-        if (remaining > 0) {
+        if (untilFinish > 0) {
             /*
              * Only when it moves by a minute or more, because anything smaller is OUR noise rather
              * than the appliance's news. The countdown is in whole minutes and the appliance revises
@@ -1019,7 +1031,7 @@ export default class Device extends AABBDevice {
              * over the same range - every genuine revision still gets through, and the wobble does
              * not. A revision the appliance actually made cannot be smaller than its own granularity.
              */
-            const predicted = Date.now() + remaining * 60_000
+            const predicted = Date.now() + untilFinish * 60_000
             if (this.endTimePredicted === undefined || Math.abs(predicted - this.endTimePredicted) >= 60_000) {
                 this.endTimePredicted = predicted
                 // Published on the minute: the seconds carry no information, and a value that keeps
