@@ -448,6 +448,44 @@ const COURSE: Record<number, string> = {
 // so that is the form `setExtendedCourse` reproduces rather than a guessed two-key frame - the two-key
 // form on its own has never been seen on the wire. (These were briefly treated as read-only, on the
 // grounds that no such write had been captured. It had been: the app selecting Towels 1.)
+// The same dial in the language printed on it, published when homeassistant.language is "ko". The
+// twenty-five LG declares are its own strings, taken from the _comment on each entry of the model
+// JSON's Course section; the five it does not declare are the panel's own words, read off it during
+// the sweeps. Home Assistant cannot translate the STATE of an entity created by MQTT discovery - the
+// mechanism is translation_key plus the OWNING integration's strings.json, and the owner here is
+// `mqtt` - so the choice has to be made where the names are, which is here.
+const COURSE_KO: Record<number, string> = {
+    0x05: '알러지케어',
+    0x06: '찬물 세탁',
+    0x08: '아기옷',
+    0x12: '컬러 케어',
+    0x1b: '이불',
+    0x2e: '표준',
+    0x36: '스팀리프레쉬',
+    0x37: '헹굼+탈수',
+    0x38: '헹굼 단독',
+    0x41: '조용조용',
+    0x46: '찌든 때',
+    0x4a: '소량급속',
+    0x4c: '알뜰삶음',
+    0x4e: '탈수 단독',
+    0x4f: '기능성의류',
+    0x55: '통살균',
+    0x59: '세탁 단독',
+    0x5e: '울/섬세',
+    0x66: '옷감 보호',
+    0x69: '키즈옷',
+    0x6a: '장마철세탁',
+    0x6c: '셔츠',
+    0x6d: '한벌 세탁',
+    0x71: '땀얼룩 제거',
+    0x72: '인공지능 세탁',
+    // Ours, from the panel - LG declares none of these for this model.
+    0x54: '타월',
+    0x87: '쾌속스팀살균',
+    0x86: '급속통헹굼',
+}
+
 // The two reached through the 0xFF escape. Each declares a BASE course and a set of option overrides
 // (0x4D's 42-byte variant): 0xf5 is built on 46 = NORMAL and 0xf6 on 84 = TOWELS, which is where the
 // suffix comes from. Neither appears in any list LG publishes for this model, so the names are ours,
@@ -456,6 +494,7 @@ const COURSE_EXT: Record<number, string> = {
     0xf5: 'NORMAL_1', // 표준1, 68 min - base NORMAL
     0xf6: 'TOWELS_1', // 타월1, 82 min - base TOWELS
 }
+const COURSE_EXT_KO: Record<number, string> = { 0xf5: '표준1', 0xf6: '타월1' }
 
 // All four option scales were read off the panel by stepping each control through a full cycle on
 // several courses and writing the displayed names down in order, with the sweep returning to its
@@ -513,8 +552,8 @@ const LEGACY_COURSE_NAMES: Record<string, number> = {
 }
 const LEGACY_COURSE_EXT_NAMES: Record<string, number> = { 'Normal 1': 0xf5, 'Towels 1': 0xf6 }
 
-const COURSE_BY_NAME = { ...invert(COURSE), ...LEGACY_COURSE_NAMES }
-const COURSE_EXT_BY_NAME = { ...invert(COURSE_EXT), ...LEGACY_COURSE_EXT_NAMES }
+const COURSE_BY_NAME = { ...invert(COURSE), ...invert(COURSE_KO), ...LEGACY_COURSE_NAMES }
+const COURSE_EXT_BY_NAME = { ...invert(COURSE_EXT), ...invert(COURSE_EXT_KO), ...LEGACY_COURSE_EXT_NAMES }
 
 export default class Device extends AABBDevice {
     /** Wh reported by each of the appliance's ~15-minute energy reports, index 0 = report 1. */
@@ -559,10 +598,20 @@ export default class Device extends AABBDevice {
      * The other reason still holds on its own: dropping a course would break any automation naming
      * it.
      */
-    courseOptions = [...Object.values(COURSE), ...Object.values(COURSE_EXT)]
+    courseOptions: string[] = []
+
+    /** Chosen once from homeassistant.language; see COURSE_KO. Writes accept every name regardless. */
+    readonly courseNames: Record<number, string>
+    readonly courseExtNames: Record<number, string>
 
     constructor(HA: Connection, thinq: Thinq2Device, meta: Metadata) {
         super(HA, thinq)
+        // Optional chaining on purpose: nothing else in a profile reads the connection's config, so a
+        // caller that does not supply one still gets a working device in the default language.
+        const korean = HA.config?.language === 'ko'
+        this.courseNames = korean ? COURSE_KO : COURSE
+        this.courseExtNames = korean ? COURSE_EXT_KO : COURSE_EXT
+        this.courseOptions = [...Object.values(this.courseNames), ...Object.values(this.courseExtNames)]
         this.setConfig(
             allowExtendedType({
                 ...HADevice.config(meta, { name: 'LG Washer' }),
@@ -1045,9 +1094,18 @@ export default class Device extends AABBDevice {
             declared.push(this.courseLabel(kind === TABLE_KIND_EXTENDED ? COURSE_EXTENDED : id, id))
         }
 
-        // Declared order is dial order, which is the more useful one to offer. Anything already on the
-        // list that was not declared keeps its place after it rather than being dropped.
-        const merged = [...declared, ...this.courseOptions.filter((course) => !declared.includes(course))]
+        /*
+         * The declaration REPLACES the list rather than growing it, because it is the dial and the
+         * dial is what the owner put on it - they take courses off, and a select still offering them
+         * is showing something the panel does not. Declared order is dial order.
+         *
+         * The one exception is the course the appliance is reporting right now. A select whose state
+         * is not one of its own options is rejected by Home Assistant, and a course CAN be selected
+         * while off the dial - measured, twice, with courses that are not the base of anything. So
+         * whatever is selected stays offered even when the dial has dropped it.
+         */
+        const current = this.lastRecord ? this.currentCourseLabel(this.lastRecord) : undefined
+        const merged = current && !declared.includes(current) ? [...declared, current] : declared
         if (merged.length === this.courseOptions.length && merged.every((c, i) => c === this.courseOptions[i])) return
 
         log('status', `${this.id}: the appliance declares ${count} courses: ${declared.join(', ')}`)
@@ -1166,8 +1224,7 @@ export default class Device extends AABBDevice {
         // extended course that is the second byte; no record has ever been seen taking the escape with a
         // zero identifier, but the same reasoning applies and the alternative is publishing "#ext0".
         const course = rec[OFF_COURSE]
-        const identifier = course === COURSE_EXTENDED ? rec[OFF_COURSE_EXT] : course
-        const label = identifier === COURSE_NONE ? undefined : this.courseLabel(course, rec[OFF_COURSE_EXT])
+        const label = this.currentCourseLabel(rec)
         if (label !== undefined) {
             this.registerCourse(label)
             this.publishProperty('course', label)
@@ -1206,9 +1263,18 @@ export default class Device extends AABBDevice {
         )
     }
 
+    /** The label for whatever course a record names, or undefined when it names none (byte 0). */
+    currentCourseLabel(rec: Buffer) {
+        const course = rec[OFF_COURSE]
+        const identifier = course === COURSE_EXTENDED ? rec[OFF_COURSE_EXT] : course
+        return identifier === COURSE_NONE ? undefined : this.courseLabel(course, rec[OFF_COURSE_EXT])
+    }
+
     courseLabel(course: number, ext: number) {
-        if (course === COURSE_EXTENDED) return COURSE_EXT[ext] ?? `#ext${ext}`
-        return COURSE[course] ?? `#${course}`
+        // `#ext123` and `#123` have to stay distinct: they are different courses reached by different
+        // writes, and a bare number would leave setProperty guessing which one was meant.
+        if (course === COURSE_EXTENDED) return this.courseExtNames[ext] ?? `#ext${ext}`
+        return this.courseNames[course] ?? `#${course}`
     }
 
     /** Add a course to the select and republish discovery, the once, when it is first seen. */

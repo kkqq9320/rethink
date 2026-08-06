@@ -42,6 +42,16 @@ export type HAConfig = {
     rethink_prefix: string
     mqtt_user: string
     mqtt_pass: string
+    /**
+     * Which language a device profile publishes appliance-specific NAMES in - "en" (the default) or
+     * "ko". FX___S publishes its course names either way; a profile that only knows one set ignores
+     * this. It is not a translation layer: Home Assistant cannot translate the STATE of an entity
+     * created by MQTT discovery, because that needs translation_key plus the owning integration's
+     * strings.json and the owner is `mqtt`. Entity states are what automations compare against, so
+     * changing this renames things they match on - profiles keep accepting every language they know
+     * on the command side, since a write is unambiguous.
+     */
+    language?: string
 }
 
 export type CA = {

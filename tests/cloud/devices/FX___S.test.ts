@@ -526,13 +526,15 @@ const courseOptions = (HA: MockHAConnection) =>
     (HA.devices[DEVICE_ID].config!.components.course as { options?: string[] }).options!
 
 describe('FX___S course table', () => {
-    test('the declared dial comes first, in the order the appliance gives it', () => {
+    test('the select becomes the dial, in the order the appliance gives it', () => {
         const { HA, thinq } = setup()
+        assert.ok(courseOptions(HA).includes('SHIRT'), 'the seeded table offers everything at first')
+
         feed(thinq, COURSE_TABLE)
-        // The ten it declares lead; the rest of the named table keeps its place behind them, because
-        // a course that has been seen once is never withdrawn.
-        assert.deepEqual(courseOptions(HA).slice(0, DIAL.length), DIAL)
-        assert.ok(courseOptions(HA).includes('SHIRT'), 'a course off this dial is still offered')
+        // The declaration REPLACES the list: the dial is what the owner put on the appliance, and a
+        // select still offering what they took off is showing something the panel does not.
+        assert.deepEqual(courseOptions(HA), DIAL)
+        assert.ok(!courseOptions(HA).includes('SHIRT'))
     })
 
     test('a declaration whose header byte has moved is read, not thrown away', () => {
@@ -563,11 +565,9 @@ describe('FX___S course table', () => {
         // Synthesised, not captured: a hypothetical sibling model declaring one course we have a name
         // for and two we do not. Only the framing is real - incoming checksums are not verified.
         feed(thinq, buf('aa10204d03021603022e029900aa00bb'))
-        const options = courseOptions(HA)
-        assert.deepEqual(options.slice(0, 3), ['NORMAL', '#153', '#ext170'])
-        // Everything already offered keeps its place behind the declaration, and nothing is dropped.
-        assert.equal(options.length, 3 + 29)
-        for (const kept of ['DUVET', 'AI_COURSE', 'TOWELS', 'TOWELS_1']) assert.ok(options.includes(kept), kept)
+        // Exactly what it declared, nothing else - and the two it has no name for are offered under
+        // their numbers rather than dropped.
+        assert.deepEqual(courseOptions(HA), ['NORMAL', '#153', '#ext170'])
     })
 
     test('an unnamed declared course can actually be selected', () => {
@@ -1224,16 +1224,32 @@ describe("FX___S the dial is the owner's, not the appliance's", () => {
         assert.equal(courseOptions(HA)[19], 'COLORCARE')
     })
 
-    test('the ten taken off the dial stay in the list', () => {
+    test('the ten taken off the dial leave the list with it', () => {
         const { HA, thinq } = setup()
         feed(thinq, COURSE_TABLE_30)
+        assert.equal(courseOptions(HA).length, 30)
+
+        feed(thinq, DECLARED_20)
+        assert.equal(courseOptions(HA).length, 20)
+        for (const gone of ['TOWELS', 'SHIRT', 'RINSEONLY', 'SINGLE_GARMENTS'])
+            assert.ok(!courseOptions(HA).includes(gone), gone)
+    })
+
+    test('...except whatever is selected right now, which has to stay offered', () => {
+        const { HA, thinq, dut } = setup()
+        feed(thinq, COURSE_TABLE_30)
+
+        // TOWELS selected, then taken off the dial. Home Assistant rejects a select state that is not
+        // one of its options, so dropping it here would leave the entity unable to report itself.
+        const rec = Buffer.alloc(66)
+        rec[20] = 1
+        rec[4] = 0x54
+        dut.processRecord(rec)
         feed(thinq, DECLARED_20)
 
-        // Deliberate: an automation naming one of these keeps working. It is a choice about
-        // automations, not a claim that the appliance still offers them - see courseOptions.
-        for (const gone of ['TOWELS', 'SHIRT', 'RINSEONLY', 'SINGLE_GARMENTS'])
-            assert.ok(courseOptions(HA).includes(gone), gone)
-        assert.equal(courseOptions(HA).length, 30)
+        assert.equal(get(HA, 'course'), 'TOWELS')
+        assert.ok(courseOptions(HA).includes('TOWELS'))
+        assert.equal(courseOptions(HA).length, 21)
     })
 })
 
@@ -1258,7 +1274,7 @@ describe('FX___S a course off the dial can still be selected', () => {
         assert.equal(hex(thinq.outbox[0]), hex(buf('aa0df0e5000201ff010a6c50bb')))
     })
 
-    test('and the option list still offers it', () => {
+    test('but the select no longer offers it, because the dial does not', () => {
         const { HA, thinq } = setup()
         feed(
             thinq,
@@ -1267,8 +1283,11 @@ describe('FX___S a course off the dial can still be selected', () => {
                     '5abb',
             ),
         )
-        assert.ok(courseOptions(HA).includes('SHIRT'))
-        assert.ok(courseOptions(HA).includes('TOWELS'))
+        // The write above still works - a name this handler knows resolves whatever the dial says -
+        // but Home Assistant validates select_option against the options, so from the UI it is the
+        // dial that decides. That is the point of syncing: the select shows the panel.
+        assert.ok(!courseOptions(HA).includes('SHIRT'))
+        assert.ok(!courseOptions(HA).includes('TOWELS'))
     })
 })
 
@@ -1320,5 +1339,59 @@ describe('FX___S two settings of the appliance rather than of a cycle', () => {
         dut.setProperty('clock_when_off', 'OFF')
         assert.equal(hex(thinq.outbox[0]), hex(buf('aa0df0e5000201ff015801bdbb')))
         assert.equal(hex(thinq.outbox[1]), hex(buf('aa0df0e5000201ff015800b2bb')))
+    })
+})
+
+describe('FX___S course names in the configured language', () => {
+    function setupIn(language?: string) {
+        const HA = new MockHAConnection()
+        HA.config = { language }
+        const thinq = new MockThinq2Device(DEVICE_ID, META)
+        const dut = new DUT(HA.asConnection(), thinq, META)
+        return { HA, thinq, dut }
+    }
+
+    test('English by default, Korean when asked', () => {
+        const { HA: en, thinq: te } = setupIn()
+        feed(te, STANDBY)
+        assert.equal(get(en, 'current_course'), 'AI_COURSE')
+
+        const { HA: ko, thinq: tk } = setupIn('ko')
+        feed(tk, STANDBY)
+        assert.equal(get(ko, 'current_course'), '인공지능 세탁')
+    })
+
+    test('the dial the appliance declares is named in that language too', () => {
+        const { HA, thinq } = setupIn('ko')
+        feed(thinq, COURSE_TABLE)
+        assert.deepEqual(courseOptions(HA), [
+            '인공지능 세탁',
+            '울/섬세',
+            '표준',
+            '표준1',
+            '타월1',
+            '통살균',
+            '이불',
+            '쾌속스팀살균',
+            '헹굼+탈수',
+            '급속통헹굼',
+        ])
+    })
+
+    test('a write takes any name this handler knows, in either language and the old ones', () => {
+        for (const language of [undefined, 'ko']) {
+            for (const name of ['NORMAL', '표준', 'Normal']) {
+                const { thinq, dut } = setupIn(language)
+                dut.setProperty('course', name)
+                assert.equal(hex(thinq.outbox[0]), hex(buf('aa0df0e5000201ff010a2e92bb')), `${language} <- ${name}`)
+            }
+        }
+    })
+
+    test('an unnamed course keeps its number, and an extended one says so', () => {
+        const { HA, thinq } = setupIn('ko')
+        // 0x99 is on no dial we have swept; 0xAA is an extended id we have never seen.
+        feed(thinq, buf('aa10204d03021603022e029900aa00bb'))
+        assert.deepEqual(courseOptions(HA), ['표준', '#153', '#ext170'])
     })
 })
