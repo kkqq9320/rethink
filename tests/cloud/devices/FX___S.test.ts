@@ -1271,3 +1271,54 @@ describe('FX___S a course off the dial can still be selected', () => {
         assert.ok(courseOptions(HA).includes('TOWELS'))
     })
 })
+
+describe('FX___S two settings of the appliance rather than of a cycle', () => {
+    // Labelled 2026-08-07 00:27, one at a time: the owner named each switch, turned it on, waited, and
+    // turned it off. Both writes echoed in the record and both came back to where they started.
+    test('course auto-optimisation is key 0x4C and bit 0x08 of byte 39', () => {
+        const { HA, thinq, dut } = setup()
+
+        const rec = Buffer.alloc(66)
+        rec[20] = 1
+        rec[39] = 0x34 // as captured with it off
+        dut.processRecord(rec)
+        assert.equal(get(HA, 'auto_optimise'), 'OFF')
+
+        rec[39] = 0x3c // ...and on
+        dut.processRecord(rec)
+        assert.equal(get(HA, 'auto_optimise'), 'ON')
+
+        thinq.resetRecorder()
+        dut.setProperty('auto_optimise', 'ON')
+        dut.setProperty('auto_optimise', 'OFF')
+        assert.equal(hex(thinq.outbox[0]), hex(buf('aa0df0e5000201ff014c0189bb')))
+        assert.equal(hex(thinq.outbox[1]), hex(buf('aa0df0e5000201ff014c008ebb')))
+    })
+
+    test('the clock while switched off is key 0x58 and bit 0x80 of byte 46', () => {
+        const { HA, thinq, dut } = setup()
+
+        const rec = Buffer.alloc(66)
+        rec[20] = 1
+        rec[46] = 0x04 // captured: laundry care off, clock off
+        dut.processRecord(rec)
+        assert.equal(get(HA, 'clock_when_off'), 'OFF')
+        assert.equal(get(HA, 'laundry_care'), 'OFF')
+
+        rec[46] = 0x84 // clock on, laundry care still off - one byte, two settings
+        dut.processRecord(rec)
+        assert.equal(get(HA, 'clock_when_off'), 'ON')
+        assert.equal(get(HA, 'laundry_care'), 'OFF')
+
+        rec[46] = 0x8c // both on
+        dut.processRecord(rec)
+        assert.equal(get(HA, 'clock_when_off'), 'ON')
+        assert.equal(get(HA, 'laundry_care'), 'ON')
+
+        thinq.resetRecorder()
+        dut.setProperty('clock_when_off', 'ON')
+        dut.setProperty('clock_when_off', 'OFF')
+        assert.equal(hex(thinq.outbox[0]), hex(buf('aa0df0e5000201ff015801bdbb')))
+        assert.equal(hex(thinq.outbox[1]), hex(buf('aa0df0e5000201ff015800b2bb')))
+    })
+})

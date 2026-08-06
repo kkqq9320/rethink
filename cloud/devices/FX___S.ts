@@ -193,6 +193,14 @@ const TURBOSHOT_ON = 0x20
 // on the setting straight away, which is what it looked like the first time it was seen.
 const OFF_LAUNDRY_CARE = 46
 const LAUNDRY_CARE_ON = 0x08
+// The same byte carries the panel's "show the clock while switched off" setting, and the byte that
+// holds the drum-light and cleaning bits carries the course auto-optimisation one. Both were labelled
+// the way everything else here was: the owner toggled each ON and then OFF, one at a time thirty
+// seconds apart, naming them first. Each write echoed in the record and each came back to where it
+// started, which is what makes a two-step sweep self-checking.
+const CLOCK_WHEN_OFF_ON = 0x80 // also in OFF_LAUNDRY_CARE - 0x04 -> 0x84 and back
+const OFF_AUTO_OPTIMISE = 39
+const AUTO_OPTIMISE_ON = 0x08 // 0x34 -> 0x3C and back
 
 const PHASE_OFF = 0
 const PHASE_STANDBY = 1
@@ -322,6 +330,8 @@ const KEY_SPIN = 0x21
 const KEY_TURBOWASH = 0x35
 const KEY_STEAM = 0x3e
 const KEY_LAUNDRY_CARE = 0x57
+const KEY_AUTO_OPTIMISE = 0x4c
+const KEY_CLOCK_WHEN_OFF = 0x58
 // The one key that carries a SIXTEEN-bit value. That is why the option write always looked like it had
 // a stray zero on the end: `7f 00 00` is this key holding no reservation, not a key and a trailing
 // byte. It also makes the model JSON's `courseDownloadDataLength: 21` come out exactly - nine one-byte
@@ -865,6 +875,26 @@ export default class Device extends AABBDevice {
                         unit_of_measurement: 'h',
                         mode: 'box',
                     },
+                    // Two settings of the appliance itself rather than of a cycle, so they are
+                    // config rather than part of the "Course - " group.
+                    auto_optimise: {
+                        platform: 'switch',
+                        unique_id: '$deviceid-auto-optimise',
+                        state_topic: '$this/auto_optimise',
+                        command_topic: '$this/auto_optimise/set',
+                        name: 'Course auto-optimisation',
+                        icon: 'mdi:auto-fix',
+                        entity_category: 'config',
+                    },
+                    clock_when_off: {
+                        platform: 'switch',
+                        unique_id: '$deviceid-clock-when-off',
+                        state_topic: '$this/clock_when_off',
+                        command_topic: '$this/clock_when_off/set',
+                        name: 'Clock while switched off',
+                        icon: 'mdi:clock-digital',
+                        entity_category: 'config',
+                    },
                     laundry_care: {
                         platform: 'switch',
                         unique_id: '$deviceid-laundry-care',
@@ -1048,6 +1078,8 @@ export default class Device extends AABBDevice {
         this.publishProperty('wrinkle_care', rec[OFF_WRINKLE_CARE] & WRINKLE_CARE_ON ? 'ON' : 'OFF')
         this.publishProperty('turbowash', rec[OFF_TURBOSHOT] & TURBOSHOT_ON ? 'ON' : 'OFF')
         this.publishProperty('laundry_care', rec[OFF_LAUNDRY_CARE] & LAUNDRY_CARE_ON ? 'ON' : 'OFF')
+        this.publishProperty('clock_when_off', rec[OFF_LAUNDRY_CARE] & CLOCK_WHEN_OFF_ON ? 'ON' : 'OFF')
+        this.publishProperty('auto_optimise', rec[OFF_AUTO_OPTIMISE] & AUTO_OPTIMISE_ON ? 'ON' : 'OFF')
         // Published in hours because that is the unit the appliance's own panel and app use, and
         // because a number entity reading 330 would invite someone to write 330 back.
         const reserveMinutes = (rec[OFF_RESERVE_HI] << 8) | rec[OFF_RESERVE_LO]
@@ -1362,6 +1394,10 @@ export default class Device extends AABBDevice {
                 return this.trigger()
             case 'laundry_care':
                 return this.setField(KEY_LAUNDRY_CARE, mqttValue === 'ON' ? 1 : 0)
+            case 'auto_optimise':
+                return this.setField(KEY_AUTO_OPTIMISE, mqttValue === 'ON' ? 1 : 0)
+            case 'clock_when_off':
+                return this.setField(KEY_CLOCK_WHEN_OFF, mqttValue === 'ON' ? 1 : 0)
             case 'turbowash':
                 return this.setField(KEY_TURBOWASH, mqttValue === 'ON' ? 1 : 0)
             case 'steam':
