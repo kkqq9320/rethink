@@ -392,6 +392,22 @@ const COURSE: Record<number, string> = {
     0x86: 'Quick Tub Rinse', // 급속통헹굼, 12 min
 }
 
+// The same dial in the language printed on it. Selected with homeassistant.language = "ko"; see
+// courseNames. These are the names the owner read off the panel during the sweep, and LG's own model
+// JSON agrees with all six of them that it also carries (표준 · 인공지능 세탁 · 이불 · 울/섬세 ·
+// 통살균 · 헹굼+탈수, modulo one space). The remaining two appear in neither its Course nor its
+// SmartCourse list, so the panel is their only source.
+const COURSE_KO: Record<number, string> = {
+    0x72: '인공지능세탁',
+    0x5e: '울/섬세',
+    0x2e: '표준',
+    0x55: '통살균',
+    0x1b: '이불',
+    0x87: '쾌속스팀살균',
+    0x37: '헹굼+탈수',
+    0x86: '급속통헹굼',
+}
+
 // Reached through the 0xFF escape, with the real identifier in the second key. Selecting one needs a
 // write carrying both keys at once; the only capture of that shape also carried all eight option keys,
 // so that is the form `setExtendedCourse` reproduces rather than a guessed two-key frame - the two-key
@@ -400,6 +416,10 @@ const COURSE: Record<number, string> = {
 const COURSE_EXT: Record<number, string> = {
     0xf5: 'Normal 1', // 표준1, 68 min
     0xf6: 'Towels 1', // 타월1, 82 min
+}
+const COURSE_EXT_KO: Record<number, string> = {
+    0xf5: '표준1',
+    0xf6: '타월1',
 }
 
 // All four option scales were read off the panel by stepping each control through a full cycle on
@@ -442,7 +462,12 @@ const WASH_BY_NAME = invert(WASH)
 const WATER_TEMP_BY_NAME = invert(WATER_TEMP)
 const SPIN_BY_NAME = invert(SPIN)
 const BEEP_BY_NAME = invert(BEEP)
-const COURSE_BY_NAME = invert(COURSE)
+// Writes accept EVERY name this handler knows, in either language, whatever it is publishing. A
+// command is unambiguous - two names cannot mean two different courses - so an automation written
+// against one language keeps working after the other is switched on, and the person typing into the
+// select does not have to know which one is configured.
+const COURSE_BY_NAME = { ...invert(COURSE), ...invert(COURSE_KO) }
+const COURSE_EXT_BY_NAME = { ...invert(COURSE_EXT), ...invert(COURSE_EXT_KO) }
 
 export default class Device extends AABBDevice {
     /** Wh reported by each of the appliance's ~15-minute energy reports, index 0 = report 1. */
@@ -477,10 +502,25 @@ export default class Device extends AABBDevice {
      * Nothing is ever removed. A course that has been seen once stays on the list: dropping it would
      * break any automation referring to it, and courses do not disappear from a dial.
      */
-    courseOptions = [...Object.values(COURSE), ...Object.values(COURSE_EXT)]
+    courseOptions: string[] = []
+
+    /**
+     * Which set of course names this instance publishes, chosen once from homeassistant.language.
+     * The appliance sends a number; the name is ours either way, and Home Assistant cannot translate
+     * the STATE of a discovery-created entity, so the choice has to be made here rather than there.
+     * Writes are not affected - COURSE_BY_NAME accepts both languages whatever this says.
+     */
+    readonly courseNames: Record<number, string>
+    readonly courseExtNames: Record<number, string>
 
     constructor(HA: Connection, thinq: Thinq2Device, meta: Metadata) {
         super(HA, thinq)
+        // Optional chaining on purpose: nothing else in a profile needs the connection's config,
+        // so a caller that does not supply one still gets a working device in the default language.
+        const korean = HA.config?.language === 'ko'
+        this.courseNames = korean ? COURSE_KO : COURSE
+        this.courseExtNames = korean ? COURSE_EXT_KO : COURSE_EXT
+        this.courseOptions = [...Object.values(this.courseNames), ...Object.values(this.courseExtNames)]
         this.setConfig(
             allowExtendedType({
                 ...HADevice.config(meta, { name: 'LG Washer' }),
@@ -620,12 +660,18 @@ export default class Device extends AABBDevice {
                     // washer's dial has many more than the four that have been run. This always shows
                     // something - the name when we know it, `#114` when we do not - so the course is
                     // visible even before its number has been identified.
+                    // An enum, with the same options as the select plus the placeholder it shows when
+                    // nothing is running. That makes Home Assistant validate it and give it the enum
+                    // treatment, and it is only safe because every label this can publish is added to
+                    // the list before it is published - see registerCourse.
                     current_course: {
                         platform: 'sensor',
                         unique_id: '$deviceid-current-course',
                         state_topic: '$this/current_course',
                         name: 'Current course',
                         icon: 'mdi:playlist-check',
+                        device_class: 'enum',
+                        options: [COURSE_CLEARED, ...this.courseOptions],
                     },
                     end_time: {
                         platform: 'sensor',
@@ -1097,8 +1143,8 @@ export default class Device extends AABBDevice {
     }
 
     courseLabel(course: number, ext: number) {
-        if (course === COURSE_EXTENDED) return COURSE_EXT[ext] ?? `#ext${ext}`
-        return COURSE[course] ?? `#${course}`
+        if (course === COURSE_EXTENDED) return this.courseExtNames[ext] ?? `#ext${ext}`
+        return this.courseNames[course] ?? `#${course}`
     }
 
     /** Add a course to the select and republish discovery, the once, when it is first seen. */
@@ -1114,8 +1160,12 @@ export default class Device extends AABBDevice {
     setCourseOptions(options: string[]) {
         this.courseOptions = options
         const course = this.config?.components?.course as { options?: string[] } | undefined
+        const current = this.config?.components?.current_course as { options?: string[] } | undefined
         if (!course) return
         course.options = [...options]
+        // The sensor declares the same list, plus the placeholder. It is an enum, so a label that
+        // reached it without being declared here would be rejected by Home Assistant.
+        if (current) current.options = [COURSE_CLEARED, ...options]
         this.publishConfig()
     }
 
@@ -1325,8 +1375,8 @@ export default class Device extends AABBDevice {
 
         if (prop !== 'course') return
 
-        const ext = Object.entries(COURSE_EXT).find(([, name]) => name === mqttValue)
-        if (ext) return this.setExtendedCourse(Number(ext[0]))
+        const ext = COURSE_EXT_BY_NAME[mqttValue]
+        if (ext !== undefined) return this.setExtendedCourse(ext)
 
         // The auto-registered labels for courses we have no name for.
         const extNumber = /^#ext(\d+)$/.exec(mqttValue)

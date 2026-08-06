@@ -1144,3 +1144,76 @@ describe('FX___S reservation armed on the appliance itself', () => {
         assert.equal(get(HA, 'status'), 'power_off')
     })
 })
+
+describe('FX___S course names follow homeassistant.language', () => {
+    function setupIn(language?: string) {
+        const HA = new MockHAConnection()
+        HA.config = { language }
+        const thinq = new MockThinq2Device(DEVICE_ID, META)
+        const dut = new DUT(HA.asConnection(), thinq, META)
+        return { HA, thinq, dut }
+    }
+
+    const optionsOf = (HA: MockHAConnection, key: string) =>
+        (HA.devices[DEVICE_ID].config!.components[key] as unknown as { options: string[] }).options
+
+    test('English by default, and when the setting is absent or something else', () => {
+        for (const language of [undefined, 'en', 'de']) {
+            const { HA, thinq } = setupIn(language)
+            feed(thinq, STANDBY)
+            assert.equal(get(HA, 'current_course'), 'AI Wash')
+            assert.ok(optionsOf(HA, 'course').includes('Normal'))
+        }
+    })
+
+    test('Korean when asked for it, in the state and in both option lists', () => {
+        const { HA, thinq } = setupIn('ko')
+        feed(thinq, STANDBY)
+
+        assert.equal(get(HA, 'current_course'), '인공지능세탁')
+        assert.equal(get(HA, 'course'), '인공지능세탁')
+        assert.ok(optionsOf(HA, 'course').includes('표준'))
+        assert.ok(optionsOf(HA, 'course').includes('타월1'))
+        assert.ok(!optionsOf(HA, 'course').includes('Normal'))
+    })
+
+    test('a write takes either language, whichever is being published', () => {
+        // The point of this: an automation written before the setting was changed keeps working.
+        for (const language of ['en', 'ko']) {
+            for (const name of ['Normal', '표준']) {
+                const { thinq, dut } = setupIn(language)
+                dut.setProperty('course', name)
+                assert.equal(hex(thinq.outbox[0]), hex(buf('aa0df0e5000201ff010a2e92bb')), `${language} <- ${name}`)
+            }
+        }
+    })
+
+    test('an extended course takes either language too', () => {
+        for (const name of ['Towels 1', '타월1']) {
+            const { thinq, dut } = setupIn('ko')
+            feed(thinq, TOWELS_1_IDLE)
+            thinq.resetRecorder()
+            dut.setProperty('course', name)
+            assert.equal(
+                hex(thinq.outbox[0]),
+                hex(buf('aa20f0e5000201ff0a0aff0bf61e03200421081f0035013e0143007f00002cbb')),
+            )
+        }
+    })
+
+    test('the current-course sensor is an enum that declares the placeholder too', () => {
+        const { HA, dut } = setupIn('ko')
+        const declared = optionsOf(HA, 'current_course')
+        assert.ok(declared.includes('-'), 'the finished placeholder has to be declared')
+        assert.ok(declared.includes('표준'))
+
+        // A course nobody has named is registered before it is published, in both lists.
+        const rec = Buffer.alloc(66)
+        rec[20] = 1
+        rec[4] = 0x63
+        dut.processRecord(rec)
+        assert.equal(get(HA, 'current_course'), '#99')
+        assert.ok(optionsOf(HA, 'current_course').includes('#99'))
+        assert.ok(optionsOf(HA, 'course').includes('#99'))
+    })
+})
