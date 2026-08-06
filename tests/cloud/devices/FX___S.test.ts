@@ -1236,3 +1236,38 @@ describe("FX___S the dial is the owner's, not the appliance's", () => {
         assert.equal(courseOptions(HA).length, 30)
     })
 })
+
+describe('FX___S a course off the dial can still be selected', () => {
+    // Measured 2026-08-06 with the dial cut back to twenty: SHIRT (108) and SWEAT_STAIN (113) are on
+    // neither the dial nor the base of any extended course, and the appliance took both - status 0x00
+    // and a record carrying the course with its own default options. That is why courseOptions keeps
+    // courses the dial has dropped: they are reachable, not dead entries.
+    test('an ordinary course write goes out for one the declaration no longer lists', () => {
+        const { thinq, dut } = setup()
+        feed(
+            thinq,
+            buf(
+                'aa32204d030218140272025e022e00f500f60255021b028702370286024a024c0205024e023602080246024f02060212' +
+                    '5abb',
+            ),
+        )
+        thinq.resetRecorder()
+
+        dut.setProperty('course', 'SHIRT')
+        // key 0x0A = 0x6C. Byte for byte the frame the appliance accepted.
+        assert.equal(hex(thinq.outbox[0]), hex(buf('aa0df0e5000201ff010a6c50bb')))
+    })
+
+    test('and the option list still offers it', () => {
+        const { HA, thinq } = setup()
+        feed(
+            thinq,
+            buf(
+                'aa32204d030218140272025e022e00f500f60255021b028702370286024a024c0205024e023602080246024f02060212' +
+                    '5abb',
+            ),
+        )
+        assert.ok(courseOptions(HA).includes('SHIRT'))
+        assert.ok(courseOptions(HA).includes('TOWELS'))
+    })
+})

@@ -536,11 +536,18 @@ export default class Device extends AABBDevice {
      * never swept - or a sibling model's extra course - is selectable without waiting for the table to
      * be updated.
      *
-     * Nothing is ever removed, and only one of the two reasons that was written down survives.
-     * Dropping a course would break any automation naming it - that still holds. "Courses do not
-     * disappear from a dial" does NOT: the dial is the owner's own selection, and they took ten
-     * courses off it on 2026-08-06 while this was running. So the list outliving the dial is a
-     * deliberate choice about automations, not a fact about appliances.
+     * Nothing is ever removed, and the reasons changed under measurement on 2026-08-06.
+     *
+     * "Courses do not disappear from a dial" is FALSE - the dial is the owner's own selection, and
+     * they took ten courses off it while this was running. But keeping them is better than it was:
+     * a course that is off the dial can still be SELECTED by writing its number. Measured on three,
+     * two of which are not the base of any extended course - 108 and 113 were accepted with status
+     * 0x00 and came back in the record with their own default options. So the list outliving the
+     * dial is not a list of dead entries; it is the appliance's full vocabulary, and Home Assistant
+     * can reach courses the physical dial no longer offers.
+     *
+     * The other reason still holds on its own: dropping a course would break any automation naming
+     * it.
      */
     courseOptions = [...Object.values(COURSE), ...Object.values(COURSE_EXT)]
 
