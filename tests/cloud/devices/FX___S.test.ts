@@ -1204,3 +1204,35 @@ describe('FX___S course names are the ones LG itself uses', () => {
         }
     })
 })
+
+describe("FX___S the dial is the owner's, not the appliance's", () => {
+    // Same appliance, twenty minutes apart on 2026-08-06: thirty courses with revision 0x17, then
+    // twenty with 0x18 after ten were taken back off. The count went down and the byte went up, which
+    // is what says it counts edits rather than describing the contents.
+    const DECLARED_20 = buf(
+        'aa32204d030218140272025e022e00f500f60255021b028702370286024a024c0205024e023602080246024f02060212' + '5abb',
+    )
+
+    test('a declaration with a higher revision and fewer courses is still read', () => {
+        const { HA, thinq } = setup()
+        feed(thinq, COURSE_TABLE_30)
+        assert.equal(courseOptions(HA).length, 30)
+
+        feed(thinq, DECLARED_20)
+        // The twenty it now declares lead, in dial order...
+        assert.deepEqual(courseOptions(HA).slice(0, 3), ['AI_COURSE', 'WOOL', 'NORMAL'])
+        assert.equal(courseOptions(HA)[19], 'COLORCARE')
+    })
+
+    test('the ten taken off the dial stay in the list', () => {
+        const { HA, thinq } = setup()
+        feed(thinq, COURSE_TABLE_30)
+        feed(thinq, DECLARED_20)
+
+        // Deliberate: an automation naming one of these keeps working. It is a choice about
+        // automations, not a claim that the appliance still offers them - see courseOptions.
+        for (const gone of ['TOWELS', 'SHIRT', 'RINSEONLY', 'SINGLE_GARMENTS'])
+            assert.ok(courseOptions(HA).includes(gone), gone)
+        assert.equal(courseOptions(HA).length, 30)
+    })
+})

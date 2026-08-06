@@ -92,13 +92,16 @@ const TABLE_COURSE_LIST = 0x03
 // as observed - a frame that differs there may be some other table, and reading one of those as the
 // dial would invent courses.
 //
-// Byte 2 is NOT required, and that was a bug worth keeping the story of. It read 0x16 in every capture
-// and was pinned to it on those grounds. Then the owner edited the dial - twenty courses added - and
-// the next declaration came with 0x17 and thirty entries, and this handler threw it away: the whole
-// point of reading the declaration is to notice that kind of change, and the guard was blind to
-// exactly it. One increment after one edit looks like a revision counter, but two observations do not
-// settle that, so it is simply not compared. What guards the frame is the length check below, which
-// is the strong one - a count that disagrees with the frame cannot be read as courses.
+// Byte 2 is a REVISION COUNTER, and requiring it was a bug worth keeping the story of. It read 0x16 in
+// every capture and was pinned to it on those grounds. Then the owner edited the dial - twenty courses
+// added - and the next declaration came with 0x17 and thirty entries, and this handler threw it away:
+// the whole point of reading the declaration is to notice that kind of change, and the guard was blind
+// to exactly it.
+//
+// A second edit settled what the byte is. Ten courses were taken back off, and it went to 0x18 while
+// the count went DOWN to twenty - so it does not describe the contents, it counts the edits. It is
+// still not compared: what guards the frame is the length check below, which is the strong one, since
+// a count that disagrees with the frame cannot be read as courses.
 const TABLE_KIND = 0x02
 // Marks the entries reached through the 0xFF escape. It partitions the ten declared courses exactly as
 // the escape requirement does: the two 0x00 entries are Normal 1 and Towels 1, the two that were found
@@ -533,8 +536,11 @@ export default class Device extends AABBDevice {
      * never swept - or a sibling model's extra course - is selectable without waiting for the table to
      * be updated.
      *
-     * Nothing is ever removed. A course that has been seen once stays on the list: dropping it would
-     * break any automation referring to it, and courses do not disappear from a dial.
+     * Nothing is ever removed, and only one of the two reasons that was written down survives.
+     * Dropping a course would break any automation naming it - that still holds. "Courses do not
+     * disappear from a dial" does NOT: the dial is the owner's own selection, and they took ten
+     * courses off it on 2026-08-06 while this was running. So the list outliving the dial is a
+     * deliberate choice about automations, not a fact about appliances.
      */
     courseOptions = [...Object.values(COURSE), ...Object.values(COURSE_EXT)]
 
