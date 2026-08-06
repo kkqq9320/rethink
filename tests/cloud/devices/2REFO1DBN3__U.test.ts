@@ -70,33 +70,33 @@ describe(MODEL_ID, () => {
         assert.equal(dev.properties.beep, 'ON')
     })
 
-    test('each door panel is reported on its own byte', () => {
+    test('the notification names which panel moved', () => {
         const cases: [Buffer, string][] = [
-            [DOOR_FRIDGE_LEFT, 'door_fridge_left'],
-            [DOOR_FRIDGE_RIGHT, 'door_fridge_right'],
-            [DOOR_FRONT, 'door_front'],
-            [DOOR_FREEZER_LEFT, 'door_freezer_left'],
-            [DOOR_FREEZER_RIGHT, 'door_freezer_right'],
+            [DOOR_FRIDGE_LEFT, 'Fridge left'],
+            [DOOR_FRIDGE_RIGHT, 'Fridge right'],
+            [DOOR_FRONT, 'Front'],
+            [DOOR_FREEZER_LEFT, 'Freezer left'],
+            [DOOR_FREEZER_RIGHT, 'Freezer right'],
         ]
 
         for (const [frame, expected] of cases) {
             const { ha, thinq } = makeDevice()
             thinq.emit('data', frame)
-            const props = ha.devices[DEVICE_ID].properties
-
-            for (const name of cases.map((c) => c[1])) {
-                assert.equal(props[name], name === expected ? 'ON' : 'OFF', `${expected} frame -> ${name}`)
-            }
+            assert.equal(ha.devices[DEVICE_ID].properties.last_door, expected)
         }
     })
 
-    test('a notification with no slot set closes every door', () => {
+    test('a release keeps the name standing - it answers "last", not "open now"', () => {
         const { ha, thinq } = makeDevice()
         thinq.emit('data', DOOR_FRIDGE_LEFT)
-        assert.equal(ha.devices[DEVICE_ID].properties.door_fridge_left, 'ON')
-
         thinq.emit('data', DOOR_ALL_CLOSED)
-        const props = ha.devices[DEVICE_ID].properties
+        assert.equal(ha.devices[DEVICE_ID].properties.last_door, 'Fridge left')
+    })
+
+    test('the five per-door sensors are withdrawn as bare removal stubs', () => {
+        const { ha } = makeDevice()
+        const components = ha.devices[DEVICE_ID]?.config!.components as Record<string, Record<string, unknown>>
+
         for (const name of [
             'door_fridge_left',
             'door_fridge_right',
@@ -104,37 +104,27 @@ describe(MODEL_ID, () => {
             'door_freezer_left',
             'door_freezer_right',
         ]) {
-            assert.equal(props[name], 'OFF')
+            // platform and NOTHING else - any extra key turns the removal back into a
+            // registration, and omitting the key entirely leaves the old entity live forever.
+            assert.deepEqual(components[name], { platform: 'binary_sensor' }, name)
         }
     })
 
-    test('a status saying no door is open clears a per-door sensor whose release was missed', () => {
+    test('door state comes only from status[7], which never missed a transition on the appliance', () => {
         const { ha, thinq } = makeDevice()
 
-        thinq.emit('data', DOOR_FRONT)
-        assert.equal(ha.devices[DEVICE_ID].properties.door_front, 'ON')
-
-        // SAMPLE_STATUS's current half has [7]=1, so it must NOT clear anything.
-        thinq.emit('data', SAMPLE_STATUS)
+        thinq.emit('data', SAMPLE_STATUS) // current half has [7]=1
         assert.equal(ha.devices[DEVICE_ID].properties.door, 'ON')
-        assert.equal(ha.devices[DEVICE_ID].properties.door_front, 'ON', 'still open - [7]=1 says so')
 
-        // Same frame with the current half's [7] set to 0: every panel must go OFF.
         const closed = Buffer.from(SAMPLE_STATUS)
         closed[4 + 65 + 7] = 0
         thinq.emit('data', closed)
+        assert.equal(ha.devices[DEVICE_ID].properties.door, 'OFF')
 
-        const props = ha.devices[DEVICE_ID].properties
-        assert.equal(props.door, 'OFF')
-        for (const name of [
-            'door_fridge_left',
-            'door_fridge_right',
-            'door_front',
-            'door_freezer_left',
-            'door_freezer_right',
-        ]) {
-            assert.equal(props[name], 'OFF', name)
-        }
+        // A door notification must not touch it: two overlapping doors produce no notification at
+        // all, so it can only ever be stale.
+        thinq.emit('data', DOOR_FRIDGE_LEFT)
+        assert.equal(ha.devices[DEVICE_ID].properties.door, 'OFF')
     })
 
     test('frames outside the AA..BB envelope, or of an unknown shape, publish nothing', () => {

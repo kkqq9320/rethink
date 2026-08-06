@@ -1,6 +1,6 @@
 import HADevice from './base'
 import { Device as Thinq2Device } from '../thinq2/device'
-import { DeviceDiscovery, type Connection } from '../homeassistant'
+import { DeviceDiscovery, type ComponentInfo, type Connection } from '../homeassistant'
 import { type Metadata } from '../thinq'
 import { allowExtendedType } from '@/util/casting'
 import AABBDevice from './aabb_device'
@@ -31,15 +31,17 @@ import { convertFreezerTemperature, convertFridgeTemperature, freezerRange, frid
 //   [17] smart care+ : 0=off 1=on   (fridge_common calls index 17 smartCare - independent agreement)
 //   [40] beep / product button sound: 0=off 1=on
 //
-// 100A DOOR NOTIFICATION - the 42-byte extended frame, which resolves all five panels
-// individually. The cloud API cannot do this: refState carries only atLeastOneDoorOpen.
-// Offsets below are into the processAABB slice; add 2 for the frame offsets used in patches.md.
+// 100A DOOR NOTIFICATION - the 42-byte extended frame. It names which panel moved, which the
+// cloud API cannot do (refState carries only atLeastOneDoorOpen, and LG's own model JSON calls
+// that field "global"). Offsets below are into the processAABB slice; add 2 for the frame
+// offsets used in patches.md.
 //   [10] 0x25 = a fridge-side door moved, 0x26 = a freezer-side door moved
-//   [21] any fridge-side door open      [22] any freezer-side door open
+//   [21] fridge-side flag               [22] freezer-side flag
 //   [23] fridge left   [24] fridge right   [26] front (door-in-door)
 //   [27] freezer left  [28] freezer right
-// A frame with every slot clear means every door is closed - the message carries the whole
-// door state, not a delta.
+//
+// !! THIS IS NOT A DOOR STATE. !! It arrives for an isolated single-door movement and is missing
+// otherwise - measured, see WITHDRAWN_DOOR_COMPONENTS. Only status[7] answers "is a door open".
 //
 // F017 WRITE - 118 payload bytes, 0xFF meaning "leave unchanged". The base message below is the
 // one LG's own cloud sent this appliance, and it is byte-for-byte identical to the one upstream
@@ -60,13 +62,42 @@ const DOOR_FRAME_LENGTH = 38 // the 42-byte extended frame, less AA <b1> and <tr
 const DOOR_COMPARTMENT_FRIDGE = 0x25
 const DOOR_COMPARTMENT_FREEZER = 0x26
 
-const DOORS: Record<string, number> = {
-    door_fridge_left: 23,
-    door_fridge_right: 24,
-    door_front: 26,
-    door_freezer_left: 27,
-    door_freezer_right: 28,
+// Which door the notification names, by slice offset. The assignment is solid - nine
+// owner-labelled openings across four sweeps, never once inconsistent - but see WITHDRAWN below
+// for why these are no longer published as door sensors.
+const DOOR_NAMES: Record<number, string> = {
+    23: 'Fridge left',
+    24: 'Fridge right',
+    26: 'Front',
+    27: 'Freezer left',
+    28: 'Freezer right',
 }
+
+/*
+ * WITHDRAWN 2026-08-06, hours after the first deploy. These were published as five per-door
+ * binary sensors on the strength of eight labelled observations - all of which, it turned out,
+ * were a single door opened slowly on its own. Real use found two more conditions:
+ *
+ *   doors worked in rapid succession  -> an open is reported, its release is not (sensor latches)
+ *   two doors of one group overlapping -> NO notification at all, not even for the first open
+ *
+ * status[7] was correct in all three conditions, including ten flips in thirty-five seconds.
+ * A door sensor that silently misses an opening fails in the worst direction - a "door left open"
+ * automation just never fires - so the per-door sensors go and the reliable global one stays.
+ *
+ * Removal stubs carry `platform` and NOTHING else: mqtt/discovery.py pops the platform and treats
+ * what remains, if empty, as a removal. Adding unique_id - or any other key - silently turns the
+ * removal back into a registration. Omitting the key entirely is worse still: it only stops a
+ * fresh install creating the entity and leaves existing ones live forever.
+ * Safe to delete once every installation has run this version once.
+ */
+const WITHDRAWN_DOOR_COMPONENTS = [
+    'door_fridge_left',
+    'door_fridge_right',
+    'door_front',
+    'door_freezer_left',
+    'door_freezer_right',
+]
 
 // Captured from this appliance (2026-08-06): AA 7C F0 17 <118 bytes> <cksum> BB.
 const F017_BASE =
@@ -144,41 +175,21 @@ export default class Device extends AABBDevice {
                         state_topic: '$this/door',
                         name: 'Door',
                     },
-                    door_fridge_left: {
-                        platform: 'binary_sensor',
-                        device_class: 'door',
-                        unique_id: '$deviceid-door_fridge_left',
-                        state_topic: '$this/door_fridge_left',
-                        name: 'Fridge door (left)',
+                    // What the appliance actually tells us: the name of the door it last
+                    // reported. Diagnostic, not a state - it does not fire for every movement
+                    // (see WITHDRAWN_DOOR_COMPONENTS), so it must never be read as "this door
+                    // is open now". `door` above is the one that answers that question.
+                    last_door: {
+                        platform: 'sensor',
+                        icon: 'mdi:door-open',
+                        unique_id: '$deviceid-last_door',
+                        state_topic: '$this/last_door',
+                        name: 'Last door reported',
+                        entity_category: 'diagnostic',
                     },
-                    door_fridge_right: {
-                        platform: 'binary_sensor',
-                        device_class: 'door',
-                        unique_id: '$deviceid-door_fridge_right',
-                        state_topic: '$this/door_fridge_right',
-                        name: 'Fridge door (right)',
-                    },
-                    door_front: {
-                        platform: 'binary_sensor',
-                        device_class: 'door',
-                        unique_id: '$deviceid-door_front',
-                        state_topic: '$this/door_front',
-                        name: 'Front door',
-                    },
-                    door_freezer_left: {
-                        platform: 'binary_sensor',
-                        device_class: 'door',
-                        unique_id: '$deviceid-door_freezer_left',
-                        state_topic: '$this/door_freezer_left',
-                        name: 'Freezer door (left)',
-                    },
-                    door_freezer_right: {
-                        platform: 'binary_sensor',
-                        device_class: 'door',
-                        unique_id: '$deviceid-door_freezer_right',
-                        state_topic: '$this/door_freezer_right',
-                        name: 'Freezer door (right)',
-                    },
+                    ...Object.fromEntries(
+                        WITHDRAWN_DOOR_COMPONENTS.map((name) => [name, { platform: 'binary_sensor' } as ComponentInfo]),
+                    ),
                 },
             }),
         )
@@ -214,28 +225,24 @@ export default class Device extends AABBDevice {
         this.publishProperty('freezer_setpoint', convertFreezerTemperature('C', status[2]))
         this.publishProperty('express_freeze', status[3] === 2 ? 'ON' : 'OFF')
         this.publishProperty('door', status[7] === 1 ? 'ON' : 'OFF')
-
-        // Backstop. status[7] is LG's "at least one door open", so 0 means every panel is shut -
-        // that is a definition, not an inference, and it lets the per-door sensors recover on their
-        // own if a 100A clear is ever missed. Measured on the appliance 2026-08-06: the front door
-        // latched ON in HA while this byte read 0 three seconds later. When it reads 1 we touch
-        // nothing, because it cannot say WHICH door.
-        if (status[7] === 0) {
-            for (const prop of Object.keys(DOORS)) this.publishProperty(prop, 'OFF')
-        }
         this.publishProperty('smart_care', status[17] === 1 ? 'ON' : 'OFF')
         this.publishProperty('beep', status[40] === 1 ? 'ON' : 'OFF')
     }
 
     // `notify` is the processAABB slice, NOT the whole frame: notify[i] === frame[i + 2].
     processDoors(notify: Buffer) {
-        // Only notifications that announce a compartment carry door state. Every one of the 22
-        // captured 42-byte frames had one of these two values here.
+        // Only notifications that announce a compartment name a door. Every one of the captured
+        // 42-byte frames had one of these two values here.
         if (notify[10] !== DOOR_COMPARTMENT_FRIDGE && notify[10] !== DOOR_COMPARTMENT_FREEZER) return
 
-        for (const [prop, offset] of Object.entries(DOORS)) {
-            this.publishProperty(prop, notify[offset] === 1 ? 'ON' : 'OFF')
+        for (const [offset, name] of Object.entries(DOOR_NAMES)) {
+            if (notify[Number(offset)] === 1) {
+                this.publishProperty('last_door', name)
+                return
+            }
         }
+        // Every slot clear is the release of whatever was named last; leave the name standing so
+        // the sensor answers "which door moved last" rather than blanking on every close.
     }
 
     sendSetting(mutate: (payload: Buffer) => void) {
