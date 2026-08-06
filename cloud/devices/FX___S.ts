@@ -88,10 +88,18 @@ const ENERGY_LEN = 7
 // base-course byte was confirmed - but deliberately unused, see setExtendedCourse); 0x01 is a
 // five-byte frame that has not been decoded.
 const TABLE_COURSE_LIST = 0x03
-// Bytes 1 and 2 read 02 16 on both four-byte-header variants and nothing explains them, so they are
-// required exactly as observed. A frame that differs there may be some other table, and reading one of
-// those as the dial would invent courses.
-const TABLE_HEADER = [0x02, 0x16]
+// Byte 1 reads 02 on both four-byte-header variants and nothing explains it, so it is required exactly
+// as observed - a frame that differs there may be some other table, and reading one of those as the
+// dial would invent courses.
+//
+// Byte 2 is NOT required, and that was a bug worth keeping the story of. It read 0x16 in every capture
+// and was pinned to it on those grounds. Then the owner edited the dial - twenty courses added - and
+// the next declaration came with 0x17 and thirty entries, and this handler threw it away: the whole
+// point of reading the declaration is to notice that kind of change, and the guard was blind to
+// exactly it. One increment after one edit looks like a revision counter, but two observations do not
+// settle that, so it is simply not compared. What guards the frame is the length check below, which
+// is the strong one - a count that disagrees with the frame cannot be read as courses.
+const TABLE_KIND = 0x02
 // Marks the entries reached through the 0xFF escape. It partitions the ten declared courses exactly as
 // the escape requirement does: the two 0x00 entries are Normal 1 and Towels 1, the two that were found
 // by hand to need it.
@@ -382,15 +390,42 @@ const COURSE_LIMITS: Record<string, CourseLimits> = {
 // escape is something the appliance declares for itself (processCourseTable); the declaration cannot
 // supply names, because it only carries numbers.
 const COURSE: Record<number, string> = {
-    0x72: 'AI_COURSE', // 인공지능세탁, 36 min
-    0x5e: 'WOOL', // 울/섬세, 53 min
-    0x2e: 'NORMAL', // 표준, 35 min
-    0x55: 'TUB_CLEAN', // 통살균, 124 min
+    // Named by LG's own model JSON, numbered by this appliance. The numbers came from the dial: the
+    // owner put every course back on it and read the panel off in order, and the declaration that
+    // followed (0x4D, 30 entries) carried the same twenty ids in the same order - two independent
+    // readings agreeing 20 for 20. Between them, every one of the 25 courses LG declares for this
+    // model now has a number.
+    0x05: 'ALLERGYCARE', // 알러지케어
+    0x06: 'ANSIMCOLD', // 찬물 세탁
+    0x08: 'BABYCARE', // 아기옷
+    0x12: 'COLORCARE', // 컬러 케어
     0x1b: 'DUVET', // 이불, 98 min. LG calls it DUVET, not BEDDING - its own JSON says so
+    0x2e: 'NORMAL', // 표준, 35 min
+    0x36: 'REFRESH', // 스팀리프레쉬
     0x37: 'RINSE_SPIN', // 헹굼+탈수, 25 min
-    // The two the model JSON cannot name. LG's Course and SmartCourse lists have neither, so these
-    // are OURS: the panel's own words in the same shape as the keys above. They are not LG's, and
-    // anyone matching this handler against another model should treat them as unverified.
+    0x38: 'RINSEONLY', // 헹굼 단독
+    0x41: 'SILENT', // 조용조용
+    0x46: 'SOAK', // 찌든 때
+    0x4a: 'SPEEDWASH', // 소량급속
+    0x4c: 'SPEEDBOIL', // 알뜰삶음
+    0x4e: 'SPIN_ONLY', // 탈수 단독
+    0x4f: 'SPORTS_WEARS', // 기능성의류
+    0x55: 'TUB_CLEAN', // 통살균, 124 min
+    0x59: 'WASHONLY', // 세탁 단독
+    0x5e: 'WOOL', // 울/섬세, 53 min
+    0x66: 'CLOTH_CARE', // 옷감 보호
+    0x69: 'KIDS_WEAR', // 키즈옷
+    0x6a: 'RAINY_DAY', // 장마철세탁
+    0x6c: 'SHIRT', // 셔츠
+    0x6d: 'SINGLE_GARMENTS', // 한벌 세탁
+    0x71: 'SWEAT_STAIN', // 땀얼룩 제거
+    0x72: 'AI_COURSE', // 인공지능세탁, 36 min
+
+    // On the appliance, absent from LG's Course AND SmartCourse lists for this model. The names are
+    // the panel's own words in the same shape as the keys above, so they are OURS - but 타월 is no
+    // longer a guess: TOWELS_1 declares course 84 as its base (see COURSE_EXT), and putting 타월 back
+    // on the dial produced exactly 84.
+    0x54: 'TOWELS', // 타월
     0x87: 'QUICK_STEAM_SANITIZE', // 쾌속스팀살균, 64 min
     0x86: 'QUICK_TUB_RINSE', // 급속통헹굼, 12 min
 }
@@ -400,11 +435,13 @@ const COURSE: Record<number, string> = {
 // so that is the form `setExtendedCourse` reproduces rather than a guessed two-key frame - the two-key
 // form on its own has never been seen on the wire. (These were briefly treated as read-only, on the
 // grounds that no such write had been captured. It had been: the app selecting Towels 1.)
+// The two reached through the 0xFF escape. Each declares a BASE course and a set of option overrides
+// (0x4D's 42-byte variant): 0xf5 is built on 46 = NORMAL and 0xf6 on 84 = TOWELS, which is where the
+// suffix comes from. Neither appears in any list LG publishes for this model, so the names are ours,
+// but the courses they derive from are the appliance's own word.
 const COURSE_EXT: Record<number, string> = {
-    // Also ours rather than LG's - see the note above. These two are the appliance's own extras and
-    // appear in no list LG publishes for this model.
-    0xf5: 'NORMAL_1', // 표준1, 68 min
-    0xf6: 'TOWELS_1', // 타월1, 82 min
+    0xf5: 'NORMAL_1', // 표준1, 68 min - base NORMAL
+    0xf6: 'TOWELS_1', // 타월1, 82 min - base TOWELS
 }
 
 // All four option scales were read off the panel by stepping each control through a full cycle on
@@ -949,7 +986,7 @@ export default class Device extends AABBDevice {
      */
     processCourseTable(payload: Buffer) {
         if (payload.length < 4 || payload[0] !== TABLE_COURSE_LIST) return
-        if (payload[1] !== TABLE_HEADER[0] || payload[2] !== TABLE_HEADER[1]) return
+        if (payload[1] !== TABLE_KIND) return
         const count = payload[3]
         // The declared count and the frame length must agree exactly. This is the only real guard: a
         // sibling model laying the table out differently has to fall through to the named table rather

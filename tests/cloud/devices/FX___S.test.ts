@@ -500,6 +500,14 @@ const EXT_DEFAULTS = buf(
 )
 const SHORT_VARIANT = buf('aa0b204d010301020379bb')
 
+// The declaration the appliance sent on 2026-08-06 after the owner put every course back on the dial:
+// thirty entries, and a header byte that moved from 0x16 to 0x17 - which this handler used to require
+// exactly, and so threw the frame away. See TABLE_KIND.
+const COURSE_TABLE_30 = buf(
+    'aa46204d0302171e0272025e022e00f500f60255021b028702370286024a024c0205024e023602080246024f0206' +
+        '0212026d026c0269027102410266026a025902380254bcbb',
+)
+
 // The order the appliance declares, which is the order of the dial itself.
 const DIAL = [
     'AI_COURSE',
@@ -518,10 +526,23 @@ const courseOptions = (HA: MockHAConnection) =>
     (HA.devices[DEVICE_ID].config!.components.course as { options?: string[] }).options!
 
 describe('FX___S course table', () => {
-    test('the declared dial matches the one swept by hand, in the same order', () => {
+    test('the declared dial comes first, in the order the appliance gives it', () => {
         const { HA, thinq } = setup()
         feed(thinq, COURSE_TABLE)
-        assert.deepEqual(courseOptions(HA), DIAL)
+        // The ten it declares lead; the rest of the named table keeps its place behind them, because
+        // a course that has been seen once is never withdrawn.
+        assert.deepEqual(courseOptions(HA).slice(0, DIAL.length), DIAL)
+        assert.ok(courseOptions(HA).includes('SHIRT'), 'a course off this dial is still offered')
+    })
+
+    test('a declaration whose header byte has moved is read, not thrown away', () => {
+        const { HA, thinq } = setup()
+        feed(thinq, COURSE_TABLE_30)
+        const options = courseOptions(HA)
+        assert.equal(options.length, 30)
+        // Dial order, as the appliance gave it: the original ten, then the twenty put back on.
+        assert.deepEqual(options.slice(0, 5), ['AI_COURSE', 'WOOL', 'NORMAL', 'NORMAL_1', 'TOWELS_1'])
+        assert.deepEqual(options.slice(-4), ['RAINY_DAY', 'WASHONLY', 'RINSEONLY', 'TOWELS'])
     })
 
     test('the two extended courses are the ones the appliance marks with kind 0x00', () => {
@@ -542,21 +563,11 @@ describe('FX___S course table', () => {
         // Synthesised, not captured: a hypothetical sibling model declaring one course we have a name
         // for and two we do not. Only the framing is real - incoming checksums are not verified.
         feed(thinq, buf('aa10204d03021603022e029900aa00bb'))
-        assert.deepEqual(courseOptions(HA), [
-            'NORMAL',
-            '#153',
-            '#ext170',
-            // Everything already offered keeps its place behind the declaration.
-            'DUVET',
-            'RINSE_SPIN',
-            'TUB_CLEAN',
-            'WOOL',
-            'AI_COURSE',
-            'QUICK_TUB_RINSE',
-            'QUICK_STEAM_SANITIZE',
-            'NORMAL_1',
-            'TOWELS_1',
-        ])
+        const options = courseOptions(HA)
+        assert.deepEqual(options.slice(0, 3), ['NORMAL', '#153', '#ext170'])
+        // Everything already offered keeps its place behind the declaration, and nothing is dropped.
+        assert.equal(options.length, 3 + 29)
+        for (const kept of ['DUVET', 'AI_COURSE', 'TOWELS', 'TOWELS_1']) assert.ok(options.includes(kept), kept)
     })
 
     test('an unnamed declared course can actually be selected', () => {
@@ -595,7 +606,7 @@ describe('FX___S course table', () => {
         // The appliance sends it every 1.5 s for about half a minute at a time.
         for (let i = 0; i < 20; i++) feed(thinq, COURSE_TABLE)
         assert.equal(publishes, 1)
-        assert.deepEqual(courseOptions(HA), DIAL)
+        assert.deepEqual(courseOptions(HA).slice(0, DIAL.length), DIAL)
     })
 })
 
