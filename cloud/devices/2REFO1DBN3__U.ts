@@ -214,6 +214,15 @@ export default class Device extends AABBDevice {
         this.publishProperty('freezer_setpoint', convertFreezerTemperature('C', status[2]))
         this.publishProperty('express_freeze', status[3] === 2 ? 'ON' : 'OFF')
         this.publishProperty('door', status[7] === 1 ? 'ON' : 'OFF')
+
+        // Backstop. status[7] is LG's "at least one door open", so 0 means every panel is shut -
+        // that is a definition, not an inference, and it lets the per-door sensors recover on their
+        // own if a 100A clear is ever missed. Measured on the appliance 2026-08-06: the front door
+        // latched ON in HA while this byte read 0 three seconds later. When it reads 1 we touch
+        // nothing, because it cannot say WHICH door.
+        if (status[7] === 0) {
+            for (const prop of Object.keys(DOORS)) this.publishProperty(prop, 'OFF')
+        }
         this.publishProperty('smart_care', status[17] === 1 ? 'ON' : 'OFF')
         this.publishProperty('beep', status[40] === 1 ? 'ON' : 'OFF')
     }

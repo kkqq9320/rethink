@@ -108,6 +108,35 @@ describe(MODEL_ID, () => {
         }
     })
 
+    test('a status saying no door is open clears a per-door sensor whose release was missed', () => {
+        const { ha, thinq } = makeDevice()
+
+        thinq.emit('data', DOOR_FRONT)
+        assert.equal(ha.devices[DEVICE_ID].properties.door_front, 'ON')
+
+        // SAMPLE_STATUS's current half has [7]=1, so it must NOT clear anything.
+        thinq.emit('data', SAMPLE_STATUS)
+        assert.equal(ha.devices[DEVICE_ID].properties.door, 'ON')
+        assert.equal(ha.devices[DEVICE_ID].properties.door_front, 'ON', 'still open - [7]=1 says so')
+
+        // Same frame with the current half's [7] set to 0: every panel must go OFF.
+        const closed = Buffer.from(SAMPLE_STATUS)
+        closed[4 + 65 + 7] = 0
+        thinq.emit('data', closed)
+
+        const props = ha.devices[DEVICE_ID].properties
+        assert.equal(props.door, 'OFF')
+        for (const name of [
+            'door_fridge_left',
+            'door_fridge_right',
+            'door_front',
+            'door_freezer_left',
+            'door_freezer_right',
+        ]) {
+            assert.equal(props[name], 'OFF', name)
+        }
+    })
+
     test('frames outside the AA..BB envelope, or of an unknown shape, publish nothing', () => {
         const { ha, thinq } = makeDevice()
         const before = { ...ha.devices[DEVICE_ID].properties }
