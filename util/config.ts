@@ -42,18 +42,6 @@ export type HAConfig = {
     rethink_prefix: string
     mqtt_user: string
     mqtt_pass: string
-    /**
-     * Which language a device profile should publish names in, where it has more than one set and
-     * they are the appliance's own - LG's course names, for instance, which the panel and the model
-     * JSON give in Korean and this project has swept and translated. It is NOT a translation layer:
-     * a profile that only knows one set of names ignores it, and Home Assistant has no way to
-     * translate discovery-created entity STATES, which is why this has to be decided here.
-     *
-     * Entity states are matched by automations, so changing it renames things they compare against.
-     * Whatever a profile does with this, it should keep accepting every language it knows on the
-     * command side, since a write is unambiguous.
-     */
-    language?: string
 }
 
 export type CA = {

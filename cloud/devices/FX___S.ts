@@ -382,30 +382,17 @@ const COURSE_LIMITS: Record<string, CourseLimits> = {
 // escape is something the appliance declares for itself (processCourseTable); the declaration cannot
 // supply names, because it only carries numbers.
 const COURSE: Record<number, string> = {
-    0x72: 'AI Wash', // 인공지능세탁, 36 min
-    0x5e: 'Wool / Delicates', // 울/섬세, 53 min
-    0x2e: 'Normal', // 표준, 35 min
-    0x55: 'Tub Clean', // 통살균, 124 min
-    0x1b: 'Bedding', // 이불, 98 min
-    0x87: 'Quick Steam Sanitize', // 쾌속스팀살균, 64 min
-    0x37: 'Rinse + Spin', // 헹굼+탈수, 25 min
-    0x86: 'Quick Tub Rinse', // 급속통헹굼, 12 min
-}
-
-// The same dial in the language printed on it. Selected with homeassistant.language = "ko"; see
-// courseNames. These are the names the owner read off the panel during the sweep, and LG's own model
-// JSON agrees with all six of them that it also carries (표준 · 인공지능 세탁 · 이불 · 울/섬세 ·
-// 통살균 · 헹굼+탈수, modulo one space). The remaining two appear in neither its Course nor its
-// SmartCourse list, so the panel is their only source.
-const COURSE_KO: Record<number, string> = {
-    0x72: '인공지능세탁',
-    0x5e: '울/섬세',
-    0x2e: '표준',
-    0x55: '통살균',
-    0x1b: '이불',
-    0x87: '쾌속스팀살균',
-    0x37: '헹굼+탈수',
-    0x86: '급속통헹굼',
+    0x72: 'AI_COURSE', // 인공지능세탁, 36 min
+    0x5e: 'WOOL', // 울/섬세, 53 min
+    0x2e: 'NORMAL', // 표준, 35 min
+    0x55: 'TUB_CLEAN', // 통살균, 124 min
+    0x1b: 'DUVET', // 이불, 98 min. LG calls it DUVET, not BEDDING - its own JSON says so
+    0x37: 'RINSE_SPIN', // 헹굼+탈수, 25 min
+    // The two the model JSON cannot name. LG's Course and SmartCourse lists have neither, so these
+    // are OURS: the panel's own words in the same shape as the keys above. They are not LG's, and
+    // anyone matching this handler against another model should treat them as unverified.
+    0x87: 'QUICK_STEAM_SANITIZE', // 쾌속스팀살균, 64 min
+    0x86: 'QUICK_TUB_RINSE', // 급속통헹굼, 12 min
 }
 
 // Reached through the 0xFF escape, with the real identifier in the second key. Selecting one needs a
@@ -414,12 +401,10 @@ const COURSE_KO: Record<number, string> = {
 // form on its own has never been seen on the wire. (These were briefly treated as read-only, on the
 // grounds that no such write had been captured. It had been: the app selecting Towels 1.)
 const COURSE_EXT: Record<number, string> = {
-    0xf5: 'Normal 1', // 표준1, 68 min
-    0xf6: 'Towels 1', // 타월1, 82 min
-}
-const COURSE_EXT_KO: Record<number, string> = {
-    0xf5: '표준1',
-    0xf6: '타월1',
+    // Also ours rather than LG's - see the note above. These two are the appliance's own extras and
+    // appear in no list LG publishes for this model.
+    0xf5: 'NORMAL_1', // 표준1, 68 min
+    0xf6: 'TOWELS_1', // 타월1, 82 min
 }
 
 // All four option scales were read off the panel by stepping each control through a full cycle on
@@ -462,12 +447,24 @@ const WASH_BY_NAME = invert(WASH)
 const WATER_TEMP_BY_NAME = invert(WATER_TEMP)
 const SPIN_BY_NAME = invert(SPIN)
 const BEEP_BY_NAME = invert(BEEP)
-// Writes accept EVERY name this handler knows, in either language, whatever it is publishing. A
-// command is unambiguous - two names cannot mean two different courses - so an automation written
-// against one language keeps working after the other is switched on, and the person typing into the
-// select does not have to know which one is configured.
-const COURSE_BY_NAME = { ...invert(COURSE), ...invert(COURSE_KO) }
-const COURSE_EXT_BY_NAME = { ...invert(COURSE_EXT), ...invert(COURSE_EXT_KO) }
+// The names this handler published before it moved to LG's keys. Writes still accept them, because a
+// command is unambiguous - two names cannot mean two different courses - so an automation that SETS a
+// course keeps working. Only comparisons against the published state have to be updated. Nothing
+// publishes these, and they can go once this owner's automations no longer mention them.
+const LEGACY_COURSE_NAMES: Record<string, number> = {
+    'AI Wash': 0x72,
+    'Wool / Delicates': 0x5e,
+    Normal: 0x2e,
+    'Tub Clean': 0x55,
+    Bedding: 0x1b,
+    'Quick Steam Sanitize': 0x87,
+    'Rinse + Spin': 0x37,
+    'Quick Tub Rinse': 0x86,
+}
+const LEGACY_COURSE_EXT_NAMES: Record<string, number> = { 'Normal 1': 0xf5, 'Towels 1': 0xf6 }
+
+const COURSE_BY_NAME = { ...invert(COURSE), ...LEGACY_COURSE_NAMES }
+const COURSE_EXT_BY_NAME = { ...invert(COURSE_EXT), ...LEGACY_COURSE_EXT_NAMES }
 
 export default class Device extends AABBDevice {
     /** Wh reported by each of the appliance's ~15-minute energy reports, index 0 = report 1. */
@@ -502,25 +499,10 @@ export default class Device extends AABBDevice {
      * Nothing is ever removed. A course that has been seen once stays on the list: dropping it would
      * break any automation referring to it, and courses do not disappear from a dial.
      */
-    courseOptions: string[] = []
-
-    /**
-     * Which set of course names this instance publishes, chosen once from homeassistant.language.
-     * The appliance sends a number; the name is ours either way, and Home Assistant cannot translate
-     * the STATE of a discovery-created entity, so the choice has to be made here rather than there.
-     * Writes are not affected - COURSE_BY_NAME accepts both languages whatever this says.
-     */
-    readonly courseNames: Record<number, string>
-    readonly courseExtNames: Record<number, string>
+    courseOptions = [...Object.values(COURSE), ...Object.values(COURSE_EXT)]
 
     constructor(HA: Connection, thinq: Thinq2Device, meta: Metadata) {
         super(HA, thinq)
-        // Optional chaining on purpose: nothing else in a profile needs the connection's config,
-        // so a caller that does not supply one still gets a working device in the default language.
-        const korean = HA.config?.language === 'ko'
-        this.courseNames = korean ? COURSE_KO : COURSE
-        this.courseExtNames = korean ? COURSE_EXT_KO : COURSE_EXT
-        this.courseOptions = [...Object.values(this.courseNames), ...Object.values(this.courseExtNames)]
         this.setConfig(
             allowExtendedType({
                 ...HADevice.config(meta, { name: 'LG Washer' }),
@@ -1143,8 +1125,8 @@ export default class Device extends AABBDevice {
     }
 
     courseLabel(course: number, ext: number) {
-        if (course === COURSE_EXTENDED) return this.courseExtNames[ext] ?? `#ext${ext}`
-        return this.courseNames[course] ?? `#${course}`
+        if (course === COURSE_EXTENDED) return COURSE_EXT[ext] ?? `#ext${ext}`
+        return COURSE[course] ?? `#${course}`
     }
 
     /** Add a course to the select and republish discovery, the once, when it is first seen. */

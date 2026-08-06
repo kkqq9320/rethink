@@ -70,13 +70,6 @@ export class MockHAConnection extends EventEmitter {
         this.emit('setProperty', id, topic.replace(/\/set$/, ''), value)
     }
 
-    /**
-     * The parts of the real connection's config a device profile may read. Only `language` is used
-     * so far (FX___S picks its course names with it); everything else a handler needs comes from the
-     * appliance. Left as a plain object so a test can set it before constructing the device.
-     */
-    config: { language?: string } = {}
-
     /** Cast to the real Connection type for TLVDevice constructors. */
     asConnection(): Connection {
         return this as unknown as Connection

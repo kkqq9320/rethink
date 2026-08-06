@@ -106,8 +106,8 @@ describe('FX___S washer', () => {
         assert.equal(get(HA, 'status_code'), 1)
         assert.equal(get(HA, 'running'), 'OFF')
         assert.equal(get(HA, 'remaining_time'), 0) // not a timed phase
-        assert.equal(get(HA, 'course'), 'AI Wash')
-        assert.equal(get(HA, 'current_course'), 'AI Wash')
+        assert.equal(get(HA, 'course'), 'AI_COURSE')
+        assert.equal(get(HA, 'current_course'), 'AI_COURSE')
         assert.equal(get(HA, 'wash'), 'normal')
         assert.equal(get(HA, 'water_temp'), '40')
         assert.equal(get(HA, 'rinse'), '2')
@@ -163,7 +163,7 @@ describe('FX___S washer', () => {
         assert.equal(get(HA, 'running'), 'OFF')
         // ...and the course must still come through, since that byte is never consumed. The select
         // holds it because it is what the next start will run; the sensor clears because nothing is on.
-        assert.equal(get(HA, 'course'), 'AI Wash')
+        assert.equal(get(HA, 'course'), 'AI_COURSE')
         assert.equal(get(HA, 'current_course'), '-')
     })
 
@@ -174,7 +174,7 @@ describe('FX___S washer', () => {
         assert.equal(get(HA, 'status'), 'rinsing')
         assert.equal(get(HA, 'remaining_time'), 25)
         assert.equal(get(HA, 'rinse_remaining'), 1)
-        assert.equal(get(HA, 'current_course'), 'Rinse + Spin')
+        assert.equal(get(HA, 'current_course'), 'RINSE_SPIN')
     })
 
     test('reports power off from an all-zero record', () => {
@@ -193,7 +193,7 @@ describe('FX___S washer', () => {
         assert.equal(get(HA, 'beep'), 'very_high')
         // The course byte survives being powered off, and this record was captured after a Rinse + Spin
         // had been selected, so it correctly overrides the AI Wash published from the standby frame.
-        assert.equal(get(HA, 'course'), 'Rinse + Spin')
+        assert.equal(get(HA, 'course'), 'RINSE_SPIN')
         // The consumable option bytes were cleared though, and must not be written back over the select.
         assert.equal(get(HA, 'wash'), 'normal')
     })
@@ -224,7 +224,7 @@ describe('FX___S washer', () => {
         assert.equal(get(HA, 'status'), 'spinning')
         assert.equal(get(HA, 'status_code'), 14)
         assert.equal(get(HA, 'running'), 'ON')
-        assert.equal(get(HA, 'course'), 'Rinse + Spin')
+        assert.equal(get(HA, 'course'), 'RINSE_SPIN')
         assert.equal(get(HA, 'remaining_time'), 2)
         assert.equal(get(HA, 'total_time'), 25)
         assert.equal(get(HA, 'cycles'), '16')
@@ -402,9 +402,9 @@ describe('FX___S commands', () => {
         ['power', 'OFF', 'aa0df0e5000201ff010200c4bb', 'power off'],
         ['power', 'ON', 'aa0df0e5000201ff010201c7bb', 'power on'],
         ['pause', '', 'aa0df0e5000201ff010302c1bb', 'pause'],
-        ['course', 'Tub Clean', 'aa0df0e5000201ff010a55bbbb', 'course = Tub Clean'],
-        ['course', 'AI Wash', 'aa0df0e5000201ff010a725ebb', 'course = AI Wash'],
-        ['course', 'Normal', 'aa0df0e5000201ff010a2e92bb', 'course = Normal'],
+        ['course', 'TUB_CLEAN', 'aa0df0e5000201ff010a55bbbb', 'course = Tub Clean'],
+        ['course', 'AI_COURSE', 'aa0df0e5000201ff010a725ebb', 'course = AI Wash'],
+        ['course', 'NORMAL', 'aa0df0e5000201ff010a2e92bb', 'course = Normal'],
     ]
 
     for (const [prop, value, expected, name] of cases) {
@@ -441,7 +441,7 @@ describe('FX___S commands', () => {
         const { thinq, dut } = setup()
         feed(thinq, TOWELS_1_IDLE)
         thinq.resetRecorder()
-        dut.setProperty('course', 'Towels 1')
+        dut.setProperty('course', 'TOWELS_1')
 
         // Byte for byte the frame the LG app sent when it selected this course - the escape value needs
         // the real identifier and all eight option keys alongside it, and this is the only shape of that
@@ -451,7 +451,7 @@ describe('FX___S commands', () => {
 
     test('an extended course does nothing until a record has been seen', () => {
         const { thinq, dut } = setup()
-        dut.setProperty('course', 'Towels 1')
+        dut.setProperty('course', 'TOWELS_1')
         assert.equal(thinq.outbox.length, 0)
     })
 
@@ -502,16 +502,16 @@ const SHORT_VARIANT = buf('aa0b204d010301020379bb')
 
 // The order the appliance declares, which is the order of the dial itself.
 const DIAL = [
-    'AI Wash',
-    'Wool / Delicates',
-    'Normal',
-    'Normal 1',
-    'Towels 1',
-    'Tub Clean',
-    'Bedding',
-    'Quick Steam Sanitize',
-    'Rinse + Spin',
-    'Quick Tub Rinse',
+    'AI_COURSE',
+    'WOOL',
+    'NORMAL',
+    'NORMAL_1',
+    'TOWELS_1',
+    'TUB_CLEAN',
+    'DUVET',
+    'QUICK_STEAM_SANITIZE',
+    'RINSE_SPIN',
+    'QUICK_TUB_RINSE',
 ]
 
 const courseOptions = (HA: MockHAConnection) =>
@@ -530,11 +530,11 @@ describe('FX___S course table', () => {
         // Selecting one has to take the escape path, which is what kind 0x00 is being read as.
         feed(thinq, TOWELS_1_IDLE)
         thinq.resetRecorder()
-        dut.setProperty('course', 'Normal 1')
+        dut.setProperty('course', 'NORMAL_1')
         // key 0x0A = 0xFF (escape) followed by key 0x0B = 0xF5, the real identifier. The byte-for-byte
         // comparison against the app's own extended-course frame is the Towels 1 test above.
         assert.ok(hex(thinq.outbox[0]).includes('0AFF0BF5'))
-        assert.ok(courseOptions(HA).includes('Normal 1'))
+        assert.ok(courseOptions(HA).includes('NORMAL_1'))
     })
 
     test('a declared course nobody has named is offered under its number, and none are withdrawn', () => {
@@ -543,19 +543,19 @@ describe('FX___S course table', () => {
         // for and two we do not. Only the framing is real - incoming checksums are not verified.
         feed(thinq, buf('aa10204d03021603022e029900aa00bb'))
         assert.deepEqual(courseOptions(HA), [
-            'Normal',
+            'NORMAL',
             '#153',
             '#ext170',
             // Everything already offered keeps its place behind the declaration.
-            'Bedding',
-            'Rinse + Spin',
-            'Tub Clean',
-            'Wool / Delicates',
-            'AI Wash',
-            'Quick Tub Rinse',
-            'Quick Steam Sanitize',
-            'Normal 1',
-            'Towels 1',
+            'DUVET',
+            'RINSE_SPIN',
+            'TUB_CLEAN',
+            'WOOL',
+            'AI_COURSE',
+            'QUICK_TUB_RINSE',
+            'QUICK_STEAM_SANITIZE',
+            'NORMAL_1',
+            'TOWELS_1',
         ])
     })
 
@@ -618,9 +618,9 @@ describe('FX___S zero course byte', () => {
     test('it leaves the last real course standing rather than overwriting it', () => {
         const { HA, thinq } = setup()
         feed(thinq, STANDBY)
-        assert.equal(get(HA, 'course'), 'AI Wash')
+        assert.equal(get(HA, 'course'), 'AI_COURSE')
         feed(thinq, ZERO_COURSE_SNAPSHOT)
-        assert.equal(get(HA, 'course'), 'AI Wash')
+        assert.equal(get(HA, 'course'), 'AI_COURSE')
         // A record with neither a phase nor a course: the select keeps the selection, and the sensor
         // clears because this frame is the appliance saying nothing is on, not a missing reading.
         assert.equal(get(HA, 'current_course'), '-')
@@ -641,7 +641,7 @@ describe('FX___S zero course byte', () => {
         rec[22] = 0 // ...with no identifier behind it
         dut.processRecord(rec)
         assert.deepEqual(courseOptions(HA), before)
-        assert.equal(get(HA, 'course'), 'AI Wash')
+        assert.equal(get(HA, 'course'), 'AI_COURSE')
     })
 })
 
@@ -660,11 +660,11 @@ describe('FX___S current course clears when nothing is running', () => {
     test('holds the course through standby and the whole cycle', () => {
         const { HA, thinq } = setup()
         feed(thinq, STANDBY)
-        assert.equal(get(HA, 'current_course'), 'AI Wash')
+        assert.equal(get(HA, 'current_course'), 'AI_COURSE')
         feed(thinq, STARTED)
-        assert.equal(get(HA, 'current_course'), 'AI Wash')
+        assert.equal(get(HA, 'current_course'), 'AI_COURSE')
         feed(thinq, RINSING)
-        assert.equal(get(HA, 'current_course'), 'AI Wash')
+        assert.equal(get(HA, 'current_course'), 'AI_COURSE')
     })
 
     test('clears at complete, stays clear through laundry care, and stays clear when switched off', () => {
@@ -688,7 +688,7 @@ describe('FX___S current course clears when nothing is running', () => {
 
         // '-' is not one of the select's options and Home Assistant rejects a state that is not, so the
         // select must keep the selection - which is also what the next start will actually run.
-        assert.equal(get(HA, 'course'), 'AI Wash')
+        assert.equal(get(HA, 'course'), 'AI_COURSE')
         assert.ok(!courseOptions(HA).includes('-'))
     })
 
@@ -697,7 +697,7 @@ describe('FX___S current course clears when nothing is running', () => {
         feed(thinq, COMPLETE)
         assert.equal(get(HA, 'current_course'), '-')
         dut.processRecord(record(1, 0x2e))
-        assert.equal(get(HA, 'current_course'), 'Normal')
+        assert.equal(get(HA, 'current_course'), 'NORMAL')
     })
 })
 
@@ -1145,75 +1145,51 @@ describe('FX___S reservation armed on the appliance itself', () => {
     })
 })
 
-describe('FX___S course names follow homeassistant.language', () => {
-    function setupIn(language?: string) {
-        const HA = new MockHAConnection()
-        HA.config = { language }
-        const thinq = new MockThinq2Device(DEVICE_ID, META)
-        const dut = new DUT(HA.asConnection(), thinq, META)
-        return { HA, thinq, dut }
-    }
-
-    const optionsOf = (HA: MockHAConnection, key: string) =>
-        (HA.devices[DEVICE_ID].config!.components[key] as unknown as { options: string[] }).options
-
-    test('English by default, and when the setting is absent or something else', () => {
-        for (const language of [undefined, 'en', 'de']) {
-            const { HA, thinq } = setupIn(language)
-            feed(thinq, STANDBY)
-            assert.equal(get(HA, 'current_course'), 'AI Wash')
-            assert.ok(optionsOf(HA, 'course').includes('Normal'))
-        }
-    })
-
-    test('Korean when asked for it, in the state and in both option lists', () => {
-        const { HA, thinq } = setupIn('ko')
+describe('FX___S course names are the ones LG itself uses', () => {
+    test('the six the model JSON names are named its way', () => {
+        const { HA, thinq } = setup()
         feed(thinq, STANDBY)
-
-        assert.equal(get(HA, 'current_course'), '인공지능세탁')
-        assert.equal(get(HA, 'course'), '인공지능세탁')
-        assert.ok(optionsOf(HA, 'course').includes('표준'))
-        assert.ok(optionsOf(HA, 'course').includes('타월1'))
-        assert.ok(!optionsOf(HA, 'course').includes('Normal'))
+        // LG's Course section calls 이불 DUVET, not BEDDING - taking its word for it is the whole
+        // point of using its keys.
+        assert.equal(get(HA, 'current_course'), 'AI_COURSE')
+        const options = (HA.devices[DEVICE_ID].config!.components.course as unknown as { options: string[] }).options
+        for (const key of ['NORMAL', 'WOOL', 'DUVET', 'TUB_CLEAN', 'RINSE_SPIN']) assert.ok(options.includes(key), key)
     })
 
-    test('a write takes either language, whichever is being published', () => {
-        // The point of this: an automation written before the setting was changed keeps working.
-        for (const language of ['en', 'ko']) {
-            for (const name of ['Normal', '표준']) {
-                const { thinq, dut } = setupIn(language)
-                dut.setProperty('course', name)
-                assert.equal(hex(thinq.outbox[0]), hex(buf('aa0df0e5000201ff010a2e92bb')), `${language} <- ${name}`)
-            }
+    test('the four it cannot name are ours, and say so in the code', () => {
+        const { HA } = setup()
+        const options = (HA.devices[DEVICE_ID].config!.components.course as unknown as { options: string[] }).options
+        for (const key of ['QUICK_STEAM_SANITIZE', 'QUICK_TUB_RINSE', 'NORMAL_1', 'TOWELS_1'])
+            assert.ok(options.includes(key), key)
+    })
+
+    test('a write still accepts the names this handler used to publish', () => {
+        // An automation that SETS a course keeps working across the rename; only comparisons against
+        // the published state have to be updated.
+        for (const [name, frame] of [
+            ['NORMAL', 'aa0df0e5000201ff010a2e92bb'],
+            ['Normal', 'aa0df0e5000201ff010a2e92bb'],
+            ['AI_COURSE', 'aa0df0e5000201ff010a725ebb'],
+            ['AI Wash', 'aa0df0e5000201ff010a725ebb'],
+            ['Tub Clean', 'aa0df0e5000201ff010a55bbbb'],
+        ] as const) {
+            const { thinq, dut } = setup()
+            dut.setProperty('course', name)
+            assert.equal(hex(thinq.outbox[0]), hex(buf(frame)), name)
         }
     })
 
-    test('an extended course takes either language too', () => {
-        for (const name of ['Towels 1', '타월1']) {
-            const { thinq, dut } = setupIn('ko')
+    test('an extended course takes the old name too', () => {
+        for (const name of ['TOWELS_1', 'Towels 1']) {
+            const { thinq, dut } = setup()
             feed(thinq, TOWELS_1_IDLE)
             thinq.resetRecorder()
             dut.setProperty('course', name)
             assert.equal(
                 hex(thinq.outbox[0]),
                 hex(buf('aa20f0e5000201ff0a0aff0bf61e03200421081f0035013e0143007f00002cbb')),
+                name,
             )
         }
-    })
-
-    test('the current-course sensor is an enum that declares the placeholder too', () => {
-        const { HA, dut } = setupIn('ko')
-        const declared = optionsOf(HA, 'current_course')
-        assert.ok(declared.includes('-'), 'the finished placeholder has to be declared')
-        assert.ok(declared.includes('표준'))
-
-        // A course nobody has named is registered before it is published, in both lists.
-        const rec = Buffer.alloc(66)
-        rec[20] = 1
-        rec[4] = 0x63
-        dut.processRecord(rec)
-        assert.equal(get(HA, 'current_course'), '#99')
-        assert.ok(optionsOf(HA, 'current_course').includes('#99'))
-        assert.ok(optionsOf(HA, 'course').includes('#99'))
     })
 })
