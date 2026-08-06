@@ -1,6 +1,6 @@
 import HADevice from './base'
 import { Device as Thinq2Device } from '../thinq2/device'
-import { type ComponentInfo, type Connection } from '../homeassistant'
+import { type ComponentInfo, type Connection, type DeviceDiscovery } from '../homeassistant'
 import { type Metadata } from '../thinq'
 import { allowExtendedType } from '@/util/casting'
 import AABBDevice from './aabb_device'
@@ -210,6 +210,9 @@ const PHASE_CARE = 47
 // A delay-end reservation is set and counting down. Declared by the model JSON, not yet seen here -
 // nothing keys off it beyond its name, so an appliance that never reaches it loses nothing.
 const PHASE_RESERVED = 7
+
+// Operations the appliance can only act on in some states - see updateButtonAvailability.
+const GATED_BUTTONS = ['start', 'pause', 'resume']
 
 // Phase codes, named as LG names them. Every one of these was pinned by laying our phase byte and the
 // LG cloud's own status for the same appliance on one clock, across three washes - 2026-07-30 (the
@@ -612,349 +615,380 @@ export default class Device extends AABBDevice {
         this.courseNames = korean ? COURSE_KO : COURSE
         this.courseExtNames = korean ? COURSE_EXT_KO : COURSE_EXT
         this.courseOptions = [...Object.values(this.courseNames), ...Object.values(this.courseExtNames)]
-        this.setConfig(
-            allowExtendedType({
-                ...HADevice.config(meta, { name: 'LG Washer' }),
-                components: {
-                    power: {
-                        platform: 'switch',
-                        unique_id: '$deviceid-power',
-                        state_topic: '$this/power',
-                        command_topic: '$this/power/set',
-                        name: '',
-                        icon: 'mdi:washing-machine',
-                    },
-                    status: {
-                        platform: 'sensor',
-                        unique_id: '$deviceid-status',
-                        state_topic: '$this/status',
-                        name: 'Status',
-                        icon: 'mdi:state-machine',
-                        device_class: 'enum',
-                        options: STATUS_OPTIONS,
-                    },
-                    // The phase enum is incomplete (3/37 are not pinned to a named stage, and only four
-                    // courses have been run). Exposing the raw byte lets an unnamed phase be identified
-                    // from history instead of vanishing into "Unknown".
-                    status_code: {
-                        platform: 'sensor',
-                        unique_id: '$deviceid-status-code',
-                        state_topic: '$this/status_code',
-                        name: 'Status code',
-                        icon: 'mdi:numeric',
-                        entity_category: 'diagnostic',
-                    },
-                    // These two published 0x3E as a per-stage TIME plan. It is an energy meter -
-                    // see processEnergyReport() - so they are withdrawn rather than repurposed: an
-                    // entity that changes from minutes to watt-hours under the same name is worse
-                    // than one that goes away. Publishing the key with nothing but `platform` is
-                    // what withdraws it; omitting the key entirely would only stop a fresh install
-                    // creating one and leave every existing entity live forever, and an empty
-                    // object is rejected outright because `platform` is required by the schema.
-                    //
-                    // The cast is load-bearing: mqtt/discovery.py pops `platform` and reads what
-                    // is left, if it is empty, as a removal. Adding `unique_id` - or anything else
-                    // - silently turns the removal back into a registration, so do not "fix" this
-                    // by filling the type in. Safe to delete once every install has run this once.
-                    cycle_plan: { platform: 'sensor' } as ComponentInfo,
-                    cycle_plan_total: { platform: 'sensor' } as ComponentInfo,
-                    // What 0x3E actually carries. The appliance under-reads the plug on the same
-                    // outlet by about 10%, so this is the appliance's own account of itself rather
-                    // than a calibrated meter - and it updates only every ~15 minutes.
-                    energy: {
-                        platform: 'sensor',
-                        unique_id: '$deviceid-energy',
-                        state_topic: '$this/energy',
-                        name: 'Energy this cycle',
-                        icon: 'mdi:lightning-bolt',
-                        device_class: 'energy',
-                        unit_of_measurement: 'Wh',
-                        state_class: 'total_increasing',
-                    },
-                    energy_reports: {
-                        platform: 'sensor',
-                        unique_id: '$deviceid-energy-reports',
-                        state_topic: '$this/energy_reports',
-                        name: 'Energy per report',
-                        icon: 'mdi:chart-histogram',
-                        entity_category: 'diagnostic',
-                    },
-                    running: {
-                        platform: 'binary_sensor',
-                        unique_id: '$deviceid-running',
-                        state_topic: '$this/running',
-                        name: 'Running',
-                        device_class: 'running',
-                    },
-                    remote_control: {
-                        platform: 'binary_sensor',
-                        unique_id: '$deviceid-remote-control',
-                        state_topic: '$this/remote_control',
-                        name: 'Remote control',
-                        icon: 'mdi:cellphone-wireless',
-                    },
-                    door_lock: {
-                        platform: 'binary_sensor',
-                        unique_id: '$deviceid-door-lock',
-                        state_topic: '$this/door_lock',
-                        name: 'Door lock',
-                        device_class: 'lock',
-                    },
-                    child_lock: {
-                        platform: 'binary_sensor',
-                        unique_id: '$deviceid-child-lock',
-                        state_topic: '$this/child_lock',
-                        name: 'Child lock',
-                        icon: 'mdi:account-lock',
-                    },
-                    wrinkle_care: {
-                        platform: 'binary_sensor',
-                        unique_id: '$deviceid-wrinkle-care',
-                        state_topic: '$this/wrinkle_care',
-                        name: 'Wrinkle care',
-                        icon: 'mdi:tshirt-crew',
-                    },
-                    drum_active: {
-                        platform: 'binary_sensor',
-                        unique_id: '$deviceid-drum-active',
-                        state_topic: '$this/drum_active',
-                        name: 'Drum turning',
-                        icon: 'mdi:rotate-3d-variant',
-                        entity_category: 'diagnostic',
-                    },
-                    remaining_time: {
-                        platform: 'sensor',
-                        unique_id: '$deviceid-remaining-time',
-                        state_topic: '$this/remaining_time',
-                        name: 'Remaining time',
-                        device_class: 'duration',
-                        unit_of_measurement: 'min',
-                    },
-                    total_time: {
-                        platform: 'sensor',
-                        unique_id: '$deviceid-total-time',
-                        state_topic: '$this/total_time',
-                        name: 'Total time',
-                        device_class: 'duration',
-                        unit_of_measurement: 'min',
-                    },
-                    // Counts down as the appliance works through the rinses, so it is genuinely useful
-                    // while running - unlike the `rinse` select, which holds the selection.
-                    rinse_remaining: {
-                        platform: 'sensor',
-                        unique_id: '$deviceid-rinse-remaining',
-                        state_topic: '$this/rinse_remaining',
-                        name: 'Rinses remaining',
-                        icon: 'mdi:water-sync',
-                    },
-                    // The select can only ever hold one of the courses we have names for, and this
-                    // washer's dial has many more than the four that have been run. This always shows
-                    // something - the name when we know it, `#114` when we do not - so the course is
-                    // visible even before its number has been identified.
-                    // An enum, with the same options as the select plus the placeholder it shows when
-                    // nothing is running. That makes Home Assistant validate it and give it the enum
-                    // treatment, and it is only safe because every label this can publish is added to
-                    // the list before it is published - see registerCourse.
-                    current_course: {
-                        platform: 'sensor',
-                        unique_id: '$deviceid-current-course',
-                        state_topic: '$this/current_course',
-                        name: 'Current course',
-                        icon: 'mdi:playlist-check',
-                        device_class: 'enum',
-                        options: [COURSE_CLEARED, ...this.courseOptions],
-                    },
-                    end_time: {
-                        platform: 'sensor',
-                        unique_id: '$deviceid-end-time',
-                        state_topic: '$this/end_time',
-                        // Not "Finishes at" any more: since the timestamp is latched at Complete and
-                        // kept, this entity holds a time in the past for most of the day and a
-                        // prediction only while a cycle runs. A name in the present tense was right
-                        // for one of those and wrong for the other.
-                        name: 'Finish time',
-                        device_class: 'timestamp',
-                    },
-                    available_options: {
-                        platform: 'sensor',
-                        unique_id: '$deviceid-available-options',
-                        state_topic: '$this/available_options',
-                        json_attributes_topic: '$this/available_options_attrs',
-                        name: 'Adjustable options',
-                        icon: 'mdi:tune-variant',
-                        entity_category: 'diagnostic',
-                    },
-                    options_raw: {
-                        platform: 'sensor',
-                        unique_id: '$deviceid-options-raw',
-                        state_topic: '$this/options_raw',
-                        name: 'Selected options (raw)',
-                        icon: 'mdi:code-braces',
-                        entity_category: 'diagnostic',
-                    },
-                    cycles: {
-                        platform: 'sensor',
-                        unique_id: '$deviceid-cycles',
-                        state_topic: '$this/cycles',
-                        name: 'Cycles',
-                        icon: 'mdi:counter',
-                        entity_category: 'diagnostic',
-                    },
-                    // The seven entities below WRITE the next cycle's settings, and Home Assistant sorts
-                    // a device's entities by name, which scattered them among the readings. The shared
-                    // "Course - " prefix groups them, and marks them as the ones that change something -
-                    // the readings that describe the cycle (Current course, Cycle plan, Remaining time)
-                    // deliberately keep their own names.
-                    //
-                    // This is a display change only: an entity_id is assigned when the entity is first
-                    // created and is not re-derived when the name changes, so anything already pointing
-                    // at select.lg_washer_course keeps working.
-                    course: {
-                        platform: 'select',
-                        unique_id: '$deviceid-course',
-                        state_topic: '$this/course',
-                        command_topic: '$this/course/set',
-                        name: 'Course - Select',
-                        icon: 'mdi:playlist-check',
-                        // Grows as the appliance declares its dial or reports a course we have no name
-                        // for; see courseOptions. Republished by setCourseOptions when it does.
-                        options: [...this.courseOptions],
-                    },
-                    wash: {
-                        platform: 'select',
-                        unique_id: '$deviceid-wash',
-                        state_topic: '$this/wash',
-                        command_topic: '$this/wash/set',
-                        name: 'Course - Wash',
-                        icon: 'mdi:washing-machine',
-                        options: Object.values(WASH),
-                    },
-                    water_temp: {
-                        platform: 'select',
-                        unique_id: '$deviceid-water-temp',
-                        state_topic: '$this/water_temp',
-                        command_topic: '$this/water_temp/set',
-                        name: 'Course - Water temperature',
-                        icon: 'mdi:thermometer-water',
-                        options: Object.values(WATER_TEMP),
-                    },
-                    rinse: {
-                        platform: 'select',
-                        unique_id: '$deviceid-rinse',
-                        state_topic: '$this/rinse',
-                        command_topic: '$this/rinse/set',
-                        name: 'Course - Rinse',
-                        icon: 'mdi:water',
-                        options: RINSE.map(String),
-                    },
-                    spin: {
-                        platform: 'select',
-                        unique_id: '$deviceid-spin',
-                        state_topic: '$this/spin',
-                        command_topic: '$this/spin/set',
-                        name: 'Course - Spin',
-                        icon: 'mdi:rotate-right',
-                        options: Object.values(SPIN),
-                    },
-                    turbowash: {
-                        platform: 'switch',
-                        unique_id: '$deviceid-turbowash',
-                        state_topic: '$this/turbowash',
-                        command_topic: '$this/turbowash/set',
-                        name: 'Course - TurboShot',
-                        icon: 'mdi:car-turbocharger',
-                    },
-                    steam: {
-                        platform: 'switch',
-                        unique_id: '$deviceid-steam',
-                        state_topic: '$this/steam',
-                        command_topic: '$this/steam/set',
-                        name: 'Course - Steam',
-                        icon: 'mdi:kettle-steam',
-                    },
-                    beep: {
-                        platform: 'select',
-                        unique_id: '$deviceid-beep',
-                        state_topic: '$this/beep',
-                        command_topic: '$this/beep/set',
-                        name: 'Beep volume',
-                        icon: 'mdi:volume-high',
-                        options: Object.values(BEEP),
-                        entity_category: 'config',
-                    },
-                    start: {
-                        platform: 'button',
-                        unique_id: '$deviceid-start',
-                        command_topic: '$this/start/set',
-                        payload_press: '',
-                        name: 'Start',
-                        icon: 'mdi:play-circle-outline',
-                    },
-                    pause: {
-                        platform: 'button',
-                        unique_id: '$deviceid-pause',
-                        command_topic: '$this/pause/set',
-                        payload_press: '',
-                        name: 'Pause',
-                        icon: 'mdi:pause-circle-outline',
-                    },
-                    resume: {
-                        platform: 'button',
-                        unique_id: '$deviceid-resume',
-                        command_topic: '$this/resume/set',
-                        payload_press: '',
-                        name: 'Resume',
-                        icon: 'mdi:play-pause',
-                    },
-                    // Hours until the cycle should FINISH, which is what this appliance's reservation
-                    // means. Half hours, because the appliance takes them; 0 is no reservation. The
-                    // range starts at 0 rather than at the appliance's 3 so that the entity can say
-                    // "none" at all - setProperty refuses the impossible gap in between rather than
-                    // sending something the appliance declares invalid.
-                    reservation: {
-                        platform: 'number',
-                        unique_id: '$deviceid-reservation',
-                        state_topic: '$this/reservation',
-                        command_topic: '$this/reservation/set',
-                        name: 'Course - Reservation',
-                        icon: 'mdi:timer-sand',
-                        min: 0,
-                        max: 19,
-                        step: 0.5,
-                        unit_of_measurement: 'h',
-                        mode: 'box',
-                    },
-                    // Two settings of the appliance itself rather than of a cycle, so they are
-                    // config rather than part of the "Course - " group.
-                    auto_optimise: {
-                        platform: 'switch',
-                        unique_id: '$deviceid-auto-optimise',
-                        state_topic: '$this/auto_optimise',
-                        command_topic: '$this/auto_optimise/set',
-                        name: 'Course auto-optimisation',
-                        icon: 'mdi:auto-fix',
-                        entity_category: 'config',
-                    },
-                    clock_when_off: {
-                        platform: 'switch',
-                        unique_id: '$deviceid-clock-when-off',
-                        state_topic: '$this/clock_when_off',
-                        command_topic: '$this/clock_when_off/set',
-                        name: 'Clock while switched off',
-                        icon: 'mdi:clock-digital',
-                        entity_category: 'config',
-                    },
-                    laundry_care: {
-                        platform: 'switch',
-                        unique_id: '$deviceid-laundry-care',
-                        state_topic: '$this/laundry_care',
-                        command_topic: '$this/laundry_care/set',
-                        name: 'Laundry care when done',
-                        icon: 'mdi:tumble-dryer',
-                    },
+        // Annotated because allowExtendedType infers its result from the assignment target: with
+        // nothing to infer from it would come out `unknown`.
+        const config: DeviceDiscovery = allowExtendedType({
+            ...HADevice.config(meta, { name: 'LG Washer' }),
+            components: {
+                power: {
+                    platform: 'switch',
+                    unique_id: '$deviceid-power',
+                    state_topic: '$this/power',
+                    command_topic: '$this/power/set',
+                    name: '',
+                    icon: 'mdi:washing-machine',
                 },
-            }),
-        )
+                status: {
+                    platform: 'sensor',
+                    unique_id: '$deviceid-status',
+                    state_topic: '$this/status',
+                    name: 'Status',
+                    icon: 'mdi:state-machine',
+                    device_class: 'enum',
+                    options: STATUS_OPTIONS,
+                },
+                // The phase enum is incomplete (3/37 are not pinned to a named stage, and only four
+                // courses have been run). Exposing the raw byte lets an unnamed phase be identified
+                // from history instead of vanishing into "Unknown".
+                status_code: {
+                    platform: 'sensor',
+                    unique_id: '$deviceid-status-code',
+                    state_topic: '$this/status_code',
+                    name: 'Status code',
+                    icon: 'mdi:numeric',
+                    entity_category: 'diagnostic',
+                },
+                // These two published 0x3E as a per-stage TIME plan. It is an energy meter -
+                // see processEnergyReport() - so they are withdrawn rather than repurposed: an
+                // entity that changes from minutes to watt-hours under the same name is worse
+                // than one that goes away. Publishing the key with nothing but `platform` is
+                // what withdraws it; omitting the key entirely would only stop a fresh install
+                // creating one and leave every existing entity live forever, and an empty
+                // object is rejected outright because `platform` is required by the schema.
+                //
+                // The cast is load-bearing: mqtt/discovery.py pops `platform` and reads what
+                // is left, if it is empty, as a removal. Adding `unique_id` - or anything else
+                // - silently turns the removal back into a registration, so do not "fix" this
+                // by filling the type in. Safe to delete once every install has run this once.
+                cycle_plan: { platform: 'sensor' } as ComponentInfo,
+                cycle_plan_total: { platform: 'sensor' } as ComponentInfo,
+                // What 0x3E actually carries. The appliance under-reads the plug on the same
+                // outlet by about 10%, so this is the appliance's own account of itself rather
+                // than a calibrated meter - and it updates only every ~15 minutes.
+                energy: {
+                    platform: 'sensor',
+                    unique_id: '$deviceid-energy',
+                    state_topic: '$this/energy',
+                    name: 'Energy this cycle',
+                    icon: 'mdi:lightning-bolt',
+                    device_class: 'energy',
+                    unit_of_measurement: 'Wh',
+                    state_class: 'total_increasing',
+                },
+                energy_reports: {
+                    platform: 'sensor',
+                    unique_id: '$deviceid-energy-reports',
+                    state_topic: '$this/energy_reports',
+                    name: 'Energy per report',
+                    icon: 'mdi:chart-histogram',
+                    entity_category: 'diagnostic',
+                },
+                // LOCAL ONLY - not for upstream, by the owner's decision (2026-08-07). Every other
+                // entity here reports something the appliance sends; this one is a set of phase
+                // numbers this handler decided to call "running", and which phases belong in it is a
+                // judgement - paused is out, laundry care is in. It earns its place on this
+                // installation, but it is ours rather than the appliance's word.
+                running: {
+                    platform: 'binary_sensor',
+                    unique_id: '$deviceid-running',
+                    state_topic: '$this/running',
+                    name: 'Running',
+                    device_class: 'running',
+                },
+                remote_control: {
+                    platform: 'binary_sensor',
+                    unique_id: '$deviceid-remote-control',
+                    state_topic: '$this/remote_control',
+                    name: 'Remote control',
+                    icon: 'mdi:cellphone-wireless',
+                },
+                door_lock: {
+                    platform: 'binary_sensor',
+                    unique_id: '$deviceid-door-lock',
+                    state_topic: '$this/door_lock',
+                    name: 'Door lock',
+                    device_class: 'lock',
+                },
+                child_lock: {
+                    platform: 'binary_sensor',
+                    unique_id: '$deviceid-child-lock',
+                    state_topic: '$this/child_lock',
+                    name: 'Child lock',
+                    icon: 'mdi:account-lock',
+                },
+                wrinkle_care: {
+                    platform: 'binary_sensor',
+                    unique_id: '$deviceid-wrinkle-care',
+                    state_topic: '$this/wrinkle_care',
+                    name: 'Wrinkle care',
+                    icon: 'mdi:tshirt-crew',
+                },
+                drum_active: {
+                    platform: 'binary_sensor',
+                    unique_id: '$deviceid-drum-active',
+                    state_topic: '$this/drum_active',
+                    name: 'Drum turning',
+                    icon: 'mdi:rotate-3d-variant',
+                    entity_category: 'diagnostic',
+                },
+                remaining_time: {
+                    platform: 'sensor',
+                    unique_id: '$deviceid-remaining-time',
+                    state_topic: '$this/remaining_time',
+                    name: 'Remaining time',
+                    device_class: 'duration',
+                    unit_of_measurement: 'min',
+                },
+                total_time: {
+                    platform: 'sensor',
+                    unique_id: '$deviceid-total-time',
+                    state_topic: '$this/total_time',
+                    name: 'Total time',
+                    device_class: 'duration',
+                    unit_of_measurement: 'min',
+                },
+                // Counts down as the appliance works through the rinses, so it is genuinely useful
+                // while running - unlike the `rinse` select, which holds the selection.
+                rinse_remaining: {
+                    platform: 'sensor',
+                    unique_id: '$deviceid-rinse-remaining',
+                    state_topic: '$this/rinse_remaining',
+                    name: 'Rinses remaining',
+                    icon: 'mdi:water-sync',
+                },
+                // The select can only ever hold one of the courses we have names for, and this
+                // washer's dial has many more than the four that have been run. This always shows
+                // something - the name when we know it, `#114` when we do not - so the course is
+                // visible even before its number has been identified.
+                // An enum, with the same options as the select plus the placeholder it shows when
+                // nothing is running. That makes Home Assistant validate it and give it the enum
+                // treatment, and it is only safe because every label this can publish is added to
+                // the list before it is published - see registerCourse.
+                current_course: {
+                    platform: 'sensor',
+                    unique_id: '$deviceid-current-course',
+                    state_topic: '$this/current_course',
+                    name: 'Current course',
+                    icon: 'mdi:playlist-check',
+                    device_class: 'enum',
+                    options: [COURSE_CLEARED, ...this.courseOptions],
+                },
+                end_time: {
+                    platform: 'sensor',
+                    unique_id: '$deviceid-end-time',
+                    state_topic: '$this/end_time',
+                    // Not "Finishes at" any more: since the timestamp is latched at Complete and
+                    // kept, this entity holds a time in the past for most of the day and a
+                    // prediction only while a cycle runs. A name in the present tense was right
+                    // for one of those and wrong for the other.
+                    name: 'Finish time',
+                    device_class: 'timestamp',
+                },
+                available_options: {
+                    platform: 'sensor',
+                    unique_id: '$deviceid-available-options',
+                    state_topic: '$this/available_options',
+                    json_attributes_topic: '$this/available_options_attrs',
+                    name: 'Adjustable options',
+                    icon: 'mdi:tune-variant',
+                    entity_category: 'diagnostic',
+                },
+                options_raw: {
+                    platform: 'sensor',
+                    unique_id: '$deviceid-options-raw',
+                    state_topic: '$this/options_raw',
+                    name: 'Selected options (raw)',
+                    icon: 'mdi:code-braces',
+                    entity_category: 'diagnostic',
+                },
+                cycles: {
+                    platform: 'sensor',
+                    unique_id: '$deviceid-cycles',
+                    state_topic: '$this/cycles',
+                    name: 'Cycles',
+                    icon: 'mdi:counter',
+                    entity_category: 'diagnostic',
+                },
+                // The seven entities below WRITE the next cycle's settings, and Home Assistant sorts
+                // a device's entities by name, which scattered them among the readings. The shared
+                // "Course - " prefix groups them, and marks them as the ones that change something -
+                // the readings that describe the cycle (Current course, Cycle plan, Remaining time)
+                // deliberately keep their own names.
+                //
+                // This is a display change only: an entity_id is assigned when the entity is first
+                // created and is not re-derived when the name changes, so anything already pointing
+                // at select.lg_washer_course keeps working.
+                course: {
+                    platform: 'select',
+                    unique_id: '$deviceid-course',
+                    state_topic: '$this/course',
+                    command_topic: '$this/course/set',
+                    name: 'Course - Select',
+                    icon: 'mdi:playlist-check',
+                    // Grows as the appliance declares its dial or reports a course we have no name
+                    // for; see courseOptions. Republished by setCourseOptions when it does.
+                    options: [...this.courseOptions],
+                },
+                wash: {
+                    platform: 'select',
+                    unique_id: '$deviceid-wash',
+                    state_topic: '$this/wash',
+                    command_topic: '$this/wash/set',
+                    name: 'Course - Wash',
+                    icon: 'mdi:washing-machine',
+                    options: Object.values(WASH),
+                },
+                water_temp: {
+                    platform: 'select',
+                    unique_id: '$deviceid-water-temp',
+                    state_topic: '$this/water_temp',
+                    command_topic: '$this/water_temp/set',
+                    name: 'Course - Water temperature',
+                    icon: 'mdi:thermometer-water',
+                    options: Object.values(WATER_TEMP),
+                },
+                rinse: {
+                    platform: 'select',
+                    unique_id: '$deviceid-rinse',
+                    state_topic: '$this/rinse',
+                    command_topic: '$this/rinse/set',
+                    name: 'Course - Rinse',
+                    icon: 'mdi:water',
+                    options: RINSE.map(String),
+                },
+                spin: {
+                    platform: 'select',
+                    unique_id: '$deviceid-spin',
+                    state_topic: '$this/spin',
+                    command_topic: '$this/spin/set',
+                    name: 'Course - Spin',
+                    icon: 'mdi:rotate-right',
+                    options: Object.values(SPIN),
+                },
+                turbowash: {
+                    platform: 'switch',
+                    unique_id: '$deviceid-turbowash',
+                    state_topic: '$this/turbowash',
+                    command_topic: '$this/turbowash/set',
+                    name: 'Course - TurboShot',
+                    icon: 'mdi:car-turbocharger',
+                },
+                steam: {
+                    platform: 'switch',
+                    unique_id: '$deviceid-steam',
+                    state_topic: '$this/steam',
+                    command_topic: '$this/steam/set',
+                    name: 'Course - Steam',
+                    icon: 'mdi:kettle-steam',
+                },
+                beep: {
+                    platform: 'select',
+                    unique_id: '$deviceid-beep',
+                    state_topic: '$this/beep',
+                    command_topic: '$this/beep/set',
+                    name: 'Beep volume',
+                    icon: 'mdi:volume-high',
+                    options: Object.values(BEEP),
+                    entity_category: 'config',
+                },
+                start: {
+                    platform: 'button',
+                    unique_id: '$deviceid-start',
+                    command_topic: '$this/start/set',
+                    payload_press: '',
+                    name: 'Start',
+                    icon: 'mdi:play-circle-outline',
+                },
+                pause: {
+                    platform: 'button',
+                    unique_id: '$deviceid-pause',
+                    command_topic: '$this/pause/set',
+                    payload_press: '',
+                    name: 'Pause',
+                    icon: 'mdi:pause-circle-outline',
+                },
+                resume: {
+                    platform: 'button',
+                    unique_id: '$deviceid-resume',
+                    command_topic: '$this/resume/set',
+                    payload_press: '',
+                    name: 'Resume',
+                    icon: 'mdi:play-pause',
+                },
+                // Hours until the cycle should FINISH, which is what this appliance's reservation
+                // means. Half hours, because the appliance takes them; 0 is no reservation. The
+                // range starts at 0 rather than at the appliance's 3 so that the entity can say
+                // "none" at all - setProperty refuses the impossible gap in between rather than
+                // sending something the appliance declares invalid.
+                reservation: {
+                    platform: 'number',
+                    unique_id: '$deviceid-reservation',
+                    state_topic: '$this/reservation',
+                    command_topic: '$this/reservation/set',
+                    name: 'Course - Reservation',
+                    icon: 'mdi:timer-sand',
+                    min: 0,
+                    max: 19,
+                    step: 0.5,
+                    unit_of_measurement: 'h',
+                    mode: 'box',
+                },
+                // Two settings of the appliance itself rather than of a cycle, so they are
+                // config rather than part of the "Course - " group.
+                auto_optimise: {
+                    platform: 'switch',
+                    unique_id: '$deviceid-auto-optimise',
+                    state_topic: '$this/auto_optimise',
+                    command_topic: '$this/auto_optimise/set',
+                    name: 'Course auto-optimisation',
+                    icon: 'mdi:auto-fix',
+                    entity_category: 'config',
+                },
+                clock_when_off: {
+                    platform: 'switch',
+                    unique_id: '$deviceid-clock-when-off',
+                    state_topic: '$this/clock_when_off',
+                    command_topic: '$this/clock_when_off/set',
+                    name: 'Clock while switched off',
+                    icon: 'mdi:clock-digital',
+                    entity_category: 'config',
+                },
+                laundry_care: {
+                    platform: 'switch',
+                    unique_id: '$deviceid-laundry-care',
+                    state_topic: '$this/laundry_care',
+                    command_topic: '$this/laundry_care/set',
+                    name: 'Laundry care when done',
+                    icon: 'mdi:tumble-dryer',
+                },
+            },
+        })
+
+        /*
+         * The three operation buttons get their own availability topic ON TOP OF the two device-wide
+         * ones. A component's `availability` REPLACES the device-level list rather than adding to it,
+         * so both device topics have to be repeated here or these buttons would stop following the
+         * device's own online/offline.
+         */
+        for (const name of GATED_BUTTONS) {
+            const comp = config.components[name] as unknown as Record<string, unknown>
+            comp.availability = [
+                { topic: '$this/availability' },
+                { topic: '$rethink/availability' },
+                { topic: `$this/${name}-availability` },
+            ]
+            comp.availability_mode = 'all'
+        }
+
+        this.setConfig(config)
+
+        /*
+         * Publish it immediately and unconditionally: an MQTT entity whose availability topic has
+         * never been published reads as unavailable, so staying silent until the first state record
+         * would grey all three out on every connect. No record is known yet, which the method treats
+         * as available - the honest default, since the appliance has not said otherwise.
+         */
+        this.updateButtonAvailability()
     }
 
     /**
@@ -1218,6 +1252,7 @@ export default class Device extends AABBDevice {
         }
         this.publishProperty('total_time', phase === PHASE_OFF ? 0 : rec[OFF_TOTAL_H] * 60 + rec[OFF_TOTAL_M])
         this.publishProperty('rinse_remaining', rec[OFF_RINSE])
+        this.updateButtonAvailability()
 
         // The course byte is not consumed - it survives the cycle, the finished state and even powering
         // off - so it is always worth publishing, except when the byte identifying it reads 0. For an
@@ -1261,6 +1296,33 @@ export default class Device extends AABBDevice {
             'options_raw',
             `course=${course} ext=${rec[OFF_COURSE_EXT]} wash=${rec[OFF_WASH]} temp=${rec[OFF_WATER_TEMP]} rinse=${rec[OFF_RINSE]} spin=${rec[OFF_SPIN]} steam=${rec[OFF_STEAM]}`,
         )
+    }
+
+    /*
+     * Grey out an operation the appliance cannot act on, rather than sending it and logging that it
+     * went nowhere. Called at startup and from every state record.
+     *
+     *   start    remote control ON, and not already running, and not switched off. Remote control is
+     *            the appliance's own gate on starting remotely - the owner confirmed it, and it is
+     *            the one command this handler has always warned about.
+     *   resume   remote control ON and actually paused.
+     *   pause    running. NOT gated on remote control: whether a pause needs it has never been
+     *            measured, and greying out a control that might work is worse than a log line.
+     *
+     * With no record yet, all three stay available - the appliance has not said otherwise.
+     */
+    updateButtonAvailability() {
+        const phase = this.lastRecord?.[OFF_PHASE]
+        const running = phase !== undefined && ACTIVE_PHASES.has(phase)
+        const state = (ok: boolean) => (phase === undefined || ok ? 'online' : 'offline')
+
+        this.HA.publishProperty(
+            this.id,
+            'start-availability',
+            state(this.remoteControl && !running && phase !== PHASE_OFF),
+        )
+        this.HA.publishProperty(this.id, 'resume-availability', state(this.remoteControl && phase === PHASE_PAUSED))
+        this.HA.publishProperty(this.id, 'pause-availability', state(running))
     }
 
     /** The label for whatever course a record names, or undefined when it names none (byte 0). */

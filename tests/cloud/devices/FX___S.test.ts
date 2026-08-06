@@ -1395,3 +1395,81 @@ describe('FX___S course names in the configured language', () => {
         assert.deepEqual(courseOptions(HA), ['표준', '#153', '#ext170'])
     })
 })
+
+describe('FX___S the operation buttons say when they can be used', () => {
+    const avail = (HA: MockHAConnection, name: string) => get(HA, `${name}-availability`)
+
+    function record(phase: number, remote = true) {
+        const rec = Buffer.alloc(66)
+        rec[20] = phase
+        if (remote) rec[36] = 0x10 // FLAG_REMOTE_CONTROL
+        return rec
+    }
+
+    test('all three are available before the appliance has said anything', () => {
+        const { HA } = setup()
+        // An MQTT entity whose availability topic was never published reads as unavailable, so the
+        // honest default has to be published at startup rather than waited for.
+        for (const name of ['start', 'pause', 'resume']) assert.equal(avail(HA, name), 'online')
+    })
+
+    test('standby offers start, and nothing else', () => {
+        const { HA, dut } = setup()
+        dut.processRecord(record(1))
+        assert.equal(avail(HA, 'start'), 'online')
+        assert.equal(avail(HA, 'pause'), 'offline')
+        assert.equal(avail(HA, 'resume'), 'offline')
+    })
+
+    test('a running cycle offers pause, and neither of the others', () => {
+        const { HA, dut } = setup()
+        dut.processRecord(record(11))
+        assert.equal(avail(HA, 'pause'), 'online')
+        assert.equal(avail(HA, 'start'), 'offline')
+        assert.equal(avail(HA, 'resume'), 'offline')
+    })
+
+    test('paused offers resume', () => {
+        const { HA, dut } = setup()
+        dut.processRecord(record(2))
+        assert.equal(avail(HA, 'resume'), 'online')
+        assert.equal(avail(HA, 'pause'), 'offline')
+    })
+
+    test('remote control off takes start and resume away, but not pause', () => {
+        const { HA, dut } = setup()
+        dut.processRecord(record(1, false))
+        assert.equal(avail(HA, 'start'), 'offline')
+
+        dut.processRecord(record(2, false))
+        assert.equal(avail(HA, 'resume'), 'offline')
+
+        // Pause is NOT gated on it: whether the appliance needs remote control for a pause has never
+        // been measured, and greying out a control that might work is worse than a log line.
+        dut.processRecord(record(11, false))
+        assert.equal(avail(HA, 'pause'), 'online')
+    })
+
+    test('switched off, start is not offered either', () => {
+        const { HA, dut } = setup()
+        dut.processRecord(record(0))
+        assert.equal(avail(HA, 'start'), 'offline')
+    })
+
+    test('the buttons declare the two device topics as well as their own', () => {
+        const { HA } = setup()
+        for (const name of ['start', 'pause', 'resume']) {
+            const comp = HA.devices[DEVICE_ID].config!.components[name] as unknown as {
+                availability: { topic: string }[]
+                availability_mode: string
+            }
+            // A component's availability REPLACES the device-level list, so both device topics have
+            // to be repeated or the button stops following the device's own online/offline.
+            assert.deepEqual(
+                comp.availability.map((a) => a.topic),
+                ['$this/availability', '$rethink/availability', `$this/${name}-availability`],
+            )
+            assert.equal(comp.availability_mode, 'all')
+        }
+    })
+})
