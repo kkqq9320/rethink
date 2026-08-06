@@ -25,6 +25,7 @@ import FX___S from '@/cloud/devices/FX___S'
 import PAC_910604_WW from '@/cloud/devices/PAC_910604_WW'
 import RAC_056905_WW from '@/cloud/devices/RAC_056905_WW'
 import DHUM_231006_WW from '@/cloud/devices/DHUM_231006_WW'
+import Dev_2REFO1DBN3__U from '@/cloud/devices/2REFO1DBN3__U'
 
 // Importing the test mocks silences device logging as a side effect; a replay is exactly when those
 // lines are wanted, so put them back.
@@ -35,6 +36,7 @@ const HANDLERS: Record<string, new (HA: never, thinq: never, meta: Metadata) => 
     PAC_910604_WW,
     RAC_056905_WW,
     DHUM_231006_WW,
+    ['2REFO1DBN3__U']: Dev_2REFO1DBN3__U,
 } as unknown as Record<string, new (HA: never, thinq: never, meta: Metadata) => object>
 
 const ID = 'replay'
