@@ -1180,6 +1180,14 @@ export default class Device extends AABBDevice {
      * The payload is JSON because that is what the MQTT event platform reads; `event_type` has to be
      * one of the types declared in the discovery config or Home Assistant drops the message, which is
      * why both lists above carry a fallback.
+     *
+     * Not retaining does NOT make the entity forgetful, which is the thing to get wrong here - it was
+     * got wrong once already. An event entity keeps showing the timestamp of its last event across a
+     * Home Assistant restart, and that has nothing to do with MQTT: core's `EventEntity` extends
+     * `RestoreEntity` and restores the state, the event type and its attributes on startup. The
+     * official integration's error event on this same appliance was still displaying a timestamp from
+     * six weeks earlier, and this entity behaves identically. Retaining would add nothing to that and
+     * would only put a finished cycle back on the wire at every reconnect.
      */
     publishEvent(topic: string, eventType: string) {
         this.HA.publishProperty(this.id, topic, JSON.stringify({ event_type: eventType }), { retain: false })
