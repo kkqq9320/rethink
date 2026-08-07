@@ -1477,6 +1477,132 @@ describe('FX___S the operation buttons say when they can be used', () => {
     })
 })
 
+describe('FX___S the two moments it announces', () => {
+    // All four 0x72 frames the appliance sent during washer-notify-20260807.jsonl, verbatim. The two
+    // that are published were each timed against the LG cloud's own push for the same instant:
+    // 00 -> washing_is_complete (+1.86 s), 64 -> error_during_washing (+1.36 s).
+    const COMPLETE_NOTIFY = buf('aa09207200000010bb')
+    const ERROR_NOTIFY = buf('aa0c2072006403000000fabb')
+    // Sent 34 s after a power-off and 16 s before another. Assumed to be the door opening and closing
+    // until the owner opened and closed it three times and produced neither. Nobody has named these.
+    const NOTIFY_201 = buf('aa09207200c9005bbb')
+    const NOTIFY_200 = buf('aa09207200c80058bb')
+
+    // The record carrying the door fault, captured 2026-08-07 15:22:30 - the owner had just tried to
+    // start a cycle with the door open. Byte 18 reads 20, which is DE1 in LG's own error enum.
+    const DOOR_ERROR_RECORD = buf(
+        'aaff200a009800c3fc000100ec00860000000000370000000000000000010000001d0037002a110000000000030000000000000000000034000000000000040000000000000000000000000000001800000000030302067200000000000000002400240000147202031b000000020003000000002000000000003400000000000004000000000000000000000000000000180000006ad0bb',
+    )
+
+    /** Counts publishes per topic, which the mock's last-value-wins map cannot show. */
+    function counting(HA: MockHAConnection) {
+        const counts: Record<string, number> = {}
+        const inner = HA.publishProperty.bind(HA)
+        HA.publishProperty = (id: string, property: string, value: string | number) => {
+            counts[property] = (counts[property] ?? 0) + 1
+            return inner(id, property, value)
+        }
+        return counts
+    }
+
+    const eventType = (HA: MockHAConnection, topic: string) => JSON.parse(String(get(HA, topic))).event_type as string
+
+    test('a finished cycle announces itself, half a minute before the phase says so', () => {
+        const { HA, thinq } = setup()
+        feed(thinq, COMPLETE_NOTIFY)
+        assert.equal(eventType(HA, 'notification'), 'washing_is_complete')
+        // ...and nothing about the state has moved: this frame carries no record.
+        assert.equal(get(HA, 'status'), undefined)
+    })
+
+    test('the second wash of the day announces itself too', () => {
+        const { HA, thinq } = setup()
+        const counts = counting(HA)
+        feed(thinq, COMPLETE_NOTIFY)
+        feed(thinq, COMPLETE_NOTIFY)
+        // publishProperty drops a repeat of the value it last sent, which is right for state and
+        // would have swallowed this one - the two payloads are the same string. See publishEvent.
+        assert.equal(counts['notification'], 2)
+    })
+
+    test('an error is a different announcement from a finished cycle', () => {
+        const { HA, thinq } = setup()
+        feed(thinq, ERROR_NOTIFY)
+        assert.equal(eventType(HA, 'notification'), 'error_during_washing')
+    })
+
+    test('the two values nobody has ever labelled fire nothing at all', () => {
+        const { HA, thinq } = setup()
+        feed(thinq, NOTIFY_200)
+        feed(thinq, NOTIFY_201)
+        assert.equal(get(HA, 'notification'), undefined)
+    })
+
+    test('the fault names itself, and it is the name the official integration uses', () => {
+        const { HA, thinq, dut } = setup()
+        feed(thinq, STANDBY) // a record with no fault first, so the next one is a MOVE
+        feed(thinq, DOOR_ERROR_RECORD)
+        assert.equal(eventType(HA, 'error'), 'door_open_error')
+        assert.equal(dut.lastRecord?.[18], 20) // DE1, straight out of LG's model JSON
+    })
+
+    test('it fires on the move into the fault, not on every record reporting it', () => {
+        const { HA, thinq } = setup()
+        feed(thinq, STANDBY)
+        const counts = counting(HA)
+        feed(thinq, DOOR_ERROR_RECORD)
+        feed(thinq, DOOR_ERROR_RECORD)
+        assert.equal(counts['error'], 1)
+    })
+
+    test('a fault already present in the very first record is not fired', () => {
+        const { HA, thinq } = setup()
+        // The instant this arrives is the reconnect, not the fault - the same call the finish-time
+        // latch makes for a cycle that is already Complete when the first frame lands.
+        feed(thinq, DOOR_ERROR_RECORD)
+        assert.equal(get(HA, 'error'), undefined)
+    })
+
+    test('a fault that clears and comes back fires again', () => {
+        const { HA, thinq, dut } = setup()
+        feed(thinq, STANDBY)
+        const counts = counting(HA)
+        feed(thinq, DOOR_ERROR_RECORD)
+        feed(thinq, STANDBY) // cleared
+        feed(thinq, DOOR_ERROR_RECORD)
+        assert.equal(counts['error'], 2)
+        assert.equal(dut.lastRecord?.[18], 20)
+    })
+
+    test('a code LG does not declare still publishes something Home Assistant will accept', () => {
+        const { HA, dut } = setup()
+        dut.processRecord(Buffer.alloc(66))
+        const rec = Buffer.alloc(66)
+        rec[18] = 99
+        dut.processRecord(rec)
+        assert.equal(eventType(HA, 'error'), 'unknown_error')
+    })
+
+    test('both entities declare every type they can publish', () => {
+        const { HA } = setup()
+        const components = HA.devices[DEVICE_ID].config!.components as unknown as Record<
+            string,
+            { platform: string; event_types: string[] }
+        >
+
+        assert.equal(components.notification.platform, 'event')
+        assert.deepEqual(components.notification.event_types, ['washing_is_complete', 'error_during_washing'])
+
+        assert.equal(components.error.platform, 'event')
+        // An event_type that is not declared is dropped by Home Assistant, so the fallback the
+        // handler falls back to has to be in the list or an unknown fault would vanish silently.
+        assert.ok(components.error.event_types.includes('door_open_error'))
+        assert.ok(components.error.event_types.includes('unknown_error'))
+        // Nine names shared with the official integration, ten of LG's own codes, one fallback.
+        assert.equal(components.error.event_types.length, 20)
+    })
+})
+
 describe('FX___S a tub clean is a running cycle', () => {
     // 2026-08-07, the first time this appliance ever reached phase 41 - 통살균, 84 minutes. It had a
     // name taken from the model JSON and a place in none of the phase sets, and all of that showed at

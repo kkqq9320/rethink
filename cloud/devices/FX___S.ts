@@ -27,13 +27,16 @@ import log from '@/util/logging'
 //   extended:  20 <type> <len16> <payload...>          len16 == buf.length + 4
 //
 // Message types seen from the appliance, censused across all three washer captures with
-// tools/aabb-survey.ts - the appliance sends thirteen and this handler dispatches on four:
+// tools/aabb-survey.ts - the appliance sends thirteen and this handler dispatches on five:
 //
 //   0x0A  2184x   tunnel, see below
 //   0x4D   527x   the appliance declaring its own course table, see processCourseTable
 //   0xE6   136x   reply to a settings write
 //   0x3E    90x   the appliance's own energy meter, one report every ~15 min, see
 //                 processEnergyReport
+//   0x72    23x   the notification channel, see processNotification. It sat in the "short acks"
+//                 bucket below until 2026-08-07, when a capture put one of its values next to the
+//                 LG cloud's own push for the same instant
 //
 //   0xD8   164x   one byte that follows the power state, sent unprompted. NOT used: it leads the
 //                 state record by 16 s in one measured transition and trails it by 31 s in another
@@ -45,9 +48,9 @@ import log from '@/util/logging'
 //                 already published from frames that arrive sooner, except the as-selected options
 //   0x31    11x   99 bytes, every byte identical in all eleven. A fixed declaration of something
 //   0x88     2x   37 bytes, likewise constant
-//   0x00   696x / 0xC3 286x / 0x7F 235x / 0x72 23x / 0x19 20x
+//   0x00   696x / 0xC3 286x / 0x7F 235x / 0x19 20x
 //                 short acks and handshake bytes. 0xC3 and 0x19 never vary at all; 0x7F carries
-//                 one byte that is only ever 3 or 4, 0x72 two that are {0,1} and {0,145,200,201}
+//                 one byte that is only ever 3 or 4
 //
 // TUNNEL (0x0A). payload = 00 <id16> 00 01 <flag> <inner> <innerlen16> 00 <data>
 //   inner 0x03  6 or 17 bytes  heartbeat, ~1.5 s, only while powered on
@@ -148,6 +151,22 @@ const RESERVE_STEP_MINUTES = 30
 const OFF_COURSE_EXT = 22 // key 0x0B
 const OFF_PHASE = 20
 const OFF_PHASE_PREV = 21
+/*
+ * The error code, and the last of the record's forty always-zero bytes to be identified. It was found
+ * the way this file's comments keep saying is the only way: by making a labelled error happen.
+ *
+ * 2026-08-07, the owner tried to start a cycle with the door open. This byte read 20 in exactly one
+ * record and was back to 0 in the next one seventeen seconds later - and 20 is what LG's own model
+ * JSON calls DE1, "문 안닫힘". The cloud agreed from the other side, firing `door_open_error` 1.7 s
+ * after our record. Two independent names for one byte, neither derived from the other.
+ *
+ * How hard that is to have got wrong: this byte was replayed across all seven washer captures, 903
+ * records. 902 of them are zero, and the single exception is the labelled one.
+ *
+ * It is the same relationship the phase byte has with `MonitoringValue.state` - the value IS the
+ * index into LG's declared enum - which is what licenses naming the other codes in ERROR below.
+ */
+const OFF_ERROR = 18
 const OFF_CYCLES = 27
 const OFF_BEEP = 28
 const OFF_FLAGS = 36
@@ -308,6 +327,98 @@ const STATUS: Record<number, string> = {
     49: 'end_waiting',
 }
 const STATUS_OPTIONS = [...new Set(Object.values(STATUS))].concat('unknown')
+
+// ---------------------------------------------------------------------------------------------------
+// NOTIFICATIONS. 0x72 is a five-byte frame - `20 72 <a> <b> <c>` - that the appliance sends at moments
+// rather than continuously, and it is the only thing here that is an EVENT rather than a state.
+//
+// It was circumstantial for three days: three captures had `00 00 00` arriving 30-46 s before a cycle
+// completed, which is suggestive and proves nothing. What settled it was putting the wire and the LG
+// cloud's own push on one clock (2026-08-07, washer-notify-20260807.jsonl, capture running 3.52 s
+// ahead of Home Assistant - measured over seven phase transitions, spread 26 ms):
+//
+//   15:15:17.61   wire     20 72 00 00 00
+//   15:15:19.465  cloud    washing_is_complete                +1.86 s
+//   15:15:48.426  ours     phase -> 42                        +30.8 s
+//
+//   15:21:59.32   wire     20 72 00 64 03 00 00 00
+//   15:22:00.671  cloud    error_during_washing               +1.36 s
+//
+// The ORDER is the argument. Appliance, then bridge, then LG's cloud, then the push - our frame leads
+// the cloud's own word for the same event by under two seconds, twice. Had it trailed, this would be
+// us reading LG's mail rather than the appliance's.
+//
+// Only these two values are published. `b` is also seen as 145, 200 and 201, and none of those has
+// ever had a label put on it: 200/201 were assumed to be the door opening and closing until the owner
+// opened and closed it three times in a capture and not one 0x72 appeared - the appliance was sending
+// 108 other frames in that window, so it was not silence. This appliance reports the door LOCK and
+// nothing else, and an entity for a signal nobody has identified would be an invented one.
+//
+// `a` is 0 in both measured frames and is required to be. The one documented frame with a = 1 carries
+// b = 145, so the pair moves together and matching on b alone would be reading half a field.
+const MSG_NOTIFY = 0x72
+const NOTIFY_COMPLETE = 0x00
+const NOTIFY_ERROR = 0x64
+const NOTIFICATION: Record<number, string> = {
+    [NOTIFY_COMPLETE]: 'washing_is_complete',
+    [NOTIFY_ERROR]: 'error_during_washing',
+}
+const NOTIFICATION_OPTIONS = [...new Set(Object.values(NOTIFICATION))]
+
+/*
+ * Error codes, indexed by OFF_ERROR into LG's declared `MonitoringValue.error` - the same
+ * value-is-the-index relationship the phase byte has, and the reason a single measured code licenses
+ * naming the rest.
+ *
+ * The NAMES are the official integration's, not ours, for the reason the status vocabulary is
+ * (see above STATUS): this appliance is visible through both, and two names for one fault is worse
+ * than either name. That mapping is not a stretch - the official declares exactly nine error types,
+ * and exactly nine of LG's declared codes have an unambiguous counterpart, nine for nine:
+ *
+ *   2  IE   급수 안됨          water_supply_error
+ *   3  OE   배수 안됨          water_drain_error
+ *   4  UE   탈수 안됨          out_of_balance_error
+ *   5  FE   물높이 높음        overfill_error
+ *   7  PE   물높이 감지 안됨   water_level_sensor_error
+ *   8  TE   온도 감지 안됨     temperature_sensor_error
+ *   9  LE   모터 회전 이상     locked_motor_error
+ *   20 DE1  문 안닫힘          door_open_error            <- the measured one
+ *   21 DE2  문 안잠김          unable_to_lock_error
+ *
+ * The remaining ten have no official counterpart, so they keep LG's own code as their name rather
+ * than a description invented here. A code the JSON does not declare publishes `unknown_error`,
+ * which exists for the same reason `unknown` does in STATUS: an event_type that is not in the
+ * declared list is dropped by Home Assistant, so the fallback has to be declared too.
+ *
+ * ONE of these twenty has been observed. The other nineteen are named, not measured - which is the
+ * safe half of what the model JSON can be used for, and phase 41 is in this file as the standing
+ * reminder of the other half.
+ */
+const ERROR: Record<number, string> = {
+    2: 'water_supply_error',
+    3: 'water_drain_error',
+    4: 'out_of_balance_error',
+    5: 'overfill_error',
+    7: 'water_level_sensor_error',
+    8: 'temperature_sensor_error',
+    9: 'locked_motor_error',
+    20: 'door_open_error',
+    21: 'unable_to_lock_error',
+    // Declared by LG, no official name to match - so LG's code is the name.
+    13: 'ff_error', // 동결 감지
+    23: 'vs_error', // 진동 센서 이상
+    43: 'ed1_error', // 세제 저장통 점검
+    44: 'ed2_error', // 세제 투입 안됨
+    45: 'ed3_error', // 유연제 저장통 점검
+    46: 'ed4_error', // 유연제 투입 안됨
+    47: 'ed5_error', // 세제통 이상
+    48: 'ts_error', // 탁도 감지 안됨
+    51: 'e1_error', // 스팀 동작 안됨
+    52: 'e4_error', // 스팀 동작 안됨
+}
+const ERROR_UNKNOWN = 'unknown_error'
+const ERROR_OPTIONS = [...new Set(Object.values(ERROR))].concat(ERROR_UNKNOWN)
+const ERROR_NONE = 0
 
 // Remaining/total time only mean anything while a wash is under way. At PHASE_DONE the counter stops at
 // 1 minute rather than reaching 0, and Laundry care leaves the previous cycle's values untouched - both
@@ -989,6 +1100,27 @@ export default class Device extends AABBDevice {
                     name: 'Laundry care when done',
                     icon: 'mdi:tumble-dryer',
                 },
+                // The two moments this appliance announces, as opposed to the state it reports
+                // continuously. `event` rather than `sensor` because both are instants: the
+                // completion frame arrives once per cycle and the error byte is gone from the
+                // record seventeen seconds later, and an entity that holds the timestamp of the
+                // last one is exactly the right shape for that.
+                notification: {
+                    platform: 'event',
+                    unique_id: '$deviceid-notification',
+                    state_topic: '$this/notification',
+                    event_types: NOTIFICATION_OPTIONS,
+                    name: 'Notification',
+                    icon: 'mdi:bell-ring-outline',
+                },
+                error: {
+                    platform: 'event',
+                    unique_id: '$deviceid-error',
+                    state_topic: '$this/error',
+                    event_types: ERROR_OPTIONS,
+                    name: 'Error',
+                    icon: 'mdi:alert-circle-outline',
+                },
             },
         })
 
@@ -1036,6 +1168,39 @@ export default class Device extends AABBDevice {
         super.drop()
     }
 
+    /**
+     * Events do not go through publishProperty, and both of that path's habits are the reason.
+     *
+     * It DEDUPES - a value equal to the last one published is dropped - which is right for state and
+     * fatal here: the second `washing_is_complete` of the day is the same string as the first, and
+     * would never be sent. And it RETAINS, which would leave a finished cycle sitting on the broker
+     * to be replayed at every reconnect. Home Assistant discards replayed retained messages on an
+     * event entity, so retaining buys nothing and costs a stale payload that outlives the event.
+     *
+     * The payload is JSON because that is what the MQTT event platform reads; `event_type` has to be
+     * one of the types declared in the discovery config or Home Assistant drops the message, which is
+     * why both lists above carry a fallback.
+     */
+    publishEvent(topic: string, eventType: string) {
+        this.HA.publishProperty(this.id, topic, JSON.stringify({ event_type: eventType }), { retain: false })
+    }
+
+    /**
+     * The notification channel - see NOTIFICATION. Two bytes are read and both have to match: a
+     * frame is only a notification we can name if `a` is 0 and `b` is one of the two values that
+     * were measured against the cloud's own push.
+     *
+     * Anything else is left alone rather than published as "unknown". An unnamed status has to
+     * publish something because the sensor always holds a value, but an event that nobody can name
+     * is better not fired at all - it would put a timestamp on the dashboard that means nothing.
+     */
+    processNotification(payload: Buffer) {
+        if (payload.length < 2 || payload[0] !== 0) return
+        const name = NOTIFICATION[payload[1]]
+        if (name === undefined) return
+        this.publishEvent('notification', name)
+    }
+
     processAABB(buf: Buffer) {
         if (buf[0] !== FROM_DEVICE || buf.length < 4) return
 
@@ -1063,6 +1228,8 @@ export default class Device extends AABBDevice {
             this.processRecord(payload.subarray(start, start + RECORD_LEN))
         } else if (type === MSG_COURSE_TABLE) {
             this.processCourseTable(payload)
+        } else if (type === MSG_NOTIFY) {
+            this.processNotification(payload)
         } else if (type === MSG_ENERGY && buf.length === ENERGY_LEN) {
             /*
              * Read from `buf`, NOT from `payload`. The extended-length test above is a heuristic -
@@ -1178,9 +1345,28 @@ export default class Device extends AABBDevice {
         // Kept before lastRecord is overwritten: the finish timestamp latches on the MOVE into
         // Complete, not on being in it, and every frame afterwards repeats the same phase.
         const previousPhase = this.lastRecord?.[OFF_PHASE]
+        const previousError = this.lastRecord?.[OFF_ERROR]
         this.lastRecord = rec
         const phase = rec[OFF_PHASE]
         const flags = rec[OFF_FLAGS]
+
+        /*
+         * On the MOVE into a fault, not on every record that reports one, for the same reason the
+         * finish time latches on the move into Complete: the entity's state IS the instant it
+         * happened, and re-firing would drag that timestamp along with now. A fault that clears and
+         * comes back fires again, because previousError has gone through 0 in between - and one
+         * fault code replacing another fires too, because that is a second thing going wrong.
+         *
+         * A record that ALREADY carries a fault when the first one arrives is deliberately not
+         * fired, which is the same call made for Complete: that instant is the reconnect, not the
+         * fault. It costs a fault that began while rethink was away, and the measured behaviour
+         * says that window is small - the one error seen here was gone from the record within
+         * seventeen seconds.
+         */
+        const error = rec[OFF_ERROR]
+        if (error !== ERROR_NONE && previousError !== undefined && error !== previousError) {
+            this.publishEvent('error', ERROR[error] ?? ERROR_UNKNOWN)
+        }
 
         this.publishProperty('power', phase === PHASE_OFF ? 'OFF' : 'ON')
         // Lower case: this sensor declares device_class 'enum', and Home Assistant rejects a state that
