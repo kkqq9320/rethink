@@ -745,8 +745,8 @@ describe('FX___S entity names', () => {
 describe('FX___S status names follow the appliance, aligned against LG on one clock', () => {
     // Every pair below was measured, not chosen: our phase byte and the LG cloud's own status for this
     // appliance were laid on one timeline across three washes (2026-07-30 from the capture, two more on
-    // 2026-08-03 from Home Assistant's recorder) and each of our transitions had exactly one cloud
-    // transition beside it. See the table above STATUS in the handler.
+    // 2026-08-03 from Home Assistant's recorder) and a tub clean on 2026-08-07, and each of our
+    // transitions had exactly one cloud transition beside it. See the table above STATUS in the handler.
     const MEASURED: [number, string][] = [
         [0, 'power_off'],
         [1, 'initial'],
@@ -757,6 +757,9 @@ describe('FX___S status names follow the appliance, aligned against LG on one cl
         [40, 'detecting'], // the appliance re-senses mid-wash; this is not a second name for washing
         [12, 'rinsing'],
         [14, 'spinning'],
+        // The JSON calls it TUB_CLEANING and this handler published that until the appliance first
+        // reached it. The cloud says `running`, and has no finer word to offer.
+        [41, 'running'],
         [42, 'end'],
         [47, 'refreshing'],
     ]
@@ -940,7 +943,7 @@ describe('FX___S finish time does not wobble while the appliance revises its own
 
 describe('FX___S names every state its own maker declares', () => {
     // LG's model JSON for this appliance declares 33 states, each with an index, and the index is this
-    // byte: every one of the eleven values measured here is declared at exactly the number measured,
+    // byte: every one of the twelve values measured here is declared at exactly the number measured,
     // which is what licenses using the rest of that list for states this appliance has not reached.
     const DECLARED = [
         0, 1, 2, 3, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 21, 23, 27, 28, 29, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43,
@@ -1471,5 +1474,55 @@ describe('FX___S the operation buttons say when they can be used', () => {
             )
             assert.equal(comp.availability_mode, 'all')
         }
+    })
+})
+
+describe('FX___S a tub clean is a running cycle', () => {
+    // 2026-08-07, the first time this appliance ever reached phase 41 - 통살균, 84 minutes. It had a
+    // name taken from the model JSON and a place in none of the phase sets, and all of that showed at
+    // once: a status the official integration has no word for, `running` off while the machine drew
+    // 1.8 kW, no remaining time, a finish time still holding the previous day's cycle, Pause greyed
+    // out - and Start offered in the middle of a running cycle.
+    //
+    // The numbers below are that run: our byte went 1 -> 41 at 12:47:48.667 and the cloud went
+    // initial -> running at 12:47:49.512, and both integrations read the total as 84.
+    const tubClean = () => {
+        const rec = Buffer.alloc(66)
+        rec[20] = 41
+        rec[36] = 0x10 // remote control on, as it was
+        rec[12] = 1
+        rec[13] = 22 // 82 minutes left, which is where the cloud put the finish
+        rec[14] = 1
+        rec[15] = 24 // of 84
+        return rec
+    }
+
+    test('it is called what the cloud calls it, and the appliance is working', () => {
+        const { HA, dut } = setup()
+        dut.processRecord(tubClean())
+        assert.equal(get(HA, 'status'), 'running')
+        // The raw byte still tells 41 apart from 11 for anyone who needs to.
+        assert.equal(get(HA, 'status_code'), 41)
+        assert.equal(get(HA, 'running'), 'ON')
+    })
+
+    test('its clock is live, so the finish time is this cycle and not the last one', () => {
+        const { HA, dut } = setup()
+        const before = Date.now()
+        dut.processRecord(tubClean())
+        assert.equal(get(HA, 'remaining_time'), 82)
+        assert.equal(get(HA, 'total_time'), 84)
+        const at = Date.parse(String(get(HA, 'end_time')))
+        assert.ok(at >= before + 82 * 60_000 - 60_000, 'about 82 minutes out')
+        assert.ok(at <= Date.now() + 82 * 60_000 + 60_000)
+    })
+
+    test('it offers pause, and does not offer start', () => {
+        const { HA, dut } = setup()
+        dut.processRecord(tubClean())
+        assert.equal(get(HA, 'pause-availability'), 'online')
+        // The one that was actually dangerous: start was live for the whole of the cycle.
+        assert.equal(get(HA, 'start-availability'), 'offline')
+        assert.equal(get(HA, 'resume-availability'), 'offline')
     })
 })

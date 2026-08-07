@@ -217,21 +217,23 @@ const GATED_BUTTONS = ['start', 'pause', 'resume']
 // Phase codes, named as LG names them. Every one of these was pinned by laying our phase byte and the
 // LG cloud's own status for the same appliance on one clock, across three washes - 2026-07-30 (the
 // capture, aligned to the cloud's history for those minutes) and two on 2026-08-03 (both timelines
-// straight out of Home Assistant's recorder). Each of our transitions has exactly one cloud transition
-// beside it, and where two of our codes carry the same name the cloud does not move at all, which is
-// what makes the pairing 1:1 rather than a guess:
+// straight out of Home Assistant's recorder) - and, later, one tub clean on 2026-08-07, the run that
+// produced a twelfth code. Each of our transitions has exactly one cloud transition beside it, and
+// where two of our codes carry the same name the cloud does not move at all, which is what makes the
+// pairing 1:1 rather than a guess:
 //
 //   ours       LG           evidence
-//   0          power_off    all three
-//   1          initial      all three
+//   0          power_off    all three washes
+//   1          initial      all three washes
 //   2          pause        7/30, twice; the second matched to 0.5 s
 //   3          detecting    7/30, matched to 0.02 s
 //   37         detecting    7/30 and 8/03; no cloud transition, it was already detecting
-//   11         running      all three, five times
-//   40         detecting    all three, five times - the appliance re-senses mid-wash
-//   12         rinsing      all three
-//   14         spinning     all three
-//   42         end          all three
+//   11         running      all three washes, five times
+//   40         detecting    all three washes, five times - the appliance re-senses mid-wash
+//   12         rinsing      all three washes
+//   14         spinning     all three washes
+//   41         running      8/07, matched to 0.85 s - the same run's 0 -> 1 matched to 1.0 s
+//   42         end          all three washes
 //   47         refreshing   7/30, twice
 //
 // The 7/30 capture's clock runs 13 s ahead of Home Assistant's, which shows up as a CONSTANT offset -
@@ -243,9 +245,9 @@ const GATED_BUTTONS = ['start', 'pause', 'resume']
 // the official integration, and two names for one stage is worse than either name.
 //
 // LG's own model JSON for this appliance settles the rest. Its `MonitoringValue.state` declares 33
-// states with an index each, and THE INDEX IS THIS BYTE: all eleven values ever measured here are
+// states with an index each, and THE INDEX IS THIS BYTE: all twelve values ever measured here are
 // declared, at exactly the number we measured, including the two that were pinned only by the clock
-// alignment above (3 = DETECTING, 11 = RUNNING). Eleven of eleven, from a source that has no idea what
+// alignment above (3 = DETECTING, 11 = RUNNING). Twelve of twelve, from a source that has no idea what
 // we captured.
 //
 // So the values below that were never observed come from that declaration rather than from a guess,
@@ -259,7 +261,15 @@ const GATED_BUTTONS = ['start', 'pause', 'resume']
 // Where the JSON is finer than the cloud, the cloud's coarser word is kept, because matching the
 // official integration is the whole point of this vocabulary: 37 is CLOTHING_RECOGNITION and 40 is
 // POLLUTION_DETECTING, and the cloud reports both as `detecting`. 42 is END_REMOTE_MAINTAIN_ON and
-// 47 is LAUNDRYCARE, reported as `end` and `refreshing`.
+// 47 is LAUNDRYCARE, reported as `end` and `refreshing`. 41 is TUB_CLEANING, reported as `running` -
+// and that last one is not a choice between two words. The official integration's `options` list has
+// 22 entries and `tub_cleaning` is not one of them, so there is no cloud vocabulary for it at all.
+//
+// 41 is also the warning this list carries. It was named TUB_CLEANING from the JSON alone and never
+// checked against the cloud, because it had never been seen - and it is the one name here that turned
+// out wrong the first time the appliance reached it (2026-08-07, a 통살균 run). Taking a NAME from the
+// JSON is safe. Taking a MEANING from it is not, and the two phase sets below are where that bit:
+// 41 was missing from both of them for exactly as long as it was misnamed.
 const STATUS: Record<number, string> = {
     [PHASE_OFF]: 'power_off',
     [PHASE_STANDBY]: 'initial',
@@ -270,6 +280,8 @@ const STATUS: Record<number, string> = {
     40: 'detecting',
     12: 'rinsing',
     14: 'spinning',
+    // TUB_CLEANING in the JSON. The cloud says `running`, measured - see above.
+    41: 'running',
     [PHASE_DONE]: 'end',
     [PHASE_CARE]: 'refreshing',
     // Declared by the model JSON, never seen on this appliance.
@@ -291,7 +303,6 @@ const STATUS: Record<number, string> = {
     36: 'confirm_start_for_control',
     38: 'detergent_input',
     39: 'softener_input',
-    41: 'tub_cleaning',
     43: 'steam',
     48: 'ezdispense_cleaning',
     49: 'end_waiting',
@@ -301,11 +312,28 @@ const STATUS_OPTIONS = [...new Set(Object.values(STATUS))].concat('unknown')
 // Remaining/total time only mean anything while a wash is under way. At PHASE_DONE the counter stops at
 // 1 minute rather than reaching 0, and Laundry care leaves the previous cycle's values untouched - both
 // would otherwise show a permanent "1 minute left" in Home Assistant.
-const TIMED_PHASES = new Set([3, 37, 11, 40, 12, 14, PHASE_PAUSED])
+//
+// 41 (a tub clean) was missing here, which zeroed the remaining minutes for the whole of one and left
+// the finish time latched at the PREVIOUS cycle's, a day stale - `end_time` is fed from this same
+// number, so one omission took out both entities. The bytes are live in 41: on 2026-08-07 the total
+// read 84 minutes and the cloud put the finish 82 minutes out, one second apart.
+const TIMED_PHASES = new Set([3, 37, 11, 40, 12, 14, 41, PHASE_PAUSED])
 
 // Phases in which the appliance is actually working. Paused is deliberately excluded - `status` already
 // says Paused, and a "Running" sensor that stays on through a pause is no use in an automation.
-const ACTIVE_PHASES = new Set([3, 37, 11, 40, 12, 14, PHASE_CARE])
+//
+// This set is also the gate on the operation buttons - see updateButtonAvailability - so a working
+// phase missing from it does not merely mislabel the appliance. It greys out Pause, and it OFFERS
+// START in the middle of a running cycle. That is what 41 did on 2026-08-07, for 84 minutes.
+//
+// KNOWN GAP, deliberately not closed: every phase the model JSON declares that this appliance has not
+// reached yet is absent from both sets, and each would behave exactly as 41 did the first time it
+// appears - 8 SOAK, 9 PREWASH, 13 RINSEHOLD, 15 DRYING, 43 STEAM and 48 EZDISPENSE_CLEANING are the
+// plausible ones. They are NOT added on the strength of one observation of a different code: whether
+// this appliance can reach them, and whether it is working in them, is not something the JSON says,
+// and inverting these sets so that an unmeasured phase defaults to "working" would turn one
+// measurement into a law about twenty-one unmeasured states. Add a phase when it is first measured.
+const ACTIVE_PHASES = new Set([3, 37, 11, 40, 12, 14, 41, PHASE_CARE])
 
 // Phases in which no cycle is under way any more, so `current_course` reads as a leftover rather than as
 // information - the course byte itself survives the cycle, the finished state and being powered off.
