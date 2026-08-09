@@ -1345,6 +1345,100 @@ describe('FX___S two settings of the appliance rather than of a cycle', () => {
     })
 })
 
+describe('FX___S the cycle options are a setting and a reading, not one entity doing both', () => {
+    // Byte 33 bit 0x20 is TurboShot, byte 34 bit 0x10 is steam, byte 46 bit 0x08 is laundry care.
+    function record(phase: number, { turbo = false, steam = false, care = false } = {}) {
+        const rec = Buffer.alloc(66)
+        rec[20] = phase
+        rec[4] = 0x2e
+        if (turbo) rec[33] = 0x20
+        if (steam) rec[34] = 0x10
+        rec[46] = care ? 0x0c : 0x04 // 0x04 is the constant this byte always carries
+        return rec
+    }
+
+    test('the switches take the selection from standby', () => {
+        const { HA, dut } = setup()
+        dut.processRecord(record(1, { turbo: true, steam: true }))
+        assert.equal(get(HA, 'turbowash'), 'ON')
+        assert.equal(get(HA, 'steam'), 'ON')
+    })
+
+    test('and hold it when the appliance zeroes the bytes at the end of the cycle', () => {
+        const { HA, dut } = setup()
+        dut.processRecord(record(1, { turbo: true }))
+        assert.equal(get(HA, 'turbowash'), 'ON')
+
+        // Measured in both full cycles on disk: the option bytes survive every working phase and are
+        // zeroed on the move into Complete. Published unconditionally this read as the appliance
+        // switching TurboShot off by itself, which is what Home Assistant's history recorded on four
+        // separate cycles.
+        dut.processRecord(record(11, { turbo: true }))
+        assert.equal(get(HA, 'turbowash'), 'ON')
+        dut.processRecord(record(42))
+        assert.equal(get(HA, 'turbowash'), 'ON')
+        dut.processRecord(record(0))
+        assert.equal(get(HA, 'turbowash'), 'ON')
+
+        // The next standby is the next selection, and it is followed.
+        dut.processRecord(record(1))
+        assert.equal(get(HA, 'turbowash'), 'OFF')
+    })
+
+    test('the sensors answer the other question: what is this cycle running with', () => {
+        const { HA, dut } = setup()
+        dut.processRecord(record(1, { turbo: true, steam: true }))
+        // Nothing is under way at standby, so they say so rather than repeating the switches.
+        assert.equal(get(HA, 'turbowash_active'), 'OFF')
+        assert.equal(get(HA, 'steam_active'), 'OFF')
+
+        dut.processRecord(record(11, { turbo: true, steam: true }))
+        assert.equal(get(HA, 'turbowash_active'), 'ON')
+        assert.equal(get(HA, 'steam_active'), 'ON')
+
+        // Still mid-cycle: a pause is excluded from `running` on purpose, but the cycle is unchanged.
+        dut.processRecord(record(2, { turbo: true, steam: true }))
+        assert.equal(get(HA, 'running'), 'OFF')
+        assert.equal(get(HA, 'turbowash_active'), 'ON')
+
+        dut.processRecord(record(42))
+        assert.equal(get(HA, 'turbowash_active'), 'OFF')
+        assert.equal(get(HA, 'steam_active'), 'OFF')
+    })
+
+    test('laundry care keeps its switch live, because the setting is not consumed by a cycle', () => {
+        const { HA, dut } = setup()
+        // 2026-07-30: switched on at Complete, still on through the whole of the next wash, cleared
+        // only by switching the appliance off. Gating this to standby would go stale exactly where
+        // the owner uses it.
+        dut.processRecord(record(42, { care: true }))
+        assert.equal(get(HA, 'laundry_care'), 'ON')
+        dut.processRecord(record(12, { care: true }))
+        assert.equal(get(HA, 'laundry_care'), 'ON')
+        dut.processRecord(record(0))
+        assert.equal(get(HA, 'laundry_care'), 'OFF')
+    })
+
+    test('and takes its running state from the phase, which is the appliance own word', () => {
+        const { HA, dut } = setup()
+        dut.processRecord(record(42, { care: true }))
+        assert.equal(get(HA, 'laundry_care_active'), 'OFF')
+        // 47 is LG's LAUNDRYCARE, the state the cloud reports as `refreshing`.
+        dut.processRecord(record(47, { care: true }))
+        assert.equal(get(HA, 'laundry_care_active'), 'ON')
+        dut.processRecord(record(0))
+        assert.equal(get(HA, 'laundry_care_active'), 'OFF')
+    })
+
+    test('the switches still write the same two keys', () => {
+        const { thinq, dut } = setup()
+        dut.setProperty('steam', 'ON')
+        dut.setProperty('turbowash', 'ON')
+        assert.equal(hex(thinq.outbox[0]), hex(buf('aa0df0e5000201ff013e019bbb')))
+        assert.equal(hex(thinq.outbox[1]), hex(buf('aa0df0e5000201ff01350190bb')))
+    })
+})
+
 describe('FX___S course names in the configured language', () => {
     function setupIn(language?: string) {
         const HA = new MockHAConnection()
@@ -1361,14 +1455,51 @@ describe('FX___S course names in the configured language', () => {
 
         const { HA: ko, thinq: tk } = setupIn('ko')
         feed(tk, STANDBY)
-        assert.equal(get(ko, 'current_course'), '인공지능 세탁')
+        // Without the space LG's own model JSON puts in it - the owner's word, since it is their panel.
+        assert.equal(get(ko, 'current_course'), '인공지능세탁')
+    })
+
+    test('the wash scale is named in that language too, and only that one', () => {
+        const { HA: en, thinq: te } = setupIn()
+        feed(te, STANDBY)
+        assert.equal(get(en, 'wash'), 'normal')
+
+        const { HA: ko, thinq: tk } = setupIn('ko')
+        feed(tk, STANDBY)
+        assert.equal(get(ko, 'wash'), '표준')
+        assert.deepEqual((ko.devices[DEVICE_ID].config!.components.wash as { options?: string[] }).options, [
+            '안함',
+            '적은 때',
+            '표준',
+            '강력',
+            '애벌',
+            '불림',
+        ])
+        // The advisory attributes speak the same vocabulary, or the sensor would name values the
+        // select does not offer. AI Wash allows two of the six.
+        assert.deepEqual(JSON.parse(String(get(ko, 'available_options_attrs'))).wash, ['표준', '불림'])
+        // Untouched: the owner asked for the wash scale, and each of these would change an entity
+        // state that automations may compare against.
+        assert.equal(get(ko, 'spin'), 'high')
+        assert.equal(get(ko, 'water_temp'), '40')
+        assert.equal(get(ko, 'beep'), 'very_high')
+    })
+
+    test('a wash write takes either vocabulary, so an automation setting the old name survives', () => {
+        for (const language of [undefined, 'ko']) {
+            for (const name of ['normal', '표준']) {
+                const { thinq, dut } = setupIn(language)
+                dut.setProperty('wash', name)
+                assert.equal(hex(thinq.outbox[0]), hex(buf('aa0df0e5000201ff011e03e5bb')), `${language} <- ${name}`)
+            }
+        }
     })
 
     test('the dial the appliance declares is named in that language too', () => {
         const { HA, thinq } = setupIn('ko')
         feed(thinq, COURSE_TABLE)
         assert.deepEqual(courseOptions(HA), [
-            '인공지능 세탁',
+            '인공지능세탁',
             '울/섬세',
             '표준',
             '표준1',
@@ -1379,6 +1510,12 @@ describe('FX___S course names in the configured language', () => {
             '헹굼+탈수',
             '급속통헹굼',
         ])
+    })
+
+    test('the course renamed on 2026-08-09 still answers to the spelling it had', () => {
+        const { thinq, dut } = setupIn('ko')
+        dut.setProperty('course', '인공지능 세탁')
+        assert.equal(hex(thinq.outbox[0]), hex(buf('aa0df0e5000201ff010a725ebb')))
     })
 
     test('a write takes any name this handler knows, in either language and the old ones', () => {

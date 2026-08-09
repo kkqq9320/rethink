@@ -446,6 +446,16 @@ const TIMED_PHASES = new Set([3, 37, 11, 40, 12, 14, 41, PHASE_PAUSED])
 // measurement into a law about twenty-one unmeasured states. Add a phase when it is first measured.
 const ACTIVE_PHASES = new Set([3, 37, 11, 40, 12, 14, 41, PHASE_CARE])
 
+// A cycle is under way - the working phases plus Paused. It is deliberately NOT the same set as
+// ACTIVE_PHASES: `running` excludes a pause because an automation asking "is the washer running"
+// wants no, while one asking "is this cycle using steam" still wants yes, since the cycle has not
+// gone anywhere and will resume with the same options. Used by the two "is this cycle running with
+// it" sensors below, and it carries ACTIVE_PHASES' caveat with it - which phases count as working
+// is this handler's judgement, not something the appliance declares. So `steam_active` and
+// `turbowash_active` are LOCAL ONLY for the same reason `running` is, and go the same way at PR
+// time; `laundry_care_active` is not, because LG's own phase 47 is what it reads.
+const CYCLE_PHASES = new Set([...ACTIVE_PHASES, PHASE_PAUSED])
+
 // Phases in which no cycle is under way any more, so `current_course` reads as a leftover rather than as
 // information - the course byte itself survives the cycle, the finished state and being powered off.
 //
@@ -621,7 +631,10 @@ const COURSE_KO: Record<number, string> = {
     0x6c: '셔츠',
     0x6d: '한벌 세탁',
     0x71: '땀얼룩 제거',
-    0x72: '인공지능 세탁',
+    // LG's own `_comment` for AI_COURSE writes this with a space; the owner asked for it without one,
+    // which is how the appliance's panel reads. Their appliance, their word - and the old spelling is
+    // still accepted as a write below.
+    0x72: '인공지능세탁',
     // Ours, from the panel - LG declares none of these for this model.
     0x54: '타월',
     0x87: '쾌속스팀살균',
@@ -658,6 +671,24 @@ const WASH: Record<number, string> = {
     0x07: 'soak',
 }
 
+// The same scale in the words the panel prints, published when homeassistant.language is "ko" - the
+// same mechanism and the same reason as COURSE_KO, and it has to be done here for the same reason:
+// Home Assistant cannot translate the STATE of an entity created by MQTT discovery.
+//
+// These are the owner's own readings, from the sweep that produced the English names beside them -
+// each control stepped through a full cycle with the displayed name written down in order, ending
+// where it started so the alignment checks itself. LG's model JSON cannot supply them: its
+// `soilWash` valueMapping carries the indices this handler already agrees with (0/1/3/5/6/7) and
+// then only translation keys - `@WM_MP_FX___S_OPTION_SOILLEVEL_LIGHT_W` and so on - never the text.
+const WASH_KO: Record<number, string> = {
+    0x00: '안함',
+    0x01: '적은 때',
+    0x03: '표준',
+    0x05: '강력',
+    0x06: '애벌',
+    0x07: '불림',
+}
+
 // The gaps (0x03, 0x05, 0x07) are unused rather than unobserved - the dial steps straight over them.
 const SPIN: Record<number, string> = {
     0x00: 'none',
@@ -674,7 +705,10 @@ const RINSE = [0, 1, 2, 3, 4, 5]
 function invert(map: Record<number, string>): Record<string, number> {
     return Object.fromEntries(Object.entries(map).map(([k, v]) => [v, Number(k)]))
 }
-const WASH_BY_NAME = invert(WASH)
+// Both vocabularies at once, for the reason LEGACY_COURSE_NAMES exists a few lines below: a command
+// is unambiguous - two names cannot mean two different wash levels - so an automation that sets
+// 'normal' keeps working after the entity starts publishing '표준'.
+const WASH_BY_NAME = { ...invert(WASH), ...invert(WASH_KO) }
 const WATER_TEMP_BY_NAME = invert(WATER_TEMP)
 const SPIN_BY_NAME = invert(SPIN)
 const BEEP_BY_NAME = invert(BEEP)
@@ -684,6 +718,8 @@ const BEEP_BY_NAME = invert(BEEP)
 // publishes these, and they can go once this owner's automations no longer mention them.
 const LEGACY_COURSE_NAMES: Record<string, number> = {
     'AI Wash': 0x72,
+    // The spelling this handler published in Korean until 2026-08-09, and LG's own.
+    '인공지능 세탁': 0x72,
     'Wool / Delicates': 0x5e,
     Normal: 0x2e,
     'Tub Clean': 0x55,
@@ -717,7 +753,16 @@ export default class Device extends AABBDevice {
      */
     remoteControl = false
 
-    /** Last state record seen, so an extended-course write can carry the options along with it. */
+    /**
+     * Last state record seen, so an extended-course write can carry the options along with it.
+     *
+     * KNOWN AND NOT FIXED HERE: the appliance zeroes every option byte on the move into Complete, so
+     * a write built from this record while it sits there sends wash / temperature / rinse / spin /
+     * TurboShot / steam as zero rather than as the selection. That predates the switches moving to a
+     * standby-only publish below and applies to six fields, not the two - latching only those two
+     * would leave the two halves of one write disagreeing. Fixing it means latching the whole
+     * selection, which is its own change.
+     */
     lastRecord: Buffer | undefined
 
     /**
@@ -745,6 +790,8 @@ export default class Device extends AABBDevice {
     /** Chosen once from homeassistant.language; see COURSE_KO. Writes accept every name regardless. */
     readonly courseNames: Record<number, string>
     readonly courseExtNames: Record<number, string>
+    /** Likewise for the wash-level scale; see WASH_KO. */
+    readonly washNames: Record<number, string>
 
     constructor(HA: Connection, thinq: Thinq2Device, meta: Metadata) {
         super(HA, thinq)
@@ -753,6 +800,7 @@ export default class Device extends AABBDevice {
         const korean = HA.config?.language === 'ko'
         this.courseNames = korean ? COURSE_KO : COURSE
         this.courseExtNames = korean ? COURSE_EXT_KO : COURSE_EXT
+        this.washNames = korean ? WASH_KO : WASH
         this.courseOptions = [...Object.values(this.courseNames), ...Object.values(this.courseExtNames)]
         // Annotated because allowExtendedType infers its result from the assignment target: with
         // nothing to infer from it would come out `unknown`.
@@ -861,6 +909,37 @@ export default class Device extends AABBDevice {
                     state_topic: '$this/wrinkle_care',
                     name: 'Wrinkle care',
                     icon: 'mdi:tshirt-crew',
+                },
+                // The three "is it happening now" sensors, which exist because the switches below
+                // cannot answer that question and be a setting at the same time. A switch has to
+                // hold what the NEXT cycle will do - that is what the owner set and what they can
+                // change - so it is published only while the appliance sits at standby. These read
+                // the same bits while the appliance works.
+                //
+                // What they can honestly claim differs by entity, so read the publish site as well:
+                // steam and TurboShot say "the cycle that is running was started with this option
+                // on", not "the appliance is injecting steam this second", which nothing in this
+                // protocol reports. Laundry care is the appliance's own word for it.
+                steam_active: {
+                    platform: 'binary_sensor',
+                    unique_id: '$deviceid-steam-active',
+                    state_topic: '$this/steam_active',
+                    name: 'Steam this cycle',
+                    icon: 'mdi:kettle-steam',
+                },
+                turbowash_active: {
+                    platform: 'binary_sensor',
+                    unique_id: '$deviceid-turbowash-active',
+                    state_topic: '$this/turbowash_active',
+                    name: 'TurboShot this cycle',
+                    icon: 'mdi:car-turbocharger',
+                },
+                laundry_care_active: {
+                    platform: 'binary_sensor',
+                    unique_id: '$deviceid-laundry-care-active',
+                    state_topic: '$this/laundry_care_active',
+                    name: 'Laundry care running',
+                    icon: 'mdi:tumble-dryer',
                 },
                 drum_active: {
                     platform: 'binary_sensor',
@@ -975,7 +1054,7 @@ export default class Device extends AABBDevice {
                     command_topic: '$this/wash/set',
                     name: 'Course - Wash',
                     icon: 'mdi:washing-machine',
-                    options: Object.values(WASH),
+                    options: Object.values(this.washNames),
                 },
                 water_temp: {
                     platform: 'select',
@@ -1390,7 +1469,40 @@ export default class Device extends AABBDevice {
         // device_class 'lock' is inverted by Home Assistant's convention: on means unlocked.
         this.publishProperty('door_lock', rec[OFF_DOOR_LOCK] ? 'OFF' : 'ON')
         this.publishProperty('wrinkle_care', rec[OFF_WRINKLE_CARE] & WRINKLE_CARE_ON ? 'ON' : 'OFF')
-        this.publishProperty('turbowash', rec[OFF_TURBOSHOT] & TURBOSHOT_ON ? 'ON' : 'OFF')
+
+        /*
+         * Whether the cycle now under way is running with steam / TurboShot. The same two bits the
+         * switches publish, read while the appliance works instead of while the owner chooses, and
+         * false outside a cycle so the pair does not say the same thing twice at standby.
+         *
+         * TurboShot is measured: across both full cycles on disk its bit holds the selected value
+         * through every working phase and is zeroed on the move into Complete
+         * (washer-cycle-20260730 15:47:56, washer-normal-20260804 14:25:27), alongside spin.
+         *
+         * Steam is NOT, and the entity is worth no more than that. Every cycle in all seven captures
+         * was run with steam off, so this bit DURING a cycle has never been observed at all - what
+         * was measured is the standby selection, toggled on the Normal course and cross-checked
+         * against Towels 1. It is published here on the assumption that it behaves like the byte
+         * beside it. The first steam wash that runs with a capture on settles it, and the check is
+         * whether this goes off before the cycle does.
+         */
+        const inCycle = CYCLE_PHASES.has(phase)
+        this.publishProperty('steam_active', inCycle && rec[OFF_STEAM] & STEAM_ON ? 'ON' : 'OFF')
+        this.publishProperty('turbowash_active', inCycle && rec[OFF_TURBOSHOT] & TURBOSHOT_ON ? 'ON' : 'OFF')
+
+        /*
+         * Laundry care is the odd one of the three and its own bit is not what says it is running.
+         *
+         * @46 bit 0x08 is the SETTING and the appliance does not consume it: on 2026-07-30 it went
+         * on at 16:09 and was still on through the whole of the next wash half an hour later, only
+         * clearing when the appliance was switched off. So the switch below keeps publishing in
+         * every phase - gating it to standby would leave it stale exactly when it is used, since
+         * the owner's own use of it is to press it while the appliance sits on Complete.
+         *
+         * What says care is RUNNING is LG's phase 47 (LAUNDRYCARE), which is the appliance's word
+         * rather than ours. Measured twice that day, with the bit set on both occasions.
+         */
+        this.publishProperty('laundry_care_active', phase === PHASE_CARE ? 'ON' : 'OFF')
         this.publishProperty('laundry_care', rec[OFF_LAUNDRY_CARE] & LAUNDRY_CARE_ON ? 'ON' : 'OFF')
         this.publishProperty('clock_when_off', rec[OFF_LAUNDRY_CARE] & CLOCK_WHEN_OFF_ON ? 'ON' : 'OFF')
         this.publishProperty('auto_optimise', rec[OFF_AUTO_OPTIMISE] & AUTO_OPTIMISE_ON ? 'ON' : 'OFF')
@@ -1403,7 +1515,6 @@ export default class Device extends AABBDevice {
         )
         this.publishProperty('cycles', String(rec[OFF_CYCLES]))
         this.publishProperty('beep', BEEP[rec[OFF_BEEP]] ?? 'unknown')
-        this.publishProperty('steam', rec[OFF_STEAM] & STEAM_ON ? 'ON' : 'OFF')
 
         // Only the wash clock counts down, so everything else would show a stale figure - and at the end
         // of a cycle the remaining-minutes byte sticks at 1 rather than reaching 0. The total is the
@@ -1504,10 +1615,29 @@ export default class Device extends AABBDevice {
         // cycle finishes, so the selects went unpublished for as long as the washer sat on Complete.
         if (phase !== PHASE_STANDBY) return
 
-        this.publishOption('wash', WASH[rec[OFF_WASH]])
+        this.publishOption('wash', this.washNames[rec[OFF_WASH]])
         this.publishOption('water_temp', WATER_TEMP[rec[OFF_WATER_TEMP]])
         this.publishOption('rinse', RINSE.includes(rec[OFF_RINSE]) ? String(rec[OFF_RINSE]) : undefined)
         this.publishOption('spin', SPIN[rec[OFF_SPIN]])
+
+        /*
+         * Steam and TurboShot belong here rather than above, and moving them is the fix for a
+         * complaint the owner made about the appliance switching an option off by itself.
+         *
+         * They are cycle options like the four above, and the appliance consumes them the same way:
+         * it zeroes TurboShot's bit on the move into Complete, measured in both full cycles on disk.
+         * Published unconditionally, that turned into Home Assistant's own record of TurboShot going
+         * on -> off at phase 42 or 16 on four separate cycles (2026-08-05 x2, 2026-08-06 x2) - the
+         * switch reporting the end of the wash as though someone had switched the option off.
+         *
+         * Standby is where the selection lives, which is the same rule and the same reason as the
+         * four selects above. Nothing is lost at phase 7: a reservation is armed FROM standby (the
+         * 2026-08-04 capture goes 1 at 18:43:44 -> 7 at 18:45:18), so the switch already holds it.
+         *
+         * What the cycle is actually running with is `steam_active` / `turbowash_active`.
+         */
+        this.publishProperty('steam', rec[OFF_STEAM] & STEAM_ON ? 'ON' : 'OFF')
+        this.publishProperty('turbowash', rec[OFF_TURBOSHOT] & TURBOSHOT_ON ? 'ON' : 'OFF')
 
         // Only four courses have been run on this appliance and the water-temperature/spin lists are
         // just as partial, so an unrecognised value is expected rather than exceptional. A select whose
@@ -1599,7 +1729,7 @@ export default class Device extends AABBDevice {
             values === null ? null : (values ?? Object.keys(map).map(Number)).map((v) => map[v] ?? String(v))
 
         const attrs = {
-            wash: named(limits.wash, WASH),
+            wash: named(limits.wash, this.washNames),
             water_temp: named(limits.water_temp, WATER_TEMP),
             rinse: limits.rinse === null ? null : (limits.rinse ?? RINSE).map(String),
             spin: named(limits.spin, SPIN),
