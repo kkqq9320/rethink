@@ -23,7 +23,10 @@ const SAMPLE_STATUS = buf(
 
 // The final door sweep (20:18:44 - 20:19:03 KST), owner-labelled in this order.
 const DOOR_FREEZER_LEFT = buf('AAFF100A002A0063170001C6260018030000000100060000010000000001000000000000000000AE6FBB')
-const DOOR_ALL_CLOSED = buf('AAFF100A002A0063180001C6260018030000000100060000000000000000000000000000000000C4A6BB')
+// A release names no door and speaks for ONE compartment - note the 0x26 / 0x25 at offset 12.
+const FREEZER_CLOSED = buf('AAFF100A002A0063180001C6260018030000000100060000000000000000000000000000000000C4A6BB')
+// 22:05:49 KST, the release after a single fridge-left opening.
+const FRIDGE_CLOSED = buf('AAFF100A002A00636D0001C6250018030000000100060000000000000000000000000000000000572ABB')
 const DOOR_FRIDGE_LEFT = buf('AAFF100A002A0063190001C6250018030000000100060001000100000000000000000000000000A660BB')
 const DOOR_FRONT = buf('AAFF100A002A00631B0001C6250018030000000100060001000000000100000000000000000000093BBB')
 // 18:33:37 and 17:40:30 - the other two panels.
@@ -70,47 +73,104 @@ describe(MODEL_ID, () => {
         assert.equal(dev.properties.beep, 'ON')
     })
 
-    test('the notification names which panel moved', () => {
-        const cases: [Buffer, string][] = [
-            [DOOR_FRIDGE_LEFT, 'Fridge left'],
-            [DOOR_FRIDGE_RIGHT, 'Fridge right'],
-            [DOOR_FRONT, 'Front'],
-            [DOOR_FREEZER_LEFT, 'Freezer left'],
-            [DOOR_FREEZER_RIGHT, 'Freezer right'],
+    test('a notification opens its own compartment and names the panel', () => {
+        const cases: [Buffer, string, string, string][] = [
+            [DOOR_FRIDGE_LEFT, 'door_fridge', 'last_door_fridge', 'Left'],
+            [DOOR_FRIDGE_RIGHT, 'door_fridge', 'last_door_fridge', 'Right'],
+            [DOOR_FRONT, 'door_fridge', 'last_door_fridge', 'Front'],
+            [DOOR_FREEZER_LEFT, 'door_freezer', 'last_door_freezer', 'Left'],
+            [DOOR_FREEZER_RIGHT, 'door_freezer', 'last_door_freezer', 'Right'],
         ]
 
-        for (const [frame, expected] of cases) {
+        for (const [frame, openProp, nameProp, expected] of cases) {
             const { ha, thinq } = makeDevice()
             thinq.emit('data', frame)
-            assert.equal(ha.devices[DEVICE_ID].properties.last_door, expected)
+            const props = ha.devices[DEVICE_ID].properties
+            assert.equal(props[openProp], 'ON', openProp)
+            assert.equal(props[nameProp], expected, nameProp)
         }
     })
 
-    test('a release keeps the name standing - it answers "last", not "open now"', () => {
+    test('a frame speaks only for the compartment it announces', () => {
         const { ha, thinq } = makeDevice()
+
         thinq.emit('data', DOOR_FRIDGE_LEFT)
-        thinq.emit('data', DOOR_ALL_CLOSED)
-        assert.equal(ha.devices[DEVICE_ID].properties.last_door, 'Fridge left')
+        thinq.emit('data', DOOR_FREEZER_RIGHT) // freezer opens while the fridge side is still open
+
+        const props = ha.devices[DEVICE_ID].properties
+        assert.equal(props.door_fridge, 'ON', 'the freezer frame must not close the fridge side')
+        assert.equal(props.door_freezer, 'ON')
+        assert.equal(props.last_door_fridge, 'Left')
+        assert.equal(props.last_door_freezer, 'Right')
     })
 
-    test('the five per-door sensors are withdrawn as bare removal stubs', () => {
+    test("the owner's four-step sequence: open left, open right, close left, close right", () => {
+        const { ha, thinq } = makeDevice()
+        const props = () => ha.devices[DEVICE_ID].properties
+
+        thinq.emit('data', DOOR_FRIDGE_LEFT) // 1. left opens - the compartment opens
+        assert.equal(props().door_fridge, 'ON')
+
+        // 2. right opens and 3. left closes: the appliance sends NOTHING, and the compartment is
+        // genuinely still open through both, so the sensor must simply hold.
+        assert.equal(props().door_fridge, 'ON')
+
+        thinq.emit('data', FRIDGE_CLOSED) // 4. right closes - the compartment closes
+        assert.equal(props().door_fridge, 'OFF')
+        assert.equal(props().last_door_fridge, 'Left', 'a release names nothing, so the name stands')
+    })
+
+    test('a freezer release does not close the fridge side', () => {
+        const { ha, thinq } = makeDevice()
+        thinq.emit('data', DOOR_FRIDGE_LEFT)
+        thinq.emit('data', DOOR_FREEZER_RIGHT)
+        thinq.emit('data', FREEZER_CLOSED)
+
+        assert.equal(ha.devices[DEVICE_ID].properties.door_freezer, 'OFF')
+        assert.equal(
+            ha.devices[DEVICE_ID].properties.door_fridge,
+            'ON',
+            'still open, and this frame never said otherwise',
+        )
+    })
+
+    test('a status saying no door is open closes both compartments', () => {
+        const { ha, thinq } = makeDevice()
+        thinq.emit('data', DOOR_FRIDGE_LEFT)
+        thinq.emit('data', DOOR_FREEZER_LEFT)
+
+        // SAMPLE_STATUS has [7]=1 in its current half - it must not close anything.
+        thinq.emit('data', SAMPLE_STATUS)
+        assert.equal(ha.devices[DEVICE_ID].properties.door_fridge, 'ON')
+        assert.equal(ha.devices[DEVICE_ID].properties.door_freezer, 'ON')
+
+        const closed = Buffer.from(SAMPLE_STATUS)
+        closed[4 + 65 + 7] = 0
+        thinq.emit('data', closed)
+        assert.equal(ha.devices[DEVICE_ID].properties.door_fridge, 'OFF')
+        assert.equal(ha.devices[DEVICE_ID].properties.door_freezer, 'OFF')
+    })
+
+    test('both withdrawn rounds ship as bare removal stubs', () => {
         const { ha } = makeDevice()
         const components = ha.devices[DEVICE_ID]?.config!.components as Record<string, Record<string, unknown>>
 
-        for (const name of [
-            'door_fridge_left',
-            'door_fridge_right',
-            'door_front',
-            'door_freezer_left',
-            'door_freezer_right',
-        ]) {
+        const expected: [string, string][] = [
+            ['door_fridge_left', 'binary_sensor'],
+            ['door_fridge_right', 'binary_sensor'],
+            ['door_front', 'binary_sensor'],
+            ['door_freezer_left', 'binary_sensor'],
+            ['door_freezer_right', 'binary_sensor'],
+            ['last_door', 'sensor'], // deployed too, so it needs a stub of its own
+        ]
+        for (const [name, platform] of expected) {
             // platform and NOTHING else - any extra key turns the removal back into a
             // registration, and omitting the key entirely leaves the old entity live forever.
-            assert.deepEqual(components[name], { platform: 'binary_sensor' }, name)
+            assert.deepEqual(components[name], { platform }, name)
         }
     })
 
-    test('door state comes only from status[7], which never missed a transition on the appliance', () => {
+    test('the global door sensor comes only from status[7], never from a notification', () => {
         const { ha, thinq } = makeDevice()
 
         thinq.emit('data', SAMPLE_STATUS) // current half has [7]=1
@@ -121,8 +181,8 @@ describe(MODEL_ID, () => {
         thinq.emit('data', closed)
         assert.equal(ha.devices[DEVICE_ID].properties.door, 'OFF')
 
-        // A door notification must not touch it: two overlapping doors produce no notification at
-        // all, so it can only ever be stale.
+        // status[7] was right in every condition measured on the appliance, including ten flips
+        // in thirty-five seconds. A notification must never override it.
         thinq.emit('data', DOOR_FRIDGE_LEFT)
         assert.equal(ha.devices[DEVICE_ID].properties.door, 'OFF')
     })
