@@ -1097,34 +1097,18 @@ describe('FX___S delay-end reservation', () => {
         assert.deepEqual([...sent.subarray(sent.length - 5, sent.length - 2)], [0x7f, 0x00, 0x00])
     })
 
-    test('clamps to what the appliance declares instead of dropping the write', () => {
+    test('refuses what the appliance declares out of range rather than sending it', () => {
         // The entity has to offer 0 so "no reservation" is publishable at all, which leaves a
-        // 0.5-2.5 h gap the appliance rejects. Refusing it silently was indistinguishable from the
-        // write being lost, so the nearest value the appliance takes is sent.
-        const minutes = (frame: Buffer) => frame.readUInt16BE(frame.length - 4)
-        const cases: [string, number][] = [
-            ['2', 180], // below the declared 3 h
-            ['0.5', 180], // the smallest step the entity offers
-            ['20', 19 * 60], // above the declared 19 h
-            ['5.25', 330], // not a half hour - rounded, not refused
-            ['5.2', 300], // rounds down as well as up
-        ]
-        for (const [asked, expected] of cases) {
-            const { thinq, dut } = setup()
-            dut.processRecord(idle())
-            thinq.resetRecorder()
-            dut.setProperty('reservation', asked)
-            assert.equal(thinq.outbox.length, 1, `${asked} h was not sent`)
-            assert.equal(minutes(thinq.outbox[0]), expected, `${asked} h`)
-        }
-    })
-
-    test('and zero still means none, rather than clamping up to the minimum', () => {
+        // 0.5-2.5 h gap the appliance rejects. Clamping that gap up to 3 h was tried on 2026-08-11
+        // and reverted the same day: the owner would rather an impossible value do nothing than
+        // quietly become a different reservation.
         const { thinq, dut } = setup()
         dut.processRecord(idle())
         thinq.resetRecorder()
-        dut.setProperty('reservation', '0')
-        assert.equal(thinq.outbox[0].readUInt16BE(thinq.outbox[0].length - 4), 0)
+        dut.setProperty('reservation', '2') // below the declared 3 h
+        dut.setProperty('reservation', '20') // above the declared 19 h
+        dut.setProperty('reservation', '5.25') // not a half hour
+        assert.equal(thinq.outbox.length, 0)
     })
 
     test('does nothing until a record has been seen', () => {

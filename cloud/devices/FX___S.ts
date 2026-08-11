@@ -1152,11 +1152,11 @@ export default class Device extends AABBDevice {
                 // Hours until the cycle should FINISH, which is what this appliance's reservation
                 // means. Half hours, because the appliance takes them; 0 is no reservation.
                 //
-                // The range starts at 0 and not at the appliance's own 3, and it has to: Home
+                // The range starts at 0 and not at the appliance's own 3, and it HAS to: Home
                 // Assistant rejects an incoming state outside [min, max], so a minimum of 3 would
-                // make the "no reservation" the appliance reports for most of its life
-                // unpublishable. setProperty clamps the 0.5-2.5 h gap up to 3 instead of dropping
-                // the write.
+                // make the "no reservation" this appliance reports for most of its life
+                // unpublishable. setProperty refuses the impossible 0.5-2.5 h gap in between rather
+                // than sending something the appliance declares invalid.
                 reservation: {
                     platform: 'number',
                     unique_id: '$deviceid-reservation',
@@ -1929,31 +1929,26 @@ export default class Device extends AABBDevice {
                 return
             }
             case 'reservation': {
-                /*
-                 * The entity's minimum is 0 and the appliance's is 3 h, and that gap cannot be
-                 * closed by declaring `min: 3`. Home Assistant's MQTT number REJECTS an incoming
-                 * state outside [min, max] - it logs the value and leaves the entity where it was -
-                 * so a minimum of 3 would make "no reservation" unpublishable, and the appliance
-                 * reports exactly that for most of its life. 0 has to be in range.
-                 *
-                 * What was wrong was the other end. A value in the 0.5-2.5 h gap was refused and
-                 * nothing was sent, so the entity snapped back with only a log line to say why -
-                 * which from the dashboard is indistinguishable from the write being lost. It is
-                 * CLAMPED now, the way a number entity's range normally behaves: anything asking
-                 * for a reservation gets the nearest one the appliance will accept, and only 0
-                 * clears it. The log line says what was actually sent.
-                 */
-                const hours = Number(mqttValue)
-                if (!Number.isFinite(hours) || hours < 0) return
-
-                // Half hours, because that is the grain the appliance takes.
-                const asked = Math.round((hours * 60) / RESERVE_STEP_MINUTES) * RESERVE_STEP_MINUTES
-                const minutes = asked === 0 ? 0 : Math.min(Math.max(asked, RESERVE_MIN_MINUTES), RESERVE_MAX_MINUTES)
-                if (minutes !== hours * 60) {
+                // The entity offers 0 to 19 in half hours so that "no reservation" is expressible, but
+                // the appliance's own declaration starts at 3 h. Rather than send something it says is
+                // out of range, refuse it and say so - a rejected write leaves no trace otherwise.
+                //
+                // Clamping that 0.5-2.5 h gap up to 3 h was tried on 2026-08-11 and REVERTED the same
+                // day at the owner's request. Neither behaviour is a bug; it is a choice about what an
+                // impossible value should do, and they would rather it do nothing than quietly become
+                // a different reservation from the one they typed.
+                const minutes = Math.round(Number(mqttValue) * 60)
+                if (!Number.isFinite(minutes) || minutes < 0) return
+                if (minutes !== 0 && (minutes < RESERVE_MIN_MINUTES || minutes > RESERVE_MAX_MINUTES)) {
                     log(
                         'status',
-                        `${this.id}: reservation ${mqttValue} h -> ${minutes / 60} h (the appliance declares ${RESERVE_MIN_MINUTES / 60}-${RESERVE_MAX_MINUTES / 60} h in half hours, 0 = none)`,
+                        `${this.id}: reservation ${mqttValue} h is outside the ${RESERVE_MIN_MINUTES / 60}-${RESERVE_MAX_MINUTES / 60} h this appliance declares; not sent`,
                     )
+                    return
+                }
+                if (minutes % RESERVE_STEP_MINUTES !== 0) {
+                    log('status', `${this.id}: reservation ${mqttValue} h is not a half hour; not sent`)
+                    return
                 }
                 return this.setReservation(minutes)
             }
