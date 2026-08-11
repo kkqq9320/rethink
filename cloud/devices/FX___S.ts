@@ -827,6 +827,15 @@ export default class Device extends AABBDevice {
                 // The phase enum is incomplete (3/37 are not pinned to a named stage, and only four
                 // courses have been run). Exposing the raw byte lets an unnamed phase be identified
                 // from history instead of vanishing into "Unknown".
+                //
+                // Off by default at the owner's request (2026-08-11): it is the escape hatch for
+                // naming a phase nobody has seen yet, not something to read day to day, and `status`
+                // now names all 33 states the model JSON declares. It stays declared so it can be
+                // switched on the moment a phase publishes `unknown`.
+                //
+                // This only affects installs that have not registered it yet - Home Assistant reads
+                // enabled_by_default when the entity FIRST enters the registry and never again, so
+                // an existing one has to be disabled by hand in the UI.
                 status_code: {
                     platform: 'sensor',
                     unique_id: '$deviceid-status-code',
@@ -834,6 +843,7 @@ export default class Device extends AABBDevice {
                     name: 'Status code',
                     icon: 'mdi:numeric',
                     entity_category: 'diagnostic',
+                    enabled_by_default: false,
                 },
                 // These two published 0x3E as a per-stage TIME plan. It is an energy meter -
                 // see processEnergyReport() - so they are withdrawn rather than repurposed: an
@@ -862,11 +872,17 @@ export default class Device extends AABBDevice {
                     unit_of_measurement: 'Wh',
                     state_class: 'total_increasing',
                 },
+                // The same meter's individual reports, which is a list and therefore cannot be a
+                // number entity. The owner's complaint about it was fair: `19/31/2` on its own does
+                // not say what the numbers are, how far apart they were, or which one is current.
+                // The name now carries the unit and the cadence, and the attributes carry the parts
+                // separately so a template or a card can use them without parsing the state.
                 energy_reports: {
                     platform: 'sensor',
                     unique_id: '$deviceid-energy-reports',
                     state_topic: '$this/energy_reports',
-                    name: 'Energy per report',
+                    json_attributes_topic: '$this/energy_reports_attrs',
+                    name: 'Energy per 15 min report (Wh)',
                     icon: 'mdi:chart-histogram',
                     entity_category: 'diagnostic',
                 },
@@ -1134,10 +1150,13 @@ export default class Device extends AABBDevice {
                     icon: 'mdi:play-pause',
                 },
                 // Hours until the cycle should FINISH, which is what this appliance's reservation
-                // means. Half hours, because the appliance takes them; 0 is no reservation. The
-                // range starts at 0 rather than at the appliance's 3 so that the entity can say
-                // "none" at all - setProperty refuses the impossible gap in between rather than
-                // sending something the appliance declares invalid.
+                // means. Half hours, because the appliance takes them; 0 is no reservation.
+                //
+                // The range starts at 0 and not at the appliance's own 3, and it has to: Home
+                // Assistant rejects an incoming state outside [min, max], so a minimum of 3 would
+                // make the "no reservation" the appliance reports for most of its life
+                // unpublishable. setProperty clamps the 0.5-2.5 h gap up to 3 instead of dropping
+                // the write.
                 reservation: {
                     platform: 'number',
                     unique_id: '$deviceid-reservation',
@@ -1375,7 +1394,29 @@ export default class Device extends AABBDevice {
         // Home Assistant's statistics treat a drop as a meter reset, which is exactly what the
         // appliance does at the start of every cycle, so the per-cycle totals still add up.
         this.publishProperty('energy', total)
-        this.publishProperty('energy_reports', this.energyReports.map((wh) => wh ?? '?').join('/'))
+
+        /*
+         * Array.from, NOT map. Connecting mid-cycle means the first report seen can be number 6,
+         * and `energyReports[5] = 2` on an empty array leaves five HOLES - which Array.prototype.map
+         * skips rather than visiting, so the `?? '?'` never ran on them and the sensor published
+         * `/////2`. It really did, on 2026-08-09 at 17:34. Array.from iterates by index and hands
+         * a hole to the callback as undefined, which is what the placeholder was always for.
+         */
+        const reports = Array.from(this.energyReports, (wh) => wh ?? null)
+        this.publishProperty('energy_reports', reports.map((wh) => wh ?? '?').join(' / '))
+        this.publishProperty(
+            'energy_reports_attrs',
+            JSON.stringify({
+                reports,
+                latest: reports[reports.length - 1],
+                // Not the sum of `reports`: a mid-cycle connect misses the reports before it, and
+                // the appliance's own cumulative figure does not.
+                cycle_total: total,
+                unit: 'Wh',
+                // Measured at 14:46 to 15:20 apart across the captures - see above.
+                interval_minutes: 15,
+            }),
+        )
     }
 
     /**
@@ -1888,21 +1929,31 @@ export default class Device extends AABBDevice {
                 return
             }
             case 'reservation': {
-                // The entity offers 0 to 19 in half hours so that "no reservation" is expressible, but
-                // the appliance's own declaration starts at 3 h. Rather than send something it says is
-                // out of range, refuse it and say so - a rejected write leaves no trace otherwise.
-                const minutes = Math.round(Number(mqttValue) * 60)
-                if (!Number.isFinite(minutes) || minutes < 0) return
-                if (minutes !== 0 && (minutes < RESERVE_MIN_MINUTES || minutes > RESERVE_MAX_MINUTES)) {
+                /*
+                 * The entity's minimum is 0 and the appliance's is 3 h, and that gap cannot be
+                 * closed by declaring `min: 3`. Home Assistant's MQTT number REJECTS an incoming
+                 * state outside [min, max] - it logs the value and leaves the entity where it was -
+                 * so a minimum of 3 would make "no reservation" unpublishable, and the appliance
+                 * reports exactly that for most of its life. 0 has to be in range.
+                 *
+                 * What was wrong was the other end. A value in the 0.5-2.5 h gap was refused and
+                 * nothing was sent, so the entity snapped back with only a log line to say why -
+                 * which from the dashboard is indistinguishable from the write being lost. It is
+                 * CLAMPED now, the way a number entity's range normally behaves: anything asking
+                 * for a reservation gets the nearest one the appliance will accept, and only 0
+                 * clears it. The log line says what was actually sent.
+                 */
+                const hours = Number(mqttValue)
+                if (!Number.isFinite(hours) || hours < 0) return
+
+                // Half hours, because that is the grain the appliance takes.
+                const asked = Math.round((hours * 60) / RESERVE_STEP_MINUTES) * RESERVE_STEP_MINUTES
+                const minutes = asked === 0 ? 0 : Math.min(Math.max(asked, RESERVE_MIN_MINUTES), RESERVE_MAX_MINUTES)
+                if (minutes !== hours * 60) {
                     log(
                         'status',
-                        `${this.id}: reservation ${mqttValue} h is outside the ${RESERVE_MIN_MINUTES / 60}-${RESERVE_MAX_MINUTES / 60} h this appliance declares; not sent`,
+                        `${this.id}: reservation ${mqttValue} h -> ${minutes / 60} h (the appliance declares ${RESERVE_MIN_MINUTES / 60}-${RESERVE_MAX_MINUTES / 60} h in half hours, 0 = none)`,
                     )
-                    return
-                }
-                if (minutes % RESERVE_STEP_MINUTES !== 0) {
-                    log('status', `${this.id}: reservation ${mqttValue} h is not a half hour; not sent`)
-                    return
                 }
                 return this.setReservation(minutes)
             }

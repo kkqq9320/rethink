@@ -350,16 +350,16 @@ describe('FX___S washer', () => {
         ])
             feed(thinq, Buffer.from(f, 'hex'))
 
-        assert.equal(get(HA, 'energy_reports'), '3/94/22/11/3/3')
+        assert.equal(get(HA, 'energy_reports'), '3 / 94 / 22 / 11 / 3 / 3')
         assert.equal(get(HA, 'energy'), 136)
 
         /* An 11 Wh report reads as an extended frame if the length is not checked; this is that one. */
-        assert.equal(get(HA, 'energy_reports')?.toString().split('/')[3], '11')
+        assert.equal(get(HA, 'energy_reports')?.toString().split(' / ')[3], '11')
 
         /* Report 1 starts a new cycle's count rather than extending the old one. */
         feed(thinq, Buffer.from('aa0b203e001600160115bb', 'hex'))
         feed(thinq, Buffer.from('aa0b203e000d00230210bb', 'hex'))
-        assert.equal(get(HA, 'energy_reports'), '22/13')
+        assert.equal(get(HA, 'energy_reports'), '22 / 13')
         assert.equal(get(HA, 'energy'), 35)
     })
 
@@ -375,7 +375,30 @@ describe('FX___S washer', () => {
 
         feed(thinq, Buffer.from('aa0b203e000300a70395bb', 'hex')) // 14:40:06    3 / 167 / 3
         assert.equal(get(HA, 'energy'), 167, 'it keeps counting while the appliance idles')
-        assert.equal(get(HA, 'energy_reports'), '140/24/3')
+        assert.equal(get(HA, 'energy_reports'), '140 / 24 / 3')
+
+        const attrs = JSON.parse(String(get(HA, 'energy_reports_attrs')))
+        assert.deepEqual(attrs.reports, [140, 24, 3])
+        assert.equal(attrs.latest, 3)
+        assert.equal(attrs.cycle_total, 167)
+        assert.equal(attrs.unit, 'Wh')
+    })
+
+    test('a cycle already under way when we connect shows the gap instead of swallowing it', () => {
+        const { HA, thinq } = setup()
+
+        // Report 6 with nothing before it, which is what connecting mid-cycle looks like. The first
+        // five slots are HOLES in the array, and Array.prototype.map skips holes rather than
+        // visiting them - so the placeholder never ran and this published `/////3` on the appliance
+        // on 2026-08-09 at 17:34.
+        feed(thinq, Buffer.from('aa0b203e0003008806f1bb', 'hex'))
+
+        assert.equal(get(HA, 'energy_reports'), '? / ? / ? / ? / ? / 3')
+        const attrs = JSON.parse(String(get(HA, 'energy_reports_attrs')))
+        assert.deepEqual(attrs.reports, [null, null, null, null, null, 3])
+        // The appliance's own cumulative figure, which is right even though our per-report list
+        // cannot be - that is the whole reason it is not a sum of `reports`.
+        assert.equal(attrs.cycle_total, 136)
     })
 
     test('0xE2 carries the same cycle total at @22, from a different frame family', () => {
@@ -732,12 +755,26 @@ describe('FX___S entity names', () => {
         )
     })
 
+    test('the raw phase byte is declared but off by default', () => {
+        const { HA } = setup()
+        const comp = HA.devices[DEVICE_ID].config!.components.status_code as unknown as Record<string, unknown>
+        // Owner's call: it is the escape hatch for naming an unseen phase, not a daily reading.
+        assert.equal(comp.enabled_by_default, false)
+        // Still published, so switching it on in the UI is all it takes.
+        assert.equal(comp.state_topic, '$this/status_code')
+        // And it is the only one turned off - `status` and the diagnostics stay as they were.
+        const off = Object.entries(HA.devices[DEVICE_ID].config!.components)
+            .filter(([, c]) => (c as unknown as Record<string, unknown>).enabled_by_default === false)
+            .map(([k]) => k)
+        assert.deepEqual(off, ['status_code'])
+    })
+
     test('the readings that describe the cycle keep their own names', () => {
         const { HA } = setup()
         // These report what the appliance is doing rather than setting it, so grouping them with the
         // controls would say they are adjustable.
         assert.equal(nameOf(HA, 'current_course'), 'Current course')
-        assert.equal(nameOf(HA, 'energy_reports'), 'Energy per report')
+        assert.equal(nameOf(HA, 'energy_reports'), 'Energy per 15 min report (Wh)')
         assert.equal(nameOf(HA, 'remaining_time'), 'Remaining time')
     })
 })
@@ -1060,14 +1097,34 @@ describe('FX___S delay-end reservation', () => {
         assert.deepEqual([...sent.subarray(sent.length - 5, sent.length - 2)], [0x7f, 0x00, 0x00])
     })
 
-    test('refuses what the appliance declares out of range rather than sending it', () => {
+    test('clamps to what the appliance declares instead of dropping the write', () => {
+        // The entity has to offer 0 so "no reservation" is publishable at all, which leaves a
+        // 0.5-2.5 h gap the appliance rejects. Refusing it silently was indistinguishable from the
+        // write being lost, so the nearest value the appliance takes is sent.
+        const minutes = (frame: Buffer) => frame.readUInt16BE(frame.length - 4)
+        const cases: [string, number][] = [
+            ['2', 180], // below the declared 3 h
+            ['0.5', 180], // the smallest step the entity offers
+            ['20', 19 * 60], // above the declared 19 h
+            ['5.25', 330], // not a half hour - rounded, not refused
+            ['5.2', 300], // rounds down as well as up
+        ]
+        for (const [asked, expected] of cases) {
+            const { thinq, dut } = setup()
+            dut.processRecord(idle())
+            thinq.resetRecorder()
+            dut.setProperty('reservation', asked)
+            assert.equal(thinq.outbox.length, 1, `${asked} h was not sent`)
+            assert.equal(minutes(thinq.outbox[0]), expected, `${asked} h`)
+        }
+    })
+
+    test('and zero still means none, rather than clamping up to the minimum', () => {
         const { thinq, dut } = setup()
         dut.processRecord(idle())
         thinq.resetRecorder()
-        dut.setProperty('reservation', '2') // below the declared 3 h
-        dut.setProperty('reservation', '20') // above the declared 19 h
-        dut.setProperty('reservation', '5.25') // not a half hour
-        assert.equal(thinq.outbox.length, 0)
+        dut.setProperty('reservation', '0')
+        assert.equal(thinq.outbox[0].readUInt16BE(thinq.outbox[0].length - 4), 0)
     })
 
     test('does nothing until a record has been seen', () => {
