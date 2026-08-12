@@ -1623,14 +1623,6 @@ export default class Device extends AABBDevice {
         if (FINISHED_PHASES.has(phase)) this.publishProperty('current_course', COURSE_CLEARED)
         else if (label !== undefined) this.publishProperty('current_course', label)
 
-        this.publishProperty('power', phase === PHASE_OFF ? 'OFF' : 'ON')
-        // Lower case: this sensor declares device_class 'enum', and Home Assistant rejects a state that
-        // is not one of the declared options - 'Unknown' was not one of them, 'unknown' is.
-        this.publishProperty('status', STATUS[phase] ?? 'unknown')
-        this.publishProperty('status_code', phase)
-        this.publishProperty('running', ACTIVE_PHASES.has(phase) ? 'ON' : 'OFF')
-        // Not while a reservation waits: the bit is set for the whole of it - see FLAG_DRUM_ACTIVE.
-        this.publishProperty('drum_active', flags & FLAG_DRUM_ACTIVE && phase !== PHASE_RESERVED ? 'ON' : 'OFF')
         this.remoteControl = (flags & FLAG_REMOTE_CONTROL) !== 0
         this.publishProperty('remote_control', this.remoteControl ? 'ON' : 'OFF')
         this.publishProperty('child_lock', flags & FLAG_CHILD_LOCK ? 'ON' : 'OFF')
@@ -1810,8 +1802,41 @@ export default class Device extends AABBDevice {
          * zeroing the bytes at Complete from reading as the owner switching an option off.
          */
         const startingCycle = previousPhase !== undefined && !CYCLE_PHASES.has(previousPhase) && CYCLE_PHASES.has(phase)
-        if (phase !== PHASE_STANDBY && !startingCycle) return
+        if (phase === PHASE_STANDBY || startingCycle) this.publishCycleOptions(rec, course)
 
+        /*
+         * AND THE STATE GOES LAST, for the reason the course went first - see above. These four are
+         * what an automation triggers on, so everything it might then ask about has to be on the
+         * wire already, and "everything" includes the block just above: the record that starts a
+         * cycle carries the options it starts with, and they are published from there.
+         *
+         * The owner found the general case that the course fix only covered one instance of. The
+         * appliance does not report a panel-side change when it happens - it can sit silent for
+         * minutes - so switching laundry care on at the panel and starting a wash leaves Home
+         * Assistant showing the old value right up until the cycle's first record arrives. That
+         * record is a full 66-byte snapshot and carries the true setting, so the information is
+         * there; publishing `running` before it just meant nobody could read it in time.
+         *
+         * (Nothing is SENT by any of this. A state topic and a command topic are different topics;
+         * a switch changing because the appliance said so does not put a frame on the wire, which is
+         * the other half of what the owner asked.)
+         */
+        this.publishProperty('power', phase === PHASE_OFF ? 'OFF' : 'ON')
+        // Lower case: this sensor declares device_class 'enum', and Home Assistant rejects a state that
+        // is not one of the declared options - 'Unknown' was not one of them, 'unknown' is.
+        this.publishProperty('status', STATUS[phase] ?? 'unknown')
+        this.publishProperty('status_code', phase)
+        this.publishProperty('running', ACTIVE_PHASES.has(phase) ? 'ON' : 'OFF')
+        // Not while a reservation waits: the bit is set for the whole of it - see FLAG_DRUM_ACTIVE.
+        this.publishProperty('drum_active', flags & FLAG_DRUM_ACTIVE && phase !== PHASE_RESERVED ? 'ON' : 'OFF')
+    }
+
+    /**
+     * The selection: the four option selects and the two option switches, published at the two
+     * moments the record carries it rather than the remaining work - standby, and the first record
+     * of a cycle. See the call site for why those two and no others.
+     */
+    publishCycleOptions(rec: Buffer, course: number) {
         this.publishOption('wash', this.washNames[rec[OFF_WASH]])
         this.publishOption('water_temp', WATER_TEMP[rec[OFF_WATER_TEMP]])
         this.publishOption('rinse', RINSE.includes(rec[OFF_RINSE]) ? String(rec[OFF_RINSE]) : undefined)

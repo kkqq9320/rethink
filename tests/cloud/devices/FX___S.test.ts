@@ -1446,6 +1446,11 @@ describe('FX___S publish order', () => {
          * naming this cycle and naming the last one.
          */
         const { HA, dut } = setup()
+
+        // Switched off, saying nothing. This is where Home Assistant sits while the owner works the
+        // panel, because the appliance does not report what they are doing there.
+        dut.processRecord(Buffer.alloc(66))
+
         const order: string[] = []
         const publish = HA.publishProperty.bind(HA)
         HA.publishProperty = ((id: string, prop: string, value: string | number) => {
@@ -1453,16 +1458,55 @@ describe('FX___S publish order', () => {
             publish(id, prop, value)
         }) as typeof HA.publishProperty
 
-        const rec = Buffer.alloc(66)
-        rec[20] = 3 // detecting - `running` turns on here
-        rec[4] = 0x2e // ...and the course changes in the same record
-        dut.processRecord(rec)
+        // The first record of the cycle, and the first news of any of it: the course they chose,
+        // the options they set, laundry care and wrinkle care they switched on at the panel - all
+        // of it arrives here, in one 66-byte snapshot, at the same instant `running` turns on.
+        const started = Buffer.alloc(66)
+        started[20] = 3 // detecting
+        started[4] = 0x2e // NORMAL
+        started[0] = 3 // wash
+        started[1] = 3 // 40 degrees
+        started[2] = 2 // two rinses
+        started[3] = 6 // high spin
+        started[33] = 0x20 // TurboShot
+        started[34] = 0x10 // steam
+        started[35] = 0x80 // wrinkle care
+        started[36] = 0x80 // drum turning
+        started[46] = 0x0c // laundry care, plus the constant 0x04
+        dut.processRecord(started)
 
         const at = (prop: string) => order.indexOf(prop)
-        assert.ok(at('current_course') >= 0 && at('running') >= 0, 'both were published')
-        assert.ok(at('current_course') < at('running'), 'current_course must precede running')
-        assert.ok(at('current_course') < at('status'), 'current_course must precede status')
-        assert.ok(at('course') < at('running'), 'the select must precede running too')
+
+        /*
+         * The general rule, which the owner arrived at from the other end: the appliance does not
+         * report a panel-side change when it happens, so switching laundry care on at the panel and
+         * starting a wash leaves Home Assistant showing the old value - right up until the cycle's
+         * first record, which is a full 66-byte snapshot and carries the truth. Publishing `running`
+         * before the rest of that snapshot is what stopped anyone reading it in time.
+         *
+         * So the four states an automation triggers on go last, after everything it might ask about.
+         */
+        const triggers = ['power', 'status', 'status_code', 'running', 'drum_active']
+        const asked = [
+            'current_course',
+            'course',
+            'laundry_care',
+            'wrinkle_care',
+            'steam_active',
+            'turbowash_active',
+            'steam',
+            'turbowash',
+            'wash',
+            'water_temp',
+            'rinse',
+            'spin',
+        ]
+        for (const t of triggers) assert.ok(at(t) >= 0, `${t} was published`)
+        const firstTrigger = Math.min(...triggers.map(at))
+        for (const prop of asked) {
+            assert.ok(at(prop) >= 0, `${prop} was published`)
+            assert.ok(at(prop) < firstTrigger, `${prop} must be published before any trigger`)
+        }
     })
 })
 
