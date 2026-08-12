@@ -1479,17 +1479,38 @@ describe('FX___S the cycle options are a setting and a reading, not one entity d
         assert.equal(get(HA, 'steam'), 'OFF')
     })
 
-    test('the steam sensor reports the stage, which ends before the cycle does', () => {
+    test('the steam sensor answers "does this cycle use steam" for the whole cycle', () => {
         const { HA, dut } = setup()
         dut.processRecord(record(1, { steam: true, turbo: true }))
         dut.processRecord(record(11, { steam: true, turbo: true }))
         assert.equal(get(HA, 'steam_active'), 'ON')
         assert.equal(get(HA, 'turbowash_active'), 'ON')
 
-        // Entering rinse: steam is spent, TurboShot is not. The two bytes are not the same kind.
+        // 2026-08-12 16:46:19: the steam bit is spent entering rinse, with 21 minutes of the cycle
+        // left. Published straight the sensor said "no steam" for all of it; latched, it holds.
+        dut.processRecord(record(12, { turbo: true }))
+        assert.equal(get(HA, 'steam_active'), 'ON')
+        assert.equal(get(HA, 'turbowash_active'), 'ON')
+
+        // The cycle ends and the latch goes with it.
+        dut.processRecord(record(42))
+        assert.equal(get(HA, 'steam_active'), 'OFF')
+        assert.equal(get(HA, 'turbowash_active'), 'OFF')
+
+        // ...and does not leak into the next cycle, which is what a latch has to be checked for.
+        dut.processRecord(record(1))
+        dut.processRecord(record(11))
+        assert.equal(get(HA, 'steam_active'), 'OFF')
+        assert.equal(get(HA, 'turbowash_active'), 'OFF')
+    })
+
+    test('a cycle joined after the steam stage cannot claim steam, and does not', () => {
+        // Reconnecting mid-wash still catches it, because the latch is an OR over every record we
+        // see rather than a read of the one that started the cycle. Joining during the rinse of a
+        // steam wash is the case nothing can recover, and it must not guess.
+        const { HA, dut } = setup()
         dut.processRecord(record(12, { turbo: true }))
         assert.equal(get(HA, 'steam_active'), 'OFF')
-        assert.equal(get(HA, 'turbowash_active'), 'ON')
     })
 
     test('and hold it when the appliance zeroes the bytes at the end of the cycle', () => {

@@ -778,6 +778,21 @@ export default class Device extends AABBDevice {
     endTimePredicted: number | undefined
 
     /**
+     * Options seen switched on at any point in the cycle now running, cleared when it ends.
+     *
+     * This is what makes "does this cycle use steam" answerable at all. The bits themselves are
+     * remaining work: steam is spent entering rinse, measured 2026-08-12, so a sensor published
+     * straight from the byte says no for the last third of a steam wash. Latching turns the byte
+     * into the question that was actually asked.
+     *
+     * OR over the cycle rather than a read of the first record, deliberately: it needs no opinion
+     * about which record started the cycle, so reconnecting mid-wash still catches steam if any
+     * record we do see has it set. What it cannot recover is a cycle we only join after the stage
+     * has finished, and nothing can.
+     */
+    seenThisCycle = { steam: false, turbowash: false }
+
+    /**
      * Remote control gates STARTING the machine, not writing settings to it. Settings writes are
      * accepted with it switched off - a hundred and six of them applied that way across the captures,
      * which is the whole course and option sweep - and the owner confirms the app's "send to washer"
@@ -975,15 +990,15 @@ export default class Device extends AABBDevice {
                 // protocol reports. TURBOSHOT holds to the end of the cycle. Laundry care is the
                 // appliance's own word for it.
                 //
-                // `Steam this cycle` was the first name and it was wrong - it went off twenty-one
-                // minutes before the cycle it claimed to describe. The entity_id keeps the old
-                // spelling, because Home Assistant assigns one at creation and does not re-derive
-                // it from the name.
+                // The name is the question the owner asked for - does the cycle that is running use
+                // steam - and it is true because the value is LATCHED, not because the byte says so.
+                // Published straight, it went off twenty-one minutes before the cycle it claimed to
+                // describe. See processRecord.
                 steam_active: {
                     platform: 'binary_sensor',
                     unique_id: '$deviceid-steam-active',
                     state_topic: '$this/steam_active',
-                    name: 'Steam remaining',
+                    name: 'Steam this cycle',
                     icon: 'mdi:kettle-steam',
                 },
                 turbowash_active: {
@@ -1585,13 +1600,27 @@ export default class Device extends AABBDevice {
          * with twenty-one minutes of the cycle still to run.
          *
          * So steam belongs to the WASH STAGE and is consumed with it, the way the wash and
-         * temperature bytes are, while TurboShot belongs to the whole cycle. This entity therefore
-         * reports the steam stage still being to come or under way - hence the name - and that is a
-         * measurement now rather than an inference from the byte next door.
+         * temperature bytes are, while TurboShot belongs to the whole cycle.
+         *
+         * WHICH IS WHY THESE ARE LATCHED. The question these entities exist to answer is the
+         * owner's - does the cycle that is running use steam - and the raw byte stops answering it
+         * a third of the way from the end. Once the bit has been seen set, it holds until the cycle
+         * is over. The alternative was to rename them after what the byte literally reports; the
+         * owner's point that the question is the useful one is the better one, and the byte's own
+         * behaviour is written down here rather than in an entity name.
+         *
+         * For TurboShot the latch changes nothing measured - its bit already holds to Complete on
+         * three cycles - so it is applied for symmetry and to stop the two drifting apart if that
+         * turns out to be another thing that was only true of the cycles we happened to catch.
          */
         const inCycle = CYCLE_PHASES.has(phase)
-        this.publishProperty('steam_active', inCycle && rec[OFF_STEAM] & STEAM_ON ? 'ON' : 'OFF')
-        this.publishProperty('turbowash_active', inCycle && rec[OFF_TURBOSHOT] & TURBOSHOT_ON ? 'ON' : 'OFF')
+        if (!inCycle) this.seenThisCycle = { steam: false, turbowash: false }
+        else {
+            if (rec[OFF_STEAM] & STEAM_ON) this.seenThisCycle.steam = true
+            if (rec[OFF_TURBOSHOT] & TURBOSHOT_ON) this.seenThisCycle.turbowash = true
+        }
+        this.publishProperty('steam_active', inCycle && this.seenThisCycle.steam ? 'ON' : 'OFF')
+        this.publishProperty('turbowash_active', inCycle && this.seenThisCycle.turbowash ? 'ON' : 'OFF')
 
         /*
          * Laundry care is the odd one of the three and its own bit is not what says it is running.
