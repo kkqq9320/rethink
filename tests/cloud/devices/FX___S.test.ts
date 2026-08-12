@@ -143,6 +143,11 @@ describe('FX___S washer', () => {
     test('does not overwrite the selected settings while a cycle is running', () => {
         const { HA, thinq } = setup()
         feed(thinq, STANDBY)
+        // Through the start, not around it: the appliance goes 1 -> 3 -> ... -> 12, and the record
+        // at the move into the cycle is the second place the selection is read (see processRecord).
+        // Jumping straight from standby to rinsing is a sequence the appliance never sends, and
+        // feeding it here used to hide that this test says nothing about the move-in record.
+        feed(thinq, STARTED)
         feed(thinq, RINSING)
 
         // The record's wash/water-temperature bytes have been consumed to 0 by this point; the selects
@@ -1403,6 +1408,53 @@ describe('FX___S the cycle options are a setting and a reading, not one entity d
         dut.processRecord(record(1, { turbo: true, steam: true }))
         assert.equal(get(HA, 'turbowash'), 'ON')
         assert.equal(get(HA, 'steam'), 'ON')
+    })
+
+    test('and from the first record of a cycle, when standby never carried it', () => {
+        /*
+         * 2026-08-12: the owner chose Normal + steam and pressed start about ninety seconds later,
+         * so the only standby record we ever saw still described the previous course - and the
+         * steam switch read off for the whole of a steam wash. The first record of a cycle carries
+         * the options as started, measured on three cycles, so it is the second place to read them.
+         */
+        const { HA, dut } = setup()
+        dut.processRecord(record(1)) // the PREVIOUS course, steam and turbo off
+        assert.equal(get(HA, 'steam'), 'OFF')
+
+        dut.processRecord(record(3, { turbo: true, steam: true })) // detecting: the cycle as started
+        assert.equal(get(HA, 'steam'), 'ON')
+        assert.equal(get(HA, 'turbowash'), 'ON')
+    })
+
+    test('but only on the move in, so the appliance consuming them mid-cycle changes nothing', () => {
+        const { HA, dut } = setup()
+        dut.processRecord(record(1))
+        dut.processRecord(record(3, { steam: true }))
+        assert.equal(get(HA, 'steam'), 'ON')
+
+        // Measured 2026-08-12 16:46:19: the steam bit clears entering rinse, in the same record as
+        // the wash byte, with twenty-one minutes of the cycle left. The switch must not follow it.
+        dut.processRecord(record(12))
+        assert.equal(get(HA, 'steam'), 'ON')
+        dut.processRecord(record(42))
+        assert.equal(get(HA, 'steam'), 'ON')
+
+        // The next standby is a real selection again.
+        dut.processRecord(record(1))
+        assert.equal(get(HA, 'steam'), 'OFF')
+    })
+
+    test('the steam sensor reports the stage, which ends before the cycle does', () => {
+        const { HA, dut } = setup()
+        dut.processRecord(record(1, { steam: true, turbo: true }))
+        dut.processRecord(record(11, { steam: true, turbo: true }))
+        assert.equal(get(HA, 'steam_active'), 'ON')
+        assert.equal(get(HA, 'turbowash_active'), 'ON')
+
+        // Entering rinse: steam is spent, TurboShot is not. The two bytes are not the same kind.
+        dut.processRecord(record(12, { turbo: true }))
+        assert.equal(get(HA, 'steam_active'), 'OFF')
+        assert.equal(get(HA, 'turbowash_active'), 'ON')
     })
 
     test('and hold it when the appliance zeroes the bytes at the end of the cycle', () => {

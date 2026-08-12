@@ -932,15 +932,22 @@ export default class Device extends AABBDevice {
                 // change - so it is published only while the appliance sits at standby. These read
                 // the same bits while the appliance works.
                 //
-                // What they can honestly claim differs by entity, so read the publish site as well:
-                // steam and TurboShot say "the cycle that is running was started with this option
-                // on", not "the appliance is injecting steam this second", which nothing in this
-                // protocol reports. Laundry care is the appliance's own word for it.
+                // What they can honestly claim differs by entity, and the difference is measured
+                // rather than assumed - see the publish site. STEAM is consumed with the wash stage
+                // and goes off entering rinse, so it says the steam stage is still to come or under
+                // way, not that the appliance is injecting steam this second, which nothing in this
+                // protocol reports. TURBOSHOT holds to the end of the cycle. Laundry care is the
+                // appliance's own word for it.
+                //
+                // `Steam this cycle` was the first name and it was wrong - it went off twenty-one
+                // minutes before the cycle it claimed to describe. The entity_id keeps the old
+                // spelling, because Home Assistant assigns one at creation and does not re-derive
+                // it from the name.
                 steam_active: {
                     platform: 'binary_sensor',
                     unique_id: '$deviceid-steam-active',
                     state_topic: '$this/steam_active',
-                    name: 'Steam this cycle',
+                    name: 'Steam remaining',
                     icon: 'mdi:kettle-steam',
                 },
                 turbowash_active: {
@@ -1520,12 +1527,18 @@ export default class Device extends AABBDevice {
          * through every working phase and is zeroed on the move into Complete
          * (washer-cycle-20260730 15:47:56, washer-normal-20260804 14:25:27), alongside spin.
          *
-         * Steam is NOT, and the entity is worth no more than that. Every cycle in all seven captures
-         * was run with steam off, so this bit DURING a cycle has never been observed at all - what
-         * was measured is the standby selection, toggled on the Normal course and cross-checked
-         * against Towels 1. It is published here on the assumption that it behaves like the byte
-         * beside it. The first steam wash that runs with a capture on settles it, and the check is
-         * whether this goes off before the cycle does.
+         * STEAM IS NOT THE SAME BYTE TWICE, and assuming it was is the thing this comment used to
+         * do. It was published as "this cycle uses steam" on the grounds that it sits beside
+         * TurboShot in the same record, with a note saying no capture had ever caught a steam wash.
+         * One was run on 2026-08-12 (washer-steam-20260812.jsonl) and the assumption was wrong: the
+         * bit is ON through detecting and the wash, and CLEARS ENTERING RINSE, in the very same
+         * record as the wash byte - 16:46:19, phase 12, `wash` 3 -> 0 and steam 0x10 -> 0 together,
+         * with twenty-one minutes of the cycle still to run.
+         *
+         * So steam belongs to the WASH STAGE and is consumed with it, the way the wash and
+         * temperature bytes are, while TurboShot belongs to the whole cycle. This entity therefore
+         * reports the steam stage still being to come or under way - hence the name - and that is a
+         * measurement now rather than an inference from the byte next door.
          */
         const inCycle = CYCLE_PHASES.has(phase)
         this.publishProperty('steam_active', inCycle && rec[OFF_STEAM] & STEAM_ON ? 'ON' : 'OFF')
@@ -1649,12 +1662,28 @@ export default class Device extends AABBDevice {
         if (FINISHED_PHASES.has(phase)) this.publishProperty('current_course', COURSE_CLEARED)
         else if (label !== undefined) this.publishProperty('current_course', label)
 
-        // The rest are consumed as the appliance works through them and read 0 from the first stage
-        // onwards, so they only report the selection while it sits at standby. Anywhere else,
-        // republishing would overwrite the selects with meaningless values; Home Assistant keeps the
-        // last value published. Gating this on the 0x10 flag instead was wrong - it stays set after a
-        // cycle finishes, so the selects went unpublished for as long as the washer sat on Complete.
-        if (phase !== PHASE_STANDBY) return
+        /*
+         * The rest are consumed as the appliance works through them and read 0 from the stage that
+         * uses them onwards, so republishing them mid-cycle would overwrite the entities with
+         * meaningless values; Home Assistant keeps the last value published. Gating this on the 0x10
+         * flag was wrong - it stays set after a cycle finishes, so the selects went unpublished for
+         * as long as the washer sat on Complete.
+         *
+         * TWO moments, not one, and the second was missing until 2026-08-12. Standby is where the
+         * selection is edited. But a cycle can begin without any standby record reaching us at all:
+         * that day the owner chose Normal + steam and pressed start about ninety seconds later, and
+         * the only standby record we had still described the PREVIOUS course. The result was
+         * `switch.…_course_steam` reading off for the whole of a steam wash, and the water
+         * temperature select reading 40 while the cycle ran with it off.
+         *
+         * The first record of a cycle carries the options as STARTED - measured three times now
+         * (2026-07-30 14:59:42, 2026-08-04 13:56:44, 2026-08-12 16:16:49, each matching the standby
+         * record before it where there was one) - so it is the second place the selection is true.
+         * Nothing is published between then and the next standby, which is what keeps the appliance
+         * zeroing the bytes at Complete from reading as the owner switching an option off.
+         */
+        const startingCycle = previousPhase !== undefined && !CYCLE_PHASES.has(previousPhase) && CYCLE_PHASES.has(phase)
+        if (phase !== PHASE_STANDBY && !startingCycle) return
 
         this.publishOption('wash', this.washNames[rec[OFF_WASH]])
         this.publishOption('water_temp', WATER_TEMP[rec[OFF_WATER_TEMP]])
