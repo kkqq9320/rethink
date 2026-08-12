@@ -1567,6 +1567,46 @@ export default class Device extends AABBDevice {
             this.publishEvent('error', ERROR[error] ?? ERROR_UNKNOWN)
         }
 
+        /*
+         * THE COURSE GOES FIRST, and the order is the whole point of it being here.
+         *
+         * These entities are published from one record, in the order the lines appear, and Home
+         * Assistant applies them in that order. An automation triggered by `running` turning on -
+         * or by `status` leaving `initial` - runs as soon as that message lands, so anything it
+         * reads with states() sees whatever was published BEFORE it. Course used to be published a
+         * hundred and eighty lines further down, so such an automation read the PREVIOUS course.
+         *
+         * That is not a rare race. The appliance changes course and starts in the same record when
+         * the owner picks a course and presses start without pausing - measured 2026-08-12, where
+         * course went 114 -> 46 and phase 1 -> 3 with no record in between. The owner's start
+         * notification named the course they had just moved away from.
+         *
+         * So the rule for this method: publish what a trigger will be asked ABOUT before publishing
+         * the thing that triggers. Course, then state.
+         *
+         * The course byte is not consumed - it survives the cycle, the finished state and even
+         * powering off - so it is always worth publishing, except when the byte identifying it
+         * reads 0. For an extended course that is the second byte; no record has ever been seen
+         * taking the escape with a zero identifier, but the same reasoning applies and the
+         * alternative is publishing "#ext0".
+         */
+        const course = rec[OFF_COURSE]
+        const label = this.currentCourseLabel(rec)
+        if (label !== undefined) {
+            this.registerCourse(label)
+            this.publishProperty('course', label)
+            // Depends only on which course is selected, so it is published in every phase, not just standby.
+            this.publishLimits(course, rec[OFF_COURSE_EXT])
+        }
+
+        // The select holds the SELECTION and keeps it - it is what the next start will run, and '-' is
+        // not one of its options, so Home Assistant would reject it. This sensor answers a different
+        // question, "what is the washer doing", and once the answer is "nothing" the leftover name reads
+        // as a cycle that is still on. It clears even when the course byte is absent, because a record
+        // that reports neither a phase nor a course is the emptiest evidence there is that nothing is on.
+        if (FINISHED_PHASES.has(phase)) this.publishProperty('current_course', COURSE_CLEARED)
+        else if (label !== undefined) this.publishProperty('current_course', label)
+
         this.publishProperty('power', phase === PHASE_OFF ? 'OFF' : 'ON')
         // Lower case: this sensor declares device_class 'enum', and Home Assistant rejects a state that
         // is not one of the declared options - 'Unknown' was not one of them, 'unknown' is.
@@ -1733,27 +1773,6 @@ export default class Device extends AABBDevice {
         this.publishProperty('total_time', phase === PHASE_OFF ? 0 : rec[OFF_TOTAL_H] * 60 + rec[OFF_TOTAL_M])
         this.publishProperty('rinse_remaining', rec[OFF_RINSE])
         this.updateButtonAvailability()
-
-        // The course byte is not consumed - it survives the cycle, the finished state and even powering
-        // off - so it is always worth publishing, except when the byte identifying it reads 0. For an
-        // extended course that is the second byte; no record has ever been seen taking the escape with a
-        // zero identifier, but the same reasoning applies and the alternative is publishing "#ext0".
-        const course = rec[OFF_COURSE]
-        const label = this.currentCourseLabel(rec)
-        if (label !== undefined) {
-            this.registerCourse(label)
-            this.publishProperty('course', label)
-            // Depends only on which course is selected, so it is published in every phase, not just standby.
-            this.publishLimits(course, rec[OFF_COURSE_EXT])
-        }
-
-        // The select holds the SELECTION and keeps it - it is what the next start will run, and '-' is
-        // not one of its options, so Home Assistant would reject it. This sensor answers a different
-        // question, "what is the washer doing", and once the answer is "nothing" the leftover name reads
-        // as a cycle that is still on. It clears even when the course byte is absent, because a record
-        // that reports neither a phase nor a course is the emptiest evidence there is that nothing is on.
-        if (FINISHED_PHASES.has(phase)) this.publishProperty('current_course', COURSE_CLEARED)
-        else if (label !== undefined) this.publishProperty('current_course', label)
 
         /*
          * The rest are consumed as the appliance works through them and read 0 from the stage that

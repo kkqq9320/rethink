@@ -1426,6 +1426,39 @@ describe('FX___S two settings of the appliance rather than of a cycle', () => {
     })
 })
 
+describe('FX___S publish order', () => {
+    test('the course is published before the states an automation triggers on', () => {
+        /*
+         * The owner's start notification named the course they had just moved away from, and this
+         * is why: everything below comes out of ONE record, in source order, and an automation
+         * triggered by `running` or by `status` reads whatever was published before it.
+         *
+         * The appliance really does change course and start in the same record - 2026-08-12, course
+         * 114 -> 46 and phase 1 -> 3 with nothing in between, because the owner picked a course and
+         * pressed start without pausing. So the order is not a detail, it is the difference between
+         * naming this cycle and naming the last one.
+         */
+        const { HA, dut } = setup()
+        const order: string[] = []
+        const publish = HA.publishProperty.bind(HA)
+        HA.publishProperty = ((id: string, prop: string, value: string | number) => {
+            order.push(prop)
+            publish(id, prop, value)
+        }) as typeof HA.publishProperty
+
+        const rec = Buffer.alloc(66)
+        rec[20] = 3 // detecting - `running` turns on here
+        rec[4] = 0x2e // ...and the course changes in the same record
+        dut.processRecord(rec)
+
+        const at = (prop: string) => order.indexOf(prop)
+        assert.ok(at('current_course') >= 0 && at('running') >= 0, 'both were published')
+        assert.ok(at('current_course') < at('running'), 'current_course must precede running')
+        assert.ok(at('current_course') < at('status'), 'current_course must precede status')
+        assert.ok(at('course') < at('running'), 'the select must precede running too')
+    })
+})
+
 describe('FX___S the cycle options are a setting and a reading, not one entity doing both', () => {
     // Byte 33 bit 0x20 is TurboShot, byte 34 bit 0x10 is steam, byte 46 bit 0x08 is laundry care.
     function record(phase: number, { turbo = false, steam = false, care = false } = {}) {
