@@ -107,7 +107,9 @@ describe('FX___S washer', () => {
         assert.equal(get(HA, 'running'), 'OFF')
         assert.equal(get(HA, 'remaining_time'), 0) // not a timed phase
         assert.equal(get(HA, 'course'), 'AI_COURSE')
-        assert.equal(get(HA, 'current_course'), 'AI_COURSE')
+        // Standby names nothing: the appliance can sit here for minutes holding a course the
+        // owner has already changed at the panel. The select is where the selection lives.
+        assert.equal(get(HA, 'current_course'), '-')
         assert.equal(get(HA, 'wash'), 'normal')
         assert.equal(get(HA, 'water_temp'), '40')
         assert.equal(get(HA, 'rinse'), '2')
@@ -280,7 +282,7 @@ describe('FX___S washer', () => {
         unknown[87] = 0x63
         feed(thinq, unknown)
 
-        assert.equal(get(HA, 'current_course'), '#99')
+        assert.equal(get(HA, 'course'), '#99')
         assert.ok(
             (HA.devices[DEVICE_ID].config!.components.course as unknown as { options: string[] }).options.includes(
                 '#99',
@@ -300,7 +302,7 @@ describe('FX___S washer', () => {
         unknown[87] = 0x63
         feed(thinq, unknown)
 
-        assert.equal(get(HA, 'current_course'), '#99')
+        assert.equal(get(HA, 'course'), '#99')
         assert.ok(
             (HA.devices[DEVICE_ID].config!.components.course as unknown as { options: string[] }).options.includes(
                 '#99',
@@ -731,10 +733,12 @@ describe('FX___S current course clears when nothing is running', () => {
         return rec
     }
 
-    test('holds the course through standby and the whole cycle', () => {
+    test('names the course for the whole cycle, and only for the cycle', () => {
         const { HA, thinq } = setup()
         feed(thinq, STANDBY)
-        assert.equal(get(HA, 'current_course'), 'AI_COURSE')
+        // Standby is not a preview - see FINISHED_PHASES. The select holds the selection instead.
+        assert.equal(get(HA, 'current_course'), '-')
+        assert.equal(get(HA, 'course'), 'AI_COURSE')
         feed(thinq, STARTED)
         assert.equal(get(HA, 'current_course'), 'AI_COURSE')
         feed(thinq, RINSING)
@@ -770,7 +774,10 @@ describe('FX___S current course clears when nothing is running', () => {
         const { HA, thinq, dut } = setup()
         feed(thinq, COMPLETE)
         assert.equal(get(HA, 'current_course'), '-')
+        // Selecting a course at standby no longer names it here - starting one does.
         dut.processRecord(record(1, 0x2e))
+        assert.equal(get(HA, 'current_course'), '-')
+        dut.processRecord(record(11, 0x2e))
         assert.equal(get(HA, 'current_course'), 'NORMAL')
     })
 })
@@ -1246,7 +1253,7 @@ describe('FX___S course names are the ones LG itself uses', () => {
         feed(thinq, STANDBY)
         // LG's Course section calls 이불 DUVET, not BEDDING - taking its word for it is the whole
         // point of using its keys.
-        assert.equal(get(HA, 'current_course'), 'AI_COURSE')
+        assert.equal(get(HA, 'course'), 'AI_COURSE')
         const options = (HA.devices[DEVICE_ID].config!.components.course as unknown as { options: string[] }).options
         for (const key of ['NORMAL', 'WOOL', 'DUVET', 'TUB_CLEAN', 'RINSE_SPIN']) assert.ok(options.includes(key), key)
     })
@@ -1601,15 +1608,20 @@ describe('FX___S the cycle options are a setting and a reading, not one entity d
         assert.equal(get(HA, 'laundry_care'), 'OFF')
     })
 
-    test('and takes its running state from the phase, which is the appliance own word', () => {
+    test('and needs no sensor of its own, because `status` already says it', () => {
         const { HA, dut } = setup()
-        dut.processRecord(record(42, { care: true }))
-        assert.equal(get(HA, 'laundry_care_active'), 'OFF')
-        // 47 is LG's LAUNDRYCARE, the state the cloud reports as `refreshing`.
+
+        // A `laundry_care_active` binary sensor existed for one day and was withdrawn at the
+        // owner's request: phase 47 is what it read, and `status` publishes that as `refreshing`.
+        // Two entities for one fact is worse than either.
         dut.processRecord(record(47, { care: true }))
-        assert.equal(get(HA, 'laundry_care_active'), 'ON')
-        dut.processRecord(record(0))
-        assert.equal(get(HA, 'laundry_care_active'), 'OFF')
+        assert.equal(get(HA, 'status'), 'refreshing')
+        assert.equal(get(HA, 'laundry_care_active'), undefined, 'nothing is published to it')
+
+        // The removal stub: the key stays, carrying `platform` and nothing else, which is what
+        // deletes the entity. Anything more turns the removal back into a registration.
+        const stub = HA.devices[DEVICE_ID].config!.components.laundry_care_active as unknown as Record<string, unknown>
+        assert.deepEqual(Object.keys(stub), ['platform'])
     })
 
     test('the switches still write the same two keys', () => {
@@ -1633,12 +1645,12 @@ describe('FX___S course names in the configured language', () => {
     test('English by default, Korean when asked', () => {
         const { HA: en, thinq: te } = setupIn()
         feed(te, STANDBY)
-        assert.equal(get(en, 'current_course'), 'AI_COURSE')
+        assert.equal(get(en, 'course'), 'AI_COURSE')
 
         const { HA: ko, thinq: tk } = setupIn('ko')
         feed(tk, STANDBY)
         // Without the space LG's own model JSON puts in it - the owner's word, since it is their panel.
-        assert.equal(get(ko, 'current_course'), '인공지능세탁')
+        assert.equal(get(ko, 'course'), '인공지능세탁')
     })
 
     test('the wash scale is named in that language too, and only that one', () => {

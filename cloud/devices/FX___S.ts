@@ -492,15 +492,26 @@ const ACTIVE_PHASES = new Set([3, 37, 11, 40, 12, 14, 41, PHASE_CARE])
 // time; `laundry_care_active` is not, because LG's own phase 47 is what it reads.
 const CYCLE_PHASES = new Set([...ACTIVE_PHASES, PHASE_PAUSED])
 
-// Phases in which no cycle is under way any more, so `current_course` reads as a leftover rather than as
-// information - the course byte itself survives the cycle, the finished state and being powered off.
+// Phases in which `current_course` would be a leftover rather than information - the course byte
+// itself survives the cycle, the finished state and being powered off.
 //
 // The owner asked for 0 and 42. Laundry care (47) is in here as well because it only ever follows 42:
 // clearing at 42, restoring the name for the length of the care run and clearing it again at 0 would
 // flicker the sensor through "-" -> "AI Wash" -> "-" on every cycle that ends with care switched on.
-// Nothing before the wash is included - standby has a course selected and waiting, which is the one
-// moment the name matters most.
-const FINISHED_PHASES = new Set([PHASE_OFF, PHASE_DONE, PHASE_CARE])
+//
+// STANDBY IS IN HERE TOO, and it was not at first. The comment used to say standby is "the one moment
+// the name matters most", which assumed the appliance reports a panel-side change promptly. It does
+// not: it volunteers state on its own schedule, and on 2026-08-12 it said nothing at all for 95
+// seconds while the owner changed the course, switched steam on and pressed start (16:15:14 to
+// 16:16:49, not one record in between). Across the captures the median standby gap is 4 s, but 21 of
+// them exceed a minute and one runs to eighteen. So the standby value is not a preview of what will
+// run - it is the last thing the appliance happened to mention, and after a panel change it is
+// confidently wrong with nothing to say so.
+//
+// The select still holds it, which is what the owner pointed out: `select.…_course_select` cannot
+// publish "-" anyway, since Home Assistant rejects a state that is not one of a select's options. So
+// nothing is lost before a wash, and this sensor now only ever names a course while one is running.
+const FINISHED_PHASES = new Set([PHASE_OFF, PHASE_STANDBY, PHASE_DONE, PHASE_CARE])
 // Deliberately not '' or 'none': the sensor has no device_class, so this is what shows on the dashboard.
 const COURSE_CLEARED = '-'
 
@@ -1008,13 +1019,18 @@ export default class Device extends AABBDevice {
                     name: 'TurboShot this cycle',
                     icon: 'mdi:car-turbocharger',
                 },
-                laundry_care_active: {
-                    platform: 'binary_sensor',
-                    unique_id: '$deviceid-laundry-care-active',
-                    state_topic: '$this/laundry_care_active',
-                    name: 'Laundry care running',
-                    icon: 'mdi:tumble-dryer',
-                },
+                /*
+                 * WITHDRAWN the day it was built, and the owner is right about why: `status` already
+                 * says `refreshing` when laundry care is running, so this entity said the same thing
+                 * in a second place. Two entities for one fact is worse than either.
+                 *
+                 * (`refreshing` is phase 47 or 21; only 47 has ever been seen, and the model JSON
+                 * calls 21 REFRESHING too, so nothing is lost.)
+                 *
+                 * A removal stub - the key stays with nothing but `platform`, which is what deletes
+                 * an existing entity. See cycle_plan above for why it must not gain any other field.
+                 */
+                laundry_care_active: { platform: 'binary_sensor' } as ComponentInfo,
                 drum_active: {
                     platform: 'binary_sensor',
                     unique_id: '$deviceid-drum-active',
@@ -1663,18 +1679,17 @@ export default class Device extends AABBDevice {
         this.publishProperty('turbowash_active', inCycle && this.seenThisCycle.turbowash ? 'ON' : 'OFF')
 
         /*
-         * Laundry care is the odd one of the three and its own bit is not what says it is running.
+         * Laundry care is the odd one of the three and needs neither a latch nor a sensor.
          *
          * @46 bit 0x08 is the SETTING and the appliance does not consume it: on 2026-07-30 it went
          * on at 16:09 and was still on through the whole of the next wash half an hour later, only
-         * clearing when the appliance was switched off. So the switch below keeps publishing in
-         * every phase - gating it to standby would leave it stale exactly when it is used, since
-         * the owner's own use of it is to press it while the appliance sits on Complete.
+         * clearing when the appliance was switched off. So the switch publishes in every phase -
+         * gating it would leave it stale exactly when it is used, since the owner's own use of it is
+         * to press it while the appliance sits on Complete.
          *
-         * What says care is RUNNING is LG's phase 47 (LAUNDRYCARE), which is the appliance's word
-         * rather than ours. Measured twice that day, with the bit set on both occasions.
+         * And "care is running" is `status` reading `refreshing`, which is already published. The
+         * binary sensor that used to be here said it twice; it is withdrawn above.
          */
-        this.publishProperty('laundry_care_active', phase === PHASE_CARE ? 'ON' : 'OFF')
         this.publishProperty('laundry_care', rec[OFF_LAUNDRY_CARE] & LAUNDRY_CARE_ON ? 'ON' : 'OFF')
         this.publishProperty('clock_when_off', rec[OFF_LAUNDRY_CARE] & CLOCK_WHEN_OFF_ON ? 'ON' : 'OFF')
         this.publishProperty('auto_optimise', rec[OFF_AUTO_OPTIMISE] & AUTO_OPTIMISE_ON ? 'ON' : 'OFF')
