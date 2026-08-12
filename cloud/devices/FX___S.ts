@@ -148,6 +148,26 @@ const RESERVE_MIN_MINUTES = 180
 const RESERVE_MAX_MINUTES = 19 * 60
 const RESERVE_STEP_MINUTES = 30
 
+/*
+ * The cycle's cumulative energy in watt-hours, big-endian, refreshed about once a minute - and for
+ * six weeks it was two entries on the "undecoded" list, because @16 is 0 until a cycle draws more
+ * than 255 Wh and no captured cycle ever had. The 2026-08-12 steam wash drew 752 and the high byte
+ * moved for the first time.
+ *
+ * It agrees with the appliance's own 15-minute 0x3E report every single time: 19 reports across five
+ * captures, 190 record-vs-report comparisons, all within 3 Wh except two during steam heating where
+ * the record was sampled ~50 s ahead of the report and heating was running at ~27 Wh/min. It ends a
+ * cycle on exactly the number 0xE2 reports for it (164 on 2026-08-04, 752 on 2026-08-12), and both
+ * of those were corroborated by the plug on that outlet (+0.18 and +0.79 kWh). It resets to 0 when a
+ * cycle starts, the same rule 0x3E follows.
+ *
+ * So this is the same quantity 0x3E carries, fifteen times more often - which matters at the end of
+ * a cycle, where the report is up to fifteen minutes stale: on 2026-08-12 the sensor read 737 at
+ * Complete when the cycle had actually used 752, and only caught up later with standby draw mixed in.
+ */
+const OFF_ENERGY_HI = 16
+const OFF_ENERGY_LO = 17
+
 const OFF_COURSE_EXT = 22 // key 0x0B
 const OFF_PHASE = 20
 const OFF_PHASE_PREV = 21
@@ -231,7 +251,23 @@ const PHASE_CARE = 47
 const PHASE_RESERVED = 7
 
 // Operations the appliance can only act on in some states - see updateButtonAvailability.
-const GATED_BUTTONS = ['start', 'pause', 'resume']
+const GATED_BUTTONS = ['start', 'pause', 'resume', 'add_wash']
+
+/*
+ * "추가 세탁하기" turns out not to be a command at all. The owner pressed it in the LG app on
+ * 2026-08-12 with a capture running and the bridge relayed one two-pair write:
+ *
+ *   f0 e5 00 02 01 ff 02  0a 37  03 01     course -> 55 (RINSE_SPIN), operation -> 1 (start)
+ *
+ * So it selects Rinse + Spin and starts it. The appliance then ran 12 -> 14 -> 42, 17:34 to 17:55,
+ * 36 Wh. Reproducing it is the safe kind of write this profile allows - the frame is replayed byte
+ * for byte from the capture, checksum included, rather than composed here.
+ *
+ * ONE OBSERVATION, and the name says so. Whether the app always picks 55, or derives a course from
+ * the one that just finished, is not something a single press can answer, so the button is named for
+ * what it demonstrably does rather than for the app's label.
+ */
+const ADD_WASH_COURSE = 0x37
 
 // Phase codes, named as LG names them. Every one of these was pinned by laying our phase byte and the
 // LG cloud's own status for the same appliance on one clock, across three washes - 2026-07-30 (the
@@ -1148,6 +1184,17 @@ export default class Device extends AABBDevice {
                     name: 'Pause',
                     icon: 'mdi:pause-circle-outline',
                 },
+                // See ADD_WASH_COURSE. Named for the cycle it actually starts, not for the app's
+                // "추가 세탁하기", because one press cannot show whether the app always chooses this
+                // course.
+                add_wash: {
+                    platform: 'button',
+                    unique_id: '$deviceid-add-wash',
+                    command_topic: '$this/add_wash/set',
+                    payload_press: '',
+                    name: 'Add wash (Rinse + Spin)',
+                    icon: 'mdi:water-sync',
+                },
                 resume: {
                     platform: 'button',
                     unique_id: '$deviceid-resume',
@@ -1398,9 +1445,11 @@ export default class Device extends AABBDevice {
         this.energyReports[report - 1] = delta
         this.energyTotal = total
 
-        // Home Assistant's statistics treat a drop as a meter reset, which is exactly what the
-        // appliance does at the start of every cycle, so the per-cycle totals still add up.
-        this.publishProperty('energy', total)
+        // `energy` is NOT published from here any more. The state record carries the same running
+        // total once a minute (OFF_ENERGY_HI), so this frame would only ever restate it fifteen
+        // minutes late - and having two sources publish one entity made them take turns, since the
+        // record is a minute fresher than the report that follows it. What is left here is the
+        // per-report breakdown, which only this frame has.
 
         /*
          * Array.from, NOT map. Connecting mid-cycle means the first report seen can be number 6,
@@ -1570,6 +1619,21 @@ export default class Device extends AABBDevice {
         this.publishProperty('cycles', String(rec[OFF_CYCLES]))
         this.publishProperty('beep', BEEP[rec[OFF_BEEP]] ?? 'unknown')
 
+        /*
+         * Energy comes from the record rather than from the 0x3E report - see OFF_ENERGY_HI - so it
+         * follows the cycle by the minute instead of by the quarter hour, and is right at the moment
+         * the cycle ends rather than fifteen minutes later.
+         *
+         * NOT while switched off. The appliance zeroes the whole record then, and a 0 there means
+         * "not reporting", not "no energy" - publishing it would drop the sensor to zero every time
+         * the washer is switched off and throw away the answer to "what did that wash use", which is
+         * exactly what the retained value is for. A real reset still gets through, because the next
+         * cycle publishes its own 0 from a powered-on record.
+         */
+        if (phase !== PHASE_OFF) {
+            this.publishProperty('energy', (rec[OFF_ENERGY_HI] << 8) | rec[OFF_ENERGY_LO])
+        }
+
         // Only the wash clock counts down, so everything else would show a stale figure - and at the end
         // of a cycle the remaining-minutes byte sticks at 1 rather than reaching 0. The total is the
         // selected course's estimate though, which is worth seeing before pressing start, so it is
@@ -1730,19 +1794,21 @@ export default class Device extends AABBDevice {
      *   resume   remote control ON and actually paused.
      *   pause    running. NOT gated on remote control: whether a pause needs it has never been
      *            measured, and greying out a control that might work is worse than a log line.
+     *   add_wash the same gate as start, because it IS a start - it carries the operation key. The
+     *            appliance's own answer to pressing it twice is what settles that: the second write
+     *            came back with status 0x09 on the operation key rather than 0x00, so it refuses one
+     *            while a cycle is already under way.
      *
-     * With no record yet, all three stay available - the appliance has not said otherwise.
+     * With no record yet, all four stay available - the appliance has not said otherwise.
      */
     updateButtonAvailability() {
         const phase = this.lastRecord?.[OFF_PHASE]
         const running = phase !== undefined && ACTIVE_PHASES.has(phase)
         const state = (ok: boolean) => (phase === undefined || ok ? 'online' : 'offline')
 
-        this.HA.publishProperty(
-            this.id,
-            'start-availability',
-            state(this.remoteControl && !running && phase !== PHASE_OFF),
-        )
+        const canStart = state(this.remoteControl && !running && phase !== PHASE_OFF)
+        this.HA.publishProperty(this.id, 'start-availability', canStart)
+        this.HA.publishProperty(this.id, 'add_wash-availability', canStart)
         this.HA.publishProperty(this.id, 'resume-availability', state(this.remoteControl && phase === PHASE_PAUSED))
         this.HA.publishProperty(this.id, 'pause-availability', state(running))
     }
@@ -1927,7 +1993,7 @@ export default class Device extends AABBDevice {
         // Settings writes are accepted with remote control off - measured, a hundred of them applied
         // that way, and the owner confirms the app's "send to washer" works without it. What needs it
         // is starting the machine remotely, so the warning is limited to that.
-        if (!this.remoteControl && (prop === 'start' || prop === 'resume')) {
+        if (!this.remoteControl && (prop === 'start' || prop === 'resume' || prop === 'add_wash')) {
             log('status', `${this.id}: ${prop} sent while remote control is off - press start on the appliance instead`)
         }
 
@@ -1937,6 +2003,26 @@ export default class Device extends AABBDevice {
             case 'start':
                 this.setField(KEY_OPERATION, OP_START)
                 return this.trigger()
+            case 'add_wash':
+                // The app's frame, byte for byte - see ADD_WASH_COURSE. No trigger() follows it:
+                // the LG cloud sent one ten times over fifteen seconds after this write, but that is
+                // its polling and not part of the command, and the appliance had already moved to
+                // phase 12 by then.
+                return this.send(
+                    Buffer.from([
+                        0xf0,
+                        0xe5,
+                        0x00,
+                        0x02,
+                        0x01,
+                        0xff,
+                        0x02,
+                        KEY_COURSE,
+                        ADD_WASH_COURSE,
+                        KEY_OPERATION,
+                        OP_START,
+                    ]),
+                )
             case 'pause':
                 return this.setField(KEY_OPERATION, OP_PAUSE)
             case 'resume':

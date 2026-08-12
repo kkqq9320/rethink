@@ -335,6 +335,42 @@ describe('FX___S washer', () => {
         feed(thinq, buf('aa09f0241001018cbb')) // our own start command echoed back
         assert.equal(get(HA, 'status'), undefined)
     })
+    test('energy comes from the state record, a minute at a time', () => {
+        const { HA, dut } = setup()
+
+        // @16/@17 is a big-endian u16 of watt-hours. It sat on the undecoded list until 2026-08-12,
+        // because @16 is 0 below 256 Wh and no captured cycle had ever gone above it.
+        const rec = (phase: number, wh: number) => {
+            const r = Buffer.alloc(66)
+            r[20] = phase
+            r[4] = 0x2e
+            r[16] = (wh >> 8) & 0xff
+            r[17] = wh & 0xff
+            return r
+        }
+
+        dut.processRecord(rec(11, 281))
+        assert.equal(get(HA, 'energy'), 281)
+
+        // The value that proved the width: a byte cannot hold it.
+        dut.processRecord(rec(11, 752))
+        assert.equal(get(HA, 'energy'), 752)
+
+        // Complete keeps it - this is the number the cycle actually used, and the 0x3E report would
+        // still be saying 737 here.
+        dut.processRecord(rec(42, 752))
+        assert.equal(get(HA, 'energy'), 752)
+
+        // Switched off, the appliance zeroes the whole record. That 0 means "not reporting", so it
+        // must not reach the sensor and wipe out what the last cycle used.
+        dut.processRecord(rec(0, 0))
+        assert.equal(get(HA, 'energy'), 752)
+
+        // A real reset does get through, from a powered-on record at the start of the next cycle.
+        dut.processRecord(rec(1, 0))
+        assert.equal(get(HA, 'energy'), 0)
+    })
+
     test('the appliance reports its own energy every fifteen minutes', () => {
         const { HA, thinq } = setup()
 
@@ -356,7 +392,9 @@ describe('FX___S washer', () => {
             feed(thinq, Buffer.from(f, 'hex'))
 
         assert.equal(get(HA, 'energy_reports'), '3 / 94 / 22 / 11 / 3 / 3')
-        assert.equal(get(HA, 'energy'), 136)
+        // `energy` no longer comes from this frame - the state record carries the same running
+        // total once a minute instead of once a quarter hour. See OFF_ENERGY_HI.
+        assert.equal(get(HA, 'energy'), undefined)
 
         /* An 11 Wh report reads as an extended frame if the length is not checked; this is that one. */
         assert.equal(get(HA, 'energy_reports')?.toString().split(' / ')[3], '11')
@@ -365,7 +403,6 @@ describe('FX___S washer', () => {
         feed(thinq, Buffer.from('aa0b203e001600160115bb', 'hex'))
         feed(thinq, Buffer.from('aa0b203e000d00230210bb', 'hex'))
         assert.equal(get(HA, 'energy_reports'), '22 / 13')
-        assert.equal(get(HA, 'energy'), 35)
     })
 
     test('the 2026-08-04 Normal cycle, which is what settled the unit', () => {
@@ -376,10 +413,8 @@ describe('FX___S washer', () => {
         // measured +0.18 kWh over the same cycle against the 164 reported here.
         feed(thinq, Buffer.from('aa0b203e008c008c01f4bb', 'hex')) // 14:10:08  140 / 140 / 1
         feed(thinq, Buffer.from('aa0b203e001800a40284bb', 'hex')) // 14:25:28   24 / 164 / 2
-        assert.equal(get(HA, 'energy'), 164)
 
         feed(thinq, Buffer.from('aa0b203e000300a70395bb', 'hex')) // 14:40:06    3 / 167 / 3
-        assert.equal(get(HA, 'energy'), 167, 'it keeps counting while the appliance idles')
         assert.equal(get(HA, 'energy_reports'), '140 / 24 / 3')
 
         const attrs = JSON.parse(String(get(HA, 'energy_reports_attrs')))
@@ -1639,11 +1674,33 @@ describe('FX___S the operation buttons say when they can be used', () => {
         return rec
     }
 
-    test('all three are available before the appliance has said anything', () => {
+    test('all four are available before the appliance has said anything', () => {
         const { HA } = setup()
         // An MQTT entity whose availability topic was never published reads as unavailable, so the
         // honest default has to be published at startup rather than waited for.
-        for (const name of ['start', 'pause', 'resume']) assert.equal(avail(HA, name), 'online')
+        for (const name of ['start', 'pause', 'resume', 'add_wash']) assert.equal(avail(HA, name), 'online')
+    })
+
+    test('add wash is gated exactly like start, because it carries a start', () => {
+        const { HA, dut } = setup()
+        dut.processRecord(record(42)) // finished, remote control on - where the owner pressed it
+        assert.equal(avail(HA, 'add_wash'), 'online')
+
+        dut.processRecord(record(12)) // already running: the appliance answered a repeat with 0x09
+        assert.equal(avail(HA, 'add_wash'), 'offline')
+
+        dut.processRecord(record(1, false)) // remote control off
+        assert.equal(avail(HA, 'add_wash'), 'offline')
+    })
+
+    test('add wash replays the frame the app sent, byte for byte', () => {
+        const { thinq, dut } = setup()
+        dut.setProperty('add_wash', '')
+        // Captured 2026-08-12 17:34:03 as toDevice while the owner pressed 추가 세탁하기 in the LG
+        // app: course -> 55 (Rinse + Spin) and operation -> 1 (start), in one two-pair write.
+        assert.equal(hex(thinq.outbox[0]), hex(buf('aa0ff0e5000201ff020a37030182bb')))
+        // And nothing else - the ten trigger frames the cloud sent afterwards are its polling.
+        assert.equal(thinq.outbox.length, 1)
     })
 
     test('standby offers start, and nothing else', () => {
